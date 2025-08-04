@@ -1,6 +1,17 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+$logFile = "C:\Temp\ActionGenerator.log"
+if (-not (Test-Path "C:\Temp")) { New-Item -Path "C:\Temp" -ItemType Directory | Out-Null }
+
+function Write-Log {
+    param (
+        [string]$message
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $logFile -Value "$timestamp - $message"
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Action Generator"
 $form.Size = New-Object System.Drawing.Size(700, 540)
@@ -24,7 +35,7 @@ $textFixlet = New-Object System.Windows.Forms.TextBox -Property @{ Location = Ne
 $labelFixletID = New-Object System.Windows.Forms.Label -Property @{ Text = "Fixlet ID:"; Location = New-Object System.Drawing.Point(10, 150); AutoSize = $true }
 $textFixletID = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(100, 148); Width = 550 }
 
-# Date Selector (future Wednesdays only)
+# Date Selector (Wednesdays only)
 $labelDate = New-Object System.Windows.Forms.Label -Property @{ Text = "Select Wednesday:"; Location = New-Object System.Drawing.Point(10, 190); AutoSize = $true }
 $comboDate = New-Object System.Windows.Forms.ComboBox -Property @{ Location = New-Object System.Drawing.Point(130, 188); Width = 200; DropDownStyle = "DropDownList" }
 
@@ -84,62 +95,15 @@ $btnGenerate.Add_Click({
     $cred = New-Object System.Management.Automation.PSCredential($user, $securePass)
 
     $actions = @(
-        @{
-            Name = "${fixletName}: Pilot"
-            Start = $startDT
-            End = $startDT.Date.AddDays(1).AddHours(6).AddMinutes(59)
-            GroupID = "12345"
-            Message = ""
-            Deadline = $null
-            ShowUI = $false
-        },
-        @{
-            Name = "${fixletName}: Deploy"
-            Start = $startDT.AddDays(1)
-            End = $startDT.AddDays(6).Date.AddHours(6).AddMinutes(59)
-            GroupID = "12345"
-            Message = ""
-            Deadline = $null
-            ShowUI = $false
-        },
-        @{
-            Name = "${fixletName}: Force"
-            Start = $startDT.AddDays(6).Date.AddHours(7)
-            End = $startDT.AddDays(6).Date.AddYears(1)
-            GroupID = "12345"
-            Deadline = $startDT.AddDays(7)
-            Message = "Update: $vendor $app $version will be enforced on $($startDT.AddDays(7).ToString('MM/dd/yyyy h:mm tt')). Please leave your machine on overnight to get the automated update. Otherwise, please close the application and run the update now. When the deadline is reached, the action will run automatically."
-            ShowUI = $true
-        },
-        @{
-            Name = "${fixletName}: Conference/Training Rooms"
-            Start = $startDT.AddDays(1)
-            End = $startDT.AddDays(6).Date.AddHours(6).AddMinutes(59)
-            GroupID = "12345"
-            Message = ""
-            Deadline = $null
-            ShowUI = $false
-        }
+        @{ Name = "${fixletName}: Pilot"; Start = $startDT; End = $startDT.AddHours(11); Message = ""; Deadline = $null; GroupID = "12345"; RestrictTime = $true },
+        @{ Name = "${fixletName}: Deploy"; Start = $startDT.AddDays(1); End = $startDT.AddDays(6).Date.AddHours(6).AddMinutes(59); Message = ""; Deadline = $null; GroupID = "12345"; RestrictTime = $true },
+        @{ Name = "${fixletName}: Force"; Start = $startDT.AddDays(6).Date.AddHours(7); End = $startDT.AddDays(6).Date.AddYears(1); 
+           Message = "Update: $vendor $app $version will be enforced on $($startDT.AddDays(7).ToString('MM/dd/yyyy h:mm tt')). Please leave your machine on overnight to get the automated update. Otherwise, please close the application and run the update now. When the deadline is reached, the action will run automatically."; 
+           Deadline = $startDT.AddDays(7); GroupID = "12345"; RestrictTime = $false },
+        @{ Name = "${fixletName}: Conference/Training Rooms"; Start = $startDT.AddDays(1); End = $startDT.AddDays(6).Date.AddHours(6).AddMinutes(59); Message = ""; Deadline = $null; GroupID = "12345"; RestrictTime = $true }
     )
 
     foreach ($action in $actions) {
-        $uiXml = @"
-<UI>
-  <ShowActionButton>true</ShowActionButton>
-  <ShowMessage>true</ShowMessage>
-  <HasRunningMessage>true</HasRunningMessage>
-  <ActionRunningMessage>Updating to $vendor $app $version. Please wait...</ActionRunningMessage>
-"@
-        if ($action.ShowUI) {
-            $uiXml += @"
-  <PreActionShowUI>true</PreActionShowUI>
-  <PreActionMessage>$($action.Message)</PreActionMessage>
-  <PreActionAskToSaveWork>true</PreActionAskToSaveWork>
-  <Deadline>$($action.Deadline.ToString("yyyy-MM-dd'T'HH:mm:ss"))</Deadline>
-"@
-        }
-        $uiXml += "</UI>"
-
         $xml = @"
 <BES>
   <SourcedFixletAction>
@@ -148,12 +112,27 @@ $btnGenerate.Add_Click({
     <Relevance>TRUE</Relevance>
     <StartDateTimeLocal>$($action.Start.ToString("yyyy-MM-dd'T'HH:mm:ss"))</StartDateTimeLocal>
     <EndDateTimeLocal>$($action.End.ToString("yyyy-MM-dd'T'HH:mm:ss"))</EndDateTimeLocal>
-    $uiXml
+    <UI>
+      <ShowActionButton>true</ShowActionButton>
+      <ShowMessage>true</ShowMessage>
+      <HasRunningMessage>true</HasRunningMessage>
+      <ActionRunningMessage>Updating to $vendor $app $version. Please wait...</ActionRunningMessage>
+      $(if ($action.Message) {
+          "<PreActionShowUI>true</PreActionShowUI>
+           <PreActionMessage>$($action.Message)</PreActionMessage>
+           <PreActionAskToSaveWork>true</PreActionAskToSaveWork>
+           <Deadline>$($action.Deadline.ToString("yyyy-MM-dd'T'HH:mm:ss"))</Deadline>"
+        } else { "" })
+    </UI>
     <Settings>
       <RetryCount>3</RetryCount>
       <RetryWait>1</RetryWait>
       <Reapply>true</Reapply>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
+      $(if ($action.RestrictTime) {
+        "<StartTimeRestriction>19:00</StartTimeRestriction>
+         <EndTimeRestriction>06:59</EndTimeRestriction>"
+      })
     </Settings>
     <Target>
       <ComputerGroupID>$($action.GroupID)</ComputerGroupID>
@@ -163,14 +142,21 @@ $btnGenerate.Add_Click({
 "@
 
         $url = "$server/api/actions"
+        Write-Log "`n[$($action.Name)]"
+        Write-Log "URL: $url"
+        Write-Log "Posting XML:`n$xml"
+
         try {
             Invoke-RestMethod -Uri $url -Method Post -Body $xml -Credential $cred -ContentType "application/xml"
+            Write-Log "Result: SUCCESS"
         } catch {
+            Write-Log "Result: FAILED - $($_.Exception.Message)"
             [System.Windows.Forms.MessageBox]::Show("Failed to create action: $($_.Exception.Message)")
         }
     }
 
     [System.Windows.Forms.MessageBox]::Show("All actions created successfully.")
+    Write-Log "----------------------------------`n"
 })
 
 $form.Controls.AddRange(@(
