@@ -1,55 +1,43 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$logFile = "C:\Temp\ActionGenerator.log"
-if (-not (Test-Path "C:\Temp")) { New-Item -Path "C:\Temp" -ItemType Directory | Out-Null }
-
-function Write-Log {
-    param (
-        [string]$message
-    )
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $logFile -Value "$timestamp - $message"
-}
-
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Action Generator"
-$form.Size = New-Object System.Drawing.Size(700, 540)
+$form.Size = New-Object System.Drawing.Size(700, 550)
 $form.StartPosition = "CenterScreen"
 
-# Server Info
-$labelServer = New-Object System.Windows.Forms.Label -Property @{ Text = "Server:"; Location = New-Object System.Drawing.Point(10, 20); AutoSize = $true }
-$textServer = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(100, 18); Width = 550 }
+# Labels and TextBoxes
+$labelServer = New-Object System.Windows.Forms.Label -Property @{ Text = "Server:"; Location = '10,20'; AutoSize = $true }
+$textServer = New-Object System.Windows.Forms.TextBox -Property @{ Location = '100,18'; Width = 550 }
 
-$labelUser = New-Object System.Windows.Forms.Label -Property @{ Text = "Username:"; Location = New-Object System.Drawing.Point(10, 50); AutoSize = $true }
-$textUser = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(100, 48); Width = 550 }
+$labelUser = New-Object System.Windows.Forms.Label -Property @{ Text = "Username:"; Location = '10,50'; AutoSize = $true }
+$textUser = New-Object System.Windows.Forms.TextBox -Property @{ Location = '100,48'; Width = 550 }
 
-$labelPass = New-Object System.Windows.Forms.Label -Property @{ Text = "Password:"; Location = New-Object System.Drawing.Point(10, 80); AutoSize = $true }
-$textPass = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(100, 78); Width = 550; UseSystemPasswordChar = $true }
+$labelPass = New-Object System.Windows.Forms.Label -Property @{ Text = "Password:"; Location = '10,80'; AutoSize = $true }
+$textPass = New-Object System.Windows.Forms.TextBox -Property @{ Location = '100,78'; Width = 550; UseSystemPasswordChar = $true }
 
-# Fixlet Name
-$labelFixlet = New-Object System.Windows.Forms.Label -Property @{ Text = "Fixlet Name:"; Location = New-Object System.Drawing.Point(10, 120); AutoSize = $true }
-$textFixlet = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(100, 118); Width = 550 }
+$labelFixlet = New-Object System.Windows.Forms.Label -Property @{ Text = "Fixlet Name:"; Location = '10,120'; AutoSize = $true }
+$textFixlet = New-Object System.Windows.Forms.TextBox -Property @{ Location = '100,118'; Width = 550 }
 
-# Fixlet ID
-$labelFixletID = New-Object System.Windows.Forms.Label -Property @{ Text = "Fixlet ID:"; Location = New-Object System.Drawing.Point(10, 150); AutoSize = $true }
-$textFixletID = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(100, 148); Width = 550 }
+$labelFixletID = New-Object System.Windows.Forms.Label -Property @{ Text = "Fixlet ID:"; Location = '10,150'; AutoSize = $true }
+$textFixletID = New-Object System.Windows.Forms.TextBox -Property @{ Location = '100,148'; Width = 550 }
 
-# Date Selector (Wednesdays only)
-$labelDate = New-Object System.Windows.Forms.Label -Property @{ Text = "Select Wednesday:"; Location = New-Object System.Drawing.Point(10, 190); AutoSize = $true }
-$comboDate = New-Object System.Windows.Forms.ComboBox -Property @{ Location = New-Object System.Drawing.Point(130, 188); Width = 200; DropDownStyle = "DropDownList" }
+$labelDate = New-Object System.Windows.Forms.Label -Property @{ Text = "Select Wednesday:"; Location = '10,190'; AutoSize = $true }
+$comboDate = New-Object System.Windows.Forms.ComboBox -Property @{ Location = '130,188'; Width = 200; DropDownStyle = "DropDownList" }
 
+# Populate 8 upcoming Wednesdays
 $today = [datetime]::Today
-for ($i = 1; $i -le 60; $i++) {
+$wedCount = 0
+for ($i = 1; $i -le 60 -and $wedCount -lt 8; $i++) {
     $day = $today.AddDays($i)
     if ($day.DayOfWeek -eq 'Wednesday') {
         $comboDate.Items.Add($day.ToString("yyyy-MM-dd"))
+        $wedCount++
     }
 }
 
-# Time Selector
-$labelTime = New-Object System.Windows.Forms.Label -Property @{ Text = "Select Time:"; Location = New-Object System.Drawing.Point(350, 190); AutoSize = $true }
-$comboTime = New-Object System.Windows.Forms.ComboBox -Property @{ Location = New-Object System.Drawing.Point(440, 188); Width = 100; DropDownStyle = "DropDownList" }
+$labelTime = New-Object System.Windows.Forms.Label -Property @{ Text = "Select Time:"; Location = '350,190'; AutoSize = $true }
+$comboTime = New-Object System.Windows.Forms.ComboBox -Property @{ Location = '440,188'; Width = 100; DropDownStyle = "DropDownList" }
 
 foreach ($time in @(
     "8:00 PM", "8:15 PM", "8:30 PM", "8:45 PM",
@@ -60,11 +48,10 @@ foreach ($time in @(
     $comboTime.Items.Add($time)
 }
 
-# Button
 $btnGenerate = New-Object System.Windows.Forms.Button
 $btnGenerate.Text = "Create Actions"
-$btnGenerate.Size = New-Object System.Drawing.Size(150, 30)
-$btnGenerate.Location = New-Object System.Drawing.Point(270, 240)
+$btnGenerate.Size = '150,30'
+$btnGenerate.Location = '270,240'
 
 $btnGenerate.Add_Click({
     $server = $textServer.Text.Trim().TrimEnd("/")
@@ -92,71 +79,81 @@ $btnGenerate.Add_Click({
     }
 
     $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential($user, $securePass)
+    $cred = New-Object PSCredential ($user, $securePass)
+
+    $deadline = $startDT.AddDays(7)
+    $groupID = 12345
 
     $actions = @(
-        @{ Name = "${fixletName}: Pilot"; Start = $startDT; End = $startDT.AddHours(11); Message = ""; Deadline = $null; GroupID = "12345"; RestrictTime = $true },
-        @{ Name = "${fixletName}: Deploy"; Start = $startDT.AddDays(1); End = $startDT.AddDays(6).Date.AddHours(6).AddMinutes(59); Message = ""; Deadline = $null; GroupID = "12345"; RestrictTime = $true },
-        @{ Name = "${fixletName}: Force"; Start = $startDT.AddDays(6).Date.AddHours(7); End = $startDT.AddDays(6).Date.AddYears(1); 
-           Message = "Update: $vendor $app $version will be enforced on $($startDT.AddDays(7).ToString('MM/dd/yyyy h:mm tt')). Please leave your machine on overnight to get the automated update. Otherwise, please close the application and run the update now. When the deadline is reached, the action will run automatically."; 
-           Deadline = $startDT.AddDays(7); GroupID = "12345"; RestrictTime = $false },
-        @{ Name = "${fixletName}: Conference/Training Rooms"; Start = $startDT.AddDays(1); End = $startDT.AddDays(6).Date.AddHours(6).AddMinutes(59); Message = ""; Deadline = $null; GroupID = "12345"; RestrictTime = $true }
+        @{ Name = "Pilot"; Start=$startDT; End=$startDT.AddDays(1).AddHours(6).AddMinutes(59); Deadline=$null; Message=$null },
+        @{ Name = "Deploy"; Start=$startDT.AddDays(1); End=$startDT.AddDays(6).AddHours(6).AddMinutes(59); Deadline=$null; Message=$null },
+        @{ Name = "Force"; Start=$startDT.AddDays(6).AddHours(7); End=$startDT.AddDays(6).AddYears(1); Deadline=$deadline;
+            Message="Update: $vendor $app $version will be enforced on $($deadline.ToString('MM/dd/yyyy h:mm tt')). Please leave your machine on overnight to get the automated update. Otherwise, please close the application and run the update now. When the deadline is reached, the action will run automatically." },
+        @{ Name = "Conference/Training Rooms"; Start=$startDT.AddDays(1); End=$startDT.AddDays(6).AddHours(6).AddMinutes(59); Deadline=$null; Message=$null }
     )
 
-    foreach ($action in $actions) {
-        $xml = @"
+    $xml = @"
 <BES>
-  <SourcedFixletAction>
-    <SourceFixletID>$fixletID</SourceFixletID>
-    <Title>$($action.Name)</Title>
+  <MultipleActionGroup>
+    <Title>${fixletName} - Action Group</Title>
     <Relevance>TRUE</Relevance>
-    <StartDateTimeLocal>$($action.Start.ToString("yyyy-MM-dd'T'HH:mm:ss"))</StartDateTimeLocal>
-    <EndDateTimeLocal>$($action.End.ToString("yyyy-MM-dd'T'HH:mm:ss"))</EndDateTimeLocal>
-    <UI>
-      <ShowActionButton>true</ShowActionButton>
-      <ShowMessage>true</ShowMessage>
-      <HasRunningMessage>true</HasRunningMessage>
-      <ActionRunningMessage>Updating to $vendor $app $version. Please wait...</ActionRunningMessage>
-      $(if ($action.Message) {
-          "<PreActionShowUI>true</PreActionShowUI>
-           <PreActionMessage>$($action.Message)</PreActionMessage>
-           <PreActionAskToSaveWork>true</PreActionAskToSaveWork>
-           <Deadline>$($action.Deadline.ToString("yyyy-MM-dd'T'HH:mm:ss"))</Deadline>"
-        } else { "" })
-    </UI>
-    <Settings>
-      <RetryCount>3</RetryCount>
-      <RetryWait>1</RetryWait>
-      <Reapply>true</Reapply>
-      <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
-      $(if ($action.RestrictTime) {
-        "<StartTimeRestriction>19:00</StartTimeRestriction>
-         <EndTimeRestriction>06:59</EndTimeRestriction>"
-      })
-    </Settings>
-    <Target>
-      <ComputerGroupID>$($action.GroupID)</ComputerGroupID>
-    </Target>
-  </SourcedFixletAction>
-</BES>
+    <UseCustomGroup>true</UseCustomGroup>
+    <ActionGroupCreationTime>${([datetime]::Now.ToString("yyyy-MM-dd'T'HH:mm:ss"))}</ActionGroupCreationTime>
+    <SiteName>CustomSite</SiteName>
+    <SourcedFixletID>$fixletID</SourcedFixletID>
+    <CustomGroupTarget>
+      <ComputerGroupID>$groupID</ComputerGroupID>
+    </CustomGroupTarget>
 "@
 
-        $url = "$server/api/actions"
-        Write-Log "`n[$($action.Name)]"
-        Write-Log "URL: $url"
-        Write-Log "Posting XML:`n$xml"
-
-        try {
-            Invoke-RestMethod -Uri $url -Method Post -Body $xml -Credential $cred -ContentType "application/xml"
-            Write-Log "Result: SUCCESS"
-        } catch {
-            Write-Log "Result: FAILED - $($_.Exception.Message)"
-            [System.Windows.Forms.MessageBox]::Show("Failed to create action: $($_.Exception.Message)")
+    foreach ($a in $actions) {
+        $xml += @"
+    <SourcedFixletAction>
+      <Title>${fixletName}: $($a.Name)</Title>
+      <Relevance>TRUE</Relevance>
+      <StartDateTimeLocal>$($a.Start.ToString("yyyy-MM-dd'T'HH:mm:ss"))</StartDateTimeLocal>
+      <EndDateTimeLocal>$($a.End.ToString("yyyy-MM-dd'T'HH:mm:ss"))</EndDateTimeLocal>
+      <UI>
+        <ShowActionButton>true</ShowActionButton>
+        <HasRunningMessage>true</HasRunningMessage>
+        <ActionRunningMessage>Installing $vendor $app $version. Please wait...</ActionRunningMessage>
+"@
+        if ($a.Message) {
+            $xml += @"
+        <PreActionShowUI>true</PreActionShowUI>
+        <PreActionMessage>$($a.Message)</PreActionMessage>
+        <PreActionAskToSaveWork>true</PreActionAskToSaveWork>
+        <Deadline>$($a.Deadline.ToString("yyyy-MM-dd'T'HH:mm:ss"))</Deadline>
+"@
         }
+        $xml += @"
+      </UI>
+      <Settings>
+        <Reapply>true</Reapply>
+        <RetryCount>3</RetryCount>
+        <RetryWait>1</RetryWait>
+        <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
+      </Settings>
+    </SourcedFixletAction>
+"@
     }
 
-    [System.Windows.Forms.MessageBox]::Show("All actions created successfully.")
-    Write-Log "----------------------------------`n"
+    $xml += "</MultipleActionGroup></BES>"
+
+    $url = "$server/api/actions"
+    $logPath = "$env:TEMP\BigFix_ActionGen.log"
+
+    "`n---`n[$(Get-Date)] Posting to: $url" | Out-File -Append $logPath
+    $xml | Out-File -Append $logPath
+
+    try {
+        $resp = Invoke-RestMethod -Uri $url -Method Post -Body $xml -Credential $cred -ContentType "application/xml"
+        "Result: SUCCESS" | Out-File -Append $logPath
+        [System.Windows.Forms.MessageBox]::Show("All actions created successfully.")
+    } catch {
+        "Result: FAILED - $($_.Exception.Message)" | Out-File -Append $logPath
+        [System.Windows.Forms.MessageBox]::Show("Failed to create actions: $($_.Exception.Message)")
+    }
 })
 
 $form.Controls.AddRange(@(
