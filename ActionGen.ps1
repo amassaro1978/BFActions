@@ -136,10 +136,14 @@ $submitBtn.Add_Click({
     $siteURL = "http://sync.bigfix.com/cgi-bin/bfgather.exe/actionsite"
 
     $actionsXml = foreach ($a in $actions) {
-        $runBetweenXml = if ($a.RunBetween) {
+        $title = $a.Title
+        $groupId = $a.GroupID
+        $runBetween = $a.RunBetween
+
+        $runBetweenXml = if ($runBetween) {
             "<StartDateTime>${formattedStart}</StartDateTime>
             <EndDateTime>$([datetime]::Parse($selectedDate).AddDays(1).ToUniversalTime().ToString("yyyy-MM-dd'T'06:59:00'Z'"))</EndDateTime>"
-        } elseif ($a.Title -eq "Force") {
+        } elseif ($title -eq "Force") {
             "<StartDateTime>${formattedStart}</StartDateTime>
             <Deadline>${deadline}</Deadline>
             <PreActionShowUI>true</PreActionShowUI>
@@ -155,9 +159,9 @@ $submitBtn.Add_Click({
     <SourceSiteURL>${siteURL}</SourceSiteURL>
     <SourceSiteName>${siteName}</SourceSiteName>
     <Target>
-        <ComputerGroupID>${a.GroupID}</ComputerGroupID>
+        <ComputerGroupID>${groupId}</ComputerGroupID>
     </Target>
-    <Title>${fixletName}: $($a.Title)</Title>
+    <Title>${fixletName}: ${title}</Title>
     <Settings>
         <HasRunningMessage>false</HasRunningMessage>
         <HasTimeRange>false</HasTimeRange>
@@ -214,7 +218,6 @@ $submitBtn.Add_Click({
         Add-Content -Path $logFile -Value $msg
     }
 
-    # Auto-scroll to bottom
     $logBox.SelectionStart = $logBox.Text.Length
     $logBox.ScrollToCaret()
 })
