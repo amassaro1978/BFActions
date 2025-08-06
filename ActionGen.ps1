@@ -92,7 +92,6 @@ $logBox.ContextMenu = $contextMenu
 
 $menuItemCopy.add_Click({ $logBox.Copy() })
 $menuItemSelectAll.add_Click({ $logBox.SelectAll() })
-
 $form.Controls.Add($logBox)
 
 # Submit click logic
@@ -137,7 +136,7 @@ $submitBtn.Add_Click({
 
     $actionsXml = foreach ($a in $actions) {
         $title = $a.Title
-        $groupId = "$($a.GroupID)"  # Ensure string literal with leading zeros preserved
+        $groupId = "$($a.GroupID)"
         $runBetween = $a.RunBetween
 
         $runBetweenXml = if ($runBetween) {
@@ -153,7 +152,7 @@ $submitBtn.Add_Click({
         }
 
 @"
-<Action>
+<MemberAction>
   <SourcedFixletAction>
     <SourceFixletID>${fixletID}</SourceFixletID>
     <SourceSiteURL>${siteURL}</SourceSiteURL>
@@ -177,7 +176,7 @@ $submitBtn.Add_Click({
         ${runBetweenXml}
     </Settings>
   </SourcedFixletAction>
-</Action>
+</MemberAction>
 "@
     }
 
@@ -193,13 +192,11 @@ $submitBtn.Add_Click({
 "@
 
     $encodedUrl = "$server/api/actions"
-    $msg = "POST to: $encodedUrl`r`n"
-    $logBox.AppendText($msg)
-    Add-Content -Path $logFile -Value $msg
+    $logBox.AppendText("POST to: $encodedUrl`r`n")
+    Add-Content -Path $logFile -Value "POST to: $encodedUrl`r`n"
 
-    $msg = "XML:`r`n$fullXml`r`n"
-    $logBox.AppendText($msg)
-    Add-Content -Path $logFile -Value $msg
+    $logBox.AppendText("XML:`r`n$fullXml`r`n")
+    Add-Content -Path $logFile -Value "XML:`r`n$fullXml`r`n"
 
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($fullXml)
     $headers = @{
