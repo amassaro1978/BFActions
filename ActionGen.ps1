@@ -126,10 +126,10 @@ $submitBtn.Add_Click({
     }
 
     $actions = @(
-        @{ Title = "Pilot"; GroupID = 12345; RunBetween = $true },
-        @{ Title = "Deploy"; GroupID = 12345; RunBetween = $true },
-        @{ Title = "Force"; GroupID = 12345; RunBetween = $false },
-        @{ Title = "Conference/Training Rooms"; GroupID = 12345; RunBetween = $true }
+        @{ Title = "Pilot"; GroupID = "00-12345"; RunBetween = $true },
+        @{ Title = "Deploy"; GroupID = "00-12345"; RunBetween = $true },
+        @{ Title = "Force"; GroupID = "00-12345"; RunBetween = $false },
+        @{ Title = "Conference/Training Rooms"; GroupID = "00-12345"; RunBetween = $true }
     )
 
     $siteName = "actionsite"
@@ -137,7 +137,7 @@ $submitBtn.Add_Click({
 
     $actionsXml = foreach ($a in $actions) {
         $title = $a.Title
-        $groupId = $a.GroupID
+        $groupId = "$($a.GroupID)"  # Ensure string literal with leading zeros preserved
         $runBetween = $a.RunBetween
 
         $runBetweenXml = if ($runBetween) {
