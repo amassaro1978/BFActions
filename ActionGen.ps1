@@ -178,10 +178,14 @@ $submitBtn.Add_Click({
     }
 
     $fullXml = @"
-<MultipleActionGroup>
-  <Title>${fixletName}: All Actions</Title>
-  $($actionsXml -join "`n")
-</MultipleActionGroup>
+<?xml version="1.0" encoding="UTF-8"?>
+<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:noNamespaceSchemaLocation="BES.xsd">
+  <MultipleActionGroup>
+    <Title>${fixletName}: All Actions</Title>
+    $($actionsXml -join "`n")
+  </MultipleActionGroup>
+</BES>
 "@
 
     $encodedUrl = "$server/api/actions"
