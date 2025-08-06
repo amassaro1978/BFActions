@@ -4,7 +4,7 @@ Add-Type -AssemblyName System.Drawing
 # Create the form
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Action Generator"
-$form.Size = New-Object System.Drawing.Size(500, 500)
+$form.Size = New-Object System.Drawing.Size(500, 520)
 $form.StartPosition = "CenterScreen"
 
 # Create labels and input fields
@@ -74,16 +74,32 @@ $submitBtn.Location = New-Object System.Drawing.Point(170, $y)
 $submitBtn.Size = New-Object System.Drawing.Size(150, 30)
 $form.Controls.Add($submitBtn)
 
-# Output log
+# Output log box
 $logBox = New-Object System.Windows.Forms.TextBox
 $logBox.Multiline = $true
 $logBox.ScrollBars = "Vertical"
 $logBox.Size = New-Object System.Drawing.Size(460, 120)
 $logBox.Location = New-Object System.Drawing.Point(10, 350)
+$logBox.ReadOnly = $false
+$logBox.WordWrap = $false
+
+# Add context menu to log box
+$contextMenu = New-Object System.Windows.Forms.ContextMenu
+$menuItemCopy = New-Object System.Windows.Forms.MenuItem "Copy"
+$menuItemSelectAll = New-Object System.Windows.Forms.MenuItem "Select All"
+$contextMenu.MenuItems.AddRange(@($menuItemCopy, $menuItemSelectAll))
+$logBox.ContextMenu = $contextMenu
+
+$menuItemCopy.add_Click({ $logBox.Copy() })
+$menuItemSelectAll.add_Click({ $logBox.SelectAll() })
+
 $form.Controls.Add($logBox)
 
 # Submit click logic
 $submitBtn.Add_Click({
+    $logFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
+    $logBox.Clear()
+
     $server = $inputs["BigFix Server URL"].Text.TrimEnd("/")
     $username = $inputs["Username"].Text
     $password = $inputs["Password"].Text
@@ -139,7 +155,7 @@ $submitBtn.Add_Click({
     <SourceSiteURL>${siteURL}</SourceSiteURL>
     <SourceSiteName>${siteName}</SourceSiteName>
     <Target>
-        <ComputerGroupID>${($a.GroupID)}</ComputerGroupID>
+        <ComputerGroupID>${a.GroupID}</ComputerGroupID>
     </Target>
     <Title>${fixletName}: $($a.Title)</Title>
     <Settings>
@@ -169,8 +185,13 @@ $submitBtn.Add_Click({
 "@
 
     $encodedUrl = "$server/api/actions"
-    $logBox.AppendText("POST to: $encodedUrl`r`n")
-    $logBox.AppendText("XML:`r`n$fullXml`r`n")
+    $msg = "POST to: $encodedUrl`r`n"
+    $logBox.AppendText($msg)
+    Add-Content -Path $logFile -Value $msg
+
+    $msg = "XML:`r`n$fullXml`r`n"
+    $logBox.AppendText($msg)
+    Add-Content -Path $logFile -Value $msg
 
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($fullXml)
     $headers = @{
@@ -180,10 +201,18 @@ $submitBtn.Add_Click({
 
     try {
         $response = Invoke-RestMethod -Uri $encodedUrl -Method Post -Headers $headers -Body $bytes
-        $logBox.AppendText("✅ Success`r`n")
+        $msg = "✅ Success`r`n"
+        $logBox.AppendText($msg)
+        Add-Content -Path $logFile -Value $msg
     } catch {
-        $logBox.AppendText("❌ Failed: $_`r`n")
+        $msg = "❌ Failed: $_`r`n"
+        $logBox.AppendText($msg)
+        Add-Content -Path $logFile -Value $msg
     }
+
+    # Auto-scroll to bottom
+    $logBox.SelectionStart = $logBox.Text.Length
+    $logBox.ScrollToCaret()
 })
 
 $form.Topmost = $true
