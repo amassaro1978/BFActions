@@ -1,292 +1,355 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Web
 
-# ====== CONFIG ======
-$ServerURL = "https://YourBigFixServer:52311"
-$CustomSiteName = "Test Group Managed (Workstations)"
-$LogFile = "C:\temp\BigFixActionGen.log"
+# =========================
+# CONFIG
+# =========================
+$LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
+$CustomSiteName = "Test Group Managed (Workstations)"  # hardcoded site
 
-# Hardcoded ComputerGroupIDs (string to preserve leading zeros)
-$GroupIDs = @{
-    "Pilot"                    = "00-12345"
-    "Deploy"                   = "00-12346"
-    "Force"                    = "00-12347"
-    "Conference/Training Rooms"= "00-12348"
+# Action -> Computer Group ID (keep strings to preserve 00- prefix)
+$GroupMap = @{
+    "Pilot"                     = "00-12345"
+    "Deploy"                    = "00-12345"
+    "Force"                     = "00-12345"
+    "Conference/Training Rooms" = "00-12345"
 }
 
-# ====== LOGGING ======
-function Write-Log {
-    param([string]$message)
-    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    $entry = "$timestamp $message"
-    $LogBox.AppendText("$entry`r`n")
-    Add-Content -Path $LogFile -Value $entry
+# =========================
+# UTIL / LOGGING
+# =========================
+function Encode-SiteName([string]$Name) {
+    $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
+    $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
+    return $enc
+}
+function Get-BaseUrl([string]$ServerInput) {
+    if (-not $ServerInput) { throw "Server is empty." }
+    $s = $ServerInput.Trim()
+    if ($s -match '^(?i)https?://') { return ($s.TrimEnd('/')) }
+    $s = $s.Trim('/')
+    if ($s -match ':\d+$') { "https://$s" } else { "https://$s:52311" }
+}
+function Join-ApiUrl([string]$BaseUrl,[string]$RelativePath) {
+    $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
+    $BaseUrl.TrimEnd('/') + $rp
+}
+function Get-AuthHeader([string]$User,[string]$Pass) {
+    $pair  = "$User`:$Pass"
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    "Basic " + [Convert]::ToBase64String($bytes)
+}
+function LogLine($txt) {
+    $line = "{0}  {1}" -f (Get-Date -Format 'u'), $txt
+    $LogBox.AppendText($line + "`r`n")
+    Add-Content -Path $LogFile -Value $line
+    $LogBox.SelectionStart = $LogBox.Text.Length
+    $LogBox.ScrollToCaret()
+}
+function Format-LocalBESDateTime([datetime]$dt) { $dt.ToString("yyyyMMdd'T'HHmmss") }
+
+# =========================
+# HTTP (curl-like)
+# =========================
+function HttpGetXml {
+    param([string]$Url,[string]$AuthHeader)
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = "GET"
+    $req.Accept = "application/xml"
+    $req.Headers["Authorization"] = $AuthHeader
+    $req.ProtocolVersion = [Version]"1.1"
+    $req.PreAuthenticate = $true
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 30000
+    try {
+        $resp = $req.GetResponse()
+        try {
+            $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+            $content = $sr.ReadToEnd(); $sr.Close()
+        } finally { $resp.Close() }
+        return $content
+    } catch {
+        throw ($_.Exception.GetBaseException().Message)
+    }
+}
+function HttpPostXml {
+    param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($XmlBody)
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = "POST"
+    $req.Accept = "application/xml"
+    $req.ContentType = "application/xml; charset=utf-8"
+    $req.Headers["Authorization"] = $AuthHeader
+    $req.ProtocolVersion = [Version]"1.1"
+    $req.PreAuthenticate = $true
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 60000
+    $req.ContentLength = $bytes.Length
+    try {
+        $rs = $req.GetRequestStream(); $rs.Write($bytes,0,$bytes.Length); $rs.Close()
+        $resp = $req.GetResponse(); $resp.Close()
+    } catch {
+        throw ($_.Exception.GetBaseException().Message)
+    }
 }
 
-# ====== CLEAN TITLE ======
-function Parse-FixletTitleToProduct {
-    param([string]$Title)
-    $clean = $Title -replace '^Update:\s*', ''
-    $clean = $clean -replace '\s+Win$', ''
+# =========================
+# FIXLET PARSING
+# =========================
+function Get-FixletContainer { param([xml]$Xml)
+    if ($Xml.BES.Fixlet)   { return @{ Type="Fixlet";   Node=$Xml.BES.Fixlet } }
+    if ($Xml.BES.Task)     { return @{ Type="Task";     Node=$Xml.BES.Task } }
+    if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
+    throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
+}
+function Get-ActionAndRelevance {
+    param($ContainerNode)
+    $rels = @(); foreach ($r in $ContainerNode.Relevance) { $rels += [string]$r }
+    $act = $null
+    if ($ContainerNode.Action) { $act = $ContainerNode.Action | Select-Object -First 1 }
+    if (-not $act -and $ContainerNode.DefaultAction) { $act = $ContainerNode.DefaultAction }
+    if (-not $act) { throw "No <Action> or <DefaultAction> block found." }
+    $script = $null
+    if ($act.ActionScript) {
+        $script = [string]$act.ActionScript.'#text'
+        if ([string]::IsNullOrWhiteSpace($script)) { $script = $act.ActionScript.InnerText }
+    }
+    if (-not $script) { throw "Action found but no <ActionScript> content present." }
+    return @{ Relevance=$rels; ActionScript=$script }
+}
+function Parse-FixletTitleToProduct([string]$Title) {
+    $clean = $Title -replace '^Update:\s*','' -replace '\s+Win$',''
     return $clean.Trim()
 }
 
-# ====== GET FIXLET XML ======
-function Get-FixletData {
+# =========================
+# SINGLE ACTION XML
+# =========================
+function Build-SingleActionXml {
     param(
-        [string]$ServerURL,
-        [string]$SiteName,
-        [string]$FixletID,
-        [string]$Username,
-        [string]$Password
+        [string]$ActionTitle,          # Pilot/Deploy/Force/Conference...
+        [string]$DisplayName,          # Vendor App Version
+        [string[]]$RelevanceBlocks,    # relevance strings
+        [string]$ActionScript,         # action script
+        [datetime]$StartLocal,         # scheduled local start
+        [bool]$SetDeadline = $false,   # only true for Force
+        [datetime]$DeadlineLocal = $null,
+        [string]$GroupId               # "00-12345"
     )
-    $encodedSite = [System.Web.HttpUtility]::UrlEncode($SiteName)
-    $uri = "$ServerURL/api/fixlet/custom/$encodedSite/$FixletID"
-    Write-Log "Fetching Fixlet from: $uri"
+    $titleText = "$($DisplayName): $ActionTitle"
+    $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
+    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+    $rels = ($RelevanceBlocks | ForEach-Object { "    <Relevance>$([System.Security.SecurityElement]::Escape($_))</Relevance>" }) -join "`r`n"
+    $deadlineBlock = if ($SetDeadline -and $DeadlineLocal) { "<Deadline>$(Format-LocalBESDateTime $DeadlineLocal)</Deadline>" } else { "" }
 
-    try {
-        $credPair = "$Username`:$Password"
-        $credBytes = [System.Text.Encoding]::ASCII.GetBytes($credPair)
-        $credBase64 = [System.Convert]::ToBase64String($credBytes)
-
-        $headers = @{ Authorization = "Basic $credBase64" }
-
-        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-        return $response
-    }
-    catch {
-        Write-Log "❌ Failed to retrieve Fixlet: $_"
-        return $null
-    }
-}
-
-# ====== EXTRACT ACTIONSCRIPT & RELEVANCE ======
-function Extract-ActionAndRelevance {
-    param($FixletXML)
-    try {
-        $ns = New-Object System.Xml.XmlNamespaceManager($FixletXML.NameTable)
-        $ns.AddNamespace("BES", $FixletXML.DocumentElement.NamespaceURI)
-
-        $titleNode = $FixletXML.SelectSingleNode("//BES:Title", $ns)
-        $title = $titleNode.InnerText
-
-        $relevanceNodes = $FixletXML.SelectNodes("//BES:Relevance", $ns)
-        $relevanceList = $relevanceNodes | ForEach-Object { $_.InnerText }
-
-        $actionNode = $FixletXML.SelectSingleNode("//BES:Action", $ns)
-        if (-not $actionNode) {
-            throw "No <Action> node found in Fixlet."
-        }
-
-        $actionScriptNode = $actionNode.SelectSingleNode("BES:ActionScript", $ns)
-        $actionScript = $actionScriptNode.InnerText
-
-        return @{
-            Title = $title
-            Relevance = $relevanceList
-            ActionScript = $actionScript
-        }
-    }
-    catch {
-        Write-Log "❌ Error extracting Action/Relevance: $_"
-        return $null
-    }
-}
-
-# ====== BUILD ACTION XML ======
-function Build-ActionXML {
-    param(
-        [string]$DisplayName,
-        [string]$FixletID,
-        [string]$ActionScript,
-        [string[]]$Relevance,
-        [datetime]$StartTime,
-        [string]$GroupID,
-        [switch]$IsForce
-    )
-
-    $deadlineString = ""
-    if ($IsForce) {
-        $deadline = $StartTime.AddHours(24)
-        $deadlineString = "<EndDateTimeLocalOffset>$($deadline.ToString("yyyy-MM-ddTHH:mm:sszzz"))</EndDateTimeLocalOffset>"
-    }
-
-    $relevanceXML = ($Relevance | ForEach-Object { "<Relevance>$_</Relevance>" }) -join "`n"
-
-    $xml = @"
+@"
 <?xml version="1.0" encoding="UTF-8"?>
 <BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
-  <SourcedFixletAction>
-    <SourceFixlet>
-      <Sitename>CustomSite</Sitename>
-      <FixletID>$FixletID</FixletID>
-      <Action>Action1</Action>
-    </SourceFixlet>
-    <Target>
-      <ComputerGroupID>$GroupID</ComputerGroupID>
-    </Target>
-    $relevanceXML
-    <ActionScript MIMEType="application/x-Fixlet-Windows-Shell">$([System.Security.SecurityElement]::Escape($ActionScript))</ActionScript>
+  <SingleAction>
+    <Title>$titleEsc</Title>
+$rels
+    <ActionScript MIMEType="application/x-Fixlet-Windows-Shell"><![CDATA[
+$ActionScript
+]]></ActionScript>
     <Settings>
       <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage>
-        <Text>Updating to $DisplayName. Please wait...</Text>
-      </RunningMessage>
+      <RunningMessage>Updating to $dispEsc. Please wait....</RunningMessage>
       <HasTimeRange>true</HasTimeRange>
-      <StartDateTimeLocalOffset>$($StartTime.ToString("yyyy-MM-ddTHH:mm:sszzz"))</StartDateTimeLocalOffset>
-      $deadlineString
+      <HasStartTime>true</HasStartTime>
+      <StartDateTimeLocal>$(Format-LocalBESDateTime $StartLocal)</StartDateTimeLocal>
+      <HasEndTime>false</HasEndTime>
+      <HasDeadline>$([string]$SetDeadline)</HasDeadline>
+      $deadlineBlock
+      <HasReapply>false</HasReapply>
+      <HasRetry>false</HasRetry>
+      <HasTemporalDistribution>false</HasTemporalDistribution>
+      <HasAllowNoFixlets>false</HasAllowNoFixlets>
     </Settings>
-  </SourcedFixletAction>
+    <Target>
+      <CustomRelevance>member of group whose (id of it as string = "$GroupId")</CustomRelevance>
+    </Target>
+  </SingleAction>
 </BES>
 "@
-    return $xml
 }
 
-# ====== POST ACTION ======
-function Post-Action {
-    param(
-        [string]$ServerURL,
-        [string]$Username,
-        [string]$Password,
-        [string]$ActionXML
-    )
-    try {
-        $credPair = "$Username`:$Password"
-        $credBytes = [System.Text.Encoding]::ASCII.GetBytes($credPair)
-        $credBase64 = [System.Convert]::ToBase64String($credBytes)
-        $headers = @{ Authorization = "Basic $credBase64" }
-
-        Write-Log "Posting action to $ServerURL/api/actions"
-        $result = Invoke-RestMethod -Uri "$ServerURL/api/actions" -Headers $headers -Method Post -Body $ActionXML -ContentType "application/xml"
-        Write-Log "✅ Action posted successfully."
-    }
-    catch {
-        Write-Log "❌ Failed to post action: $_"
-    }
-}
-
-# ====== GUI ======
+# =========================
+# GUI
+# =========================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Action Generator"
-$form.Size = New-Object System.Drawing.Size(750,600)
+$form.Size = New-Object System.Drawing.Size(620, 760)
 $form.StartPosition = "CenterScreen"
 
-$lblServer = New-Object System.Windows.Forms.Label
-$lblServer.Text = "BigFix Server URL:"
-$lblServer.Location = New-Object System.Drawing.Point(10,20)
-$form.Controls.Add($lblServer)
+$y = 20
+function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB) {
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Label
+    $lbl.Location = New-Object Drawing.Point(10,$script:y)
+    $lbl.Size = New-Object Drawing.Size(140,22)
+    $form.Controls.Add($lbl)
 
-$txtServer = New-Object System.Windows.Forms.TextBox
-$txtServer.Text = $ServerURL
-$txtServer.Location = New-Object System.Drawing.Point(150,18)
-$txtServer.Width = 300
-$form.Controls.Add($txtServer)
+    if ($IsPassword) {
+        $tb = New-Object System.Windows.Forms.MaskedTextBox
+        $tb.PasswordChar = '*'
+    } else {
+        $tb = New-Object System.Windows.Forms.TextBox
+    }
+    $tb.Location = New-Object Drawing.Point(160,$script:y)
+    $tb.Size = New-Object Drawing.Size(420,22)
+    $form.Controls.Add($tb)
+    $OutTB.Value = $tb
+    $script:y += 34
+}
 
-$lblUser = New-Object System.Windows.Forms.Label
-$lblUser.Text = "Username:"
-$lblUser.Location = New-Object System.Drawing.Point(10,60)
-$form.Controls.Add($lblUser)
+$tbServer = $null; Add-Field "BigFix Server:" $false ([ref]$tbServer)
+$tbUser   = $null; Add-Field "Username:"      $false ([ref]$tbUser)
+$tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
+$tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
-$txtUser = New-Object System.Windows.Forms.TextBox
-$txtUser.Location = New-Object System.Drawing.Point(150,58)
-$txtUser.Width = 200
-$form.Controls.Add($txtUser)
-
-$lblPass = New-Object System.Windows.Forms.Label
-$lblPass.Text = "Password:"
-$lblPass.Location = New-Object System.Drawing.Point(10,100)
-$form.Controls.Add($lblPass)
-
-$txtPass = New-Object System.Windows.Forms.MaskedTextBox
-$txtPass.Location = New-Object System.Drawing.Point(150,98)
-$txtPass.Width = 200
-$txtPass.PasswordChar = '*'
-$form.Controls.Add($txtPass)
-
-$lblFixletID = New-Object System.Windows.Forms.Label
-$lblFixletID.Text = "Fixlet ID:"
-$lblFixletID.Location = New-Object System.Drawing.Point(10,140)
-$form.Controls.Add($lblFixletID)
-
-$txtFixletID = New-Object System.Windows.Forms.TextBox
-$txtFixletID.Location = New-Object System.Drawing.Point(150,138)
-$txtFixletID.Width = 100
-$form.Controls.Add($txtFixletID)
-
-$lblDate = New-Object System.Windows.Forms.Label
-$lblDate.Text = "Schedule Date:"
-$lblDate.Location = New-Object System.Drawing.Point(10,180)
+# Date (future Wednesdays)
+$lblDate = New-Object Windows.Forms.Label
+$lblDate.Text = "Schedule Date (Wed):"
+$lblDate.Location = New-Object Drawing.Point(10,$y)
+$lblDate.Size = New-Object Drawing.Size(140,22)
 $form.Controls.Add($lblDate)
 
-$cbDate = New-Object System.Windows.Forms.ComboBox
-$cbDate.Location = New-Object System.Drawing.Point(150,178)
-$cbDate.Width = 150
-# Populate only future Wednesdays
-$today = Get-Date
-for ($i=1; $i -le 60; $i++) {
-    $date = $today.AddDays($i)
-    if ($date.DayOfWeek -eq 'Wednesday') {
-        $cbDate.Items.Add($date.ToString("yyyy-MM-dd"))
-    }
-}
+$cbDate = New-Object Windows.Forms.ComboBox
+$cbDate.DropDownStyle = 'DropDownList'
+$cbDate.Location = New-Object Drawing.Point(160,$y)
+$cbDate.Size = New-Object Drawing.Size(160,22)
 $form.Controls.Add($cbDate)
+$y += 34
+# populate next 20 Wednesdays
+$today = Get-Date
+$daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
+$nextWed = $today.AddDays($daysUntilWed)
+for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-$lblTime = New-Object System.Windows.Forms.Label
-$lblTime.Text = "Start Time:"
-$lblTime.Location = New-Object System.Drawing.Point(10,220)
+# Time (8:00 PM – 11:45 PM, 15m)
+$lblTime = New-Object Windows.Forms.Label
+$lblTime.Text = "Schedule Time:"
+$lblTime.Location = New-Object Drawing.Point(10,$y)
+$lblTime.Size = New-Object Drawing.Size(140,22)
 $form.Controls.Add($lblTime)
 
-$cbTime = New-Object System.Windows.Forms.ComboBox
-$cbTime.Location = New-Object System.Drawing.Point(150,218)
-$cbTime.Width = 100
-# Populate 15-min increments from 8:00 PM to 11:45 PM
-for ($h=20; $h -le 23; $h++) {
-    foreach ($m in 0,15,30,45) {
-        $time = (Get-Date -Hour $h -Minute $m -Second 0).ToString("hh:mm tt")
-        $cbTime.Items.Add($time)
-    }
-}
+$cbTime = New-Object Windows.Forms.ComboBox
+$cbTime.DropDownStyle = 'DropDownList'
+$cbTime.Location = New-Object Drawing.Point(160,$y)
+$cbTime.Size = New-Object Drawing.Size(160,22)
 $form.Controls.Add($cbTime)
+$y += 42
+$start = Get-Date "20:00"; $end = Get-Date "23:45"
+while ($start -le $end) { [void]$cbTime.Items.Add($start.ToString("h:mm tt")); $start = $start.AddMinutes(15) }
 
-$btnRun = New-Object System.Windows.Forms.Button
-$btnRun.Text = "Generate & Post Actions"
-$btnRun.Location = New-Object System.Drawing.Point(10,260)
-$btnRun.Width = 200
-$form.Controls.Add($btnRun)
+# Button
+$btn = New-Object Windows.Forms.Button
+$btn.Text = "Generate & Post 4 Single Actions"
+$btn.Location = New-Object Drawing.Point(160,$y)
+$btn.Size = New-Object Drawing.Size(280,32)
+$form.Controls.Add($btn)
+$y += 42
 
+# Log
 $LogBox = New-Object System.Windows.Forms.TextBox
-$LogBox.Location = New-Object System.Drawing.Point(10,300)
-$LogBox.Size = New-Object System.Drawing.Size(700,240)
 $LogBox.Multiline = $true
 $LogBox.ScrollBars = "Vertical"
+$LogBox.ReadOnly = $false
+$LogBox.WordWrap = $false
+$LogBox.Location = New-Object Drawing.Point(10,$y)
+$LogBox.Size = New-Object Drawing.Size(570,520)
+$LogBox.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($LogBox)
+# Context menu for easy copy/select all
+$cm = New-Object System.Windows.Forms.ContextMenu
+$miCopy = New-Object System.Windows.Forms.MenuItem "Copy"
+$miAll  = New-Object System.Windows.Forms.MenuItem "Select All"
+$cm.MenuItems.AddRange(@($miCopy,$miAll))
+$LogBox.ContextMenu = $cm
+$miCopy.add_Click({ $LogBox.Copy() })
+$miAll.add_Click({ $LogBox.SelectAll() })
 
-# ====== BUTTON CLICK ======
-$btnRun.Add_Click({
-    $fixletID = $txtFixletID.Text
-    $date = $cbDate.SelectedItem
-    $time = $cbTime.SelectedItem
-    if (-not $fixletID -or -not $date -or -not $time) {
-        Write-Log "❌ Please fill all fields."
+# =========================
+# ACTION
+# =========================
+$btn.Add_Click({
+    $LogBox.Clear()
+    $server = $tbServer.Text.Trim()
+    $user   = $tbUser.Text.Trim()
+    $pass   = $tbPass.Text
+    $fixId  = $tbFixlet.Text.Trim()
+    $dStr   = $cbDate.SelectedItem
+    $tStr   = $cbTime.SelectedItem
+
+    if (-not ($server -and $user -and $pass -and $fixId -and $dStr -and $tStr)) {
+        LogLine "❌ Please fill in Server, Username, Password, Fixlet ID, Date, and Time."
         return
     }
-    $startDT = Get-Date "$date $time"
 
-    $fixletXML = Get-FixletData -ServerURL $txtServer.Text -SiteName $CustomSiteName -FixletID $fixletID -Username $txtUser.Text -Password $txtPass.Text
-    if (-not $fixletXML) { return }
+    try {
+        $base = Get-BaseUrl $server
+        $encodedSite = Encode-SiteName $CustomSiteName
+        $fixletUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/fixlet/custom/$encodedSite/$fixId"
+        LogLine "Encoded Fixlet GET URL: $fixletUrl"
 
-    $data = Extract-ActionAndRelevance -FixletXML $fixletXML
-    if (-not $data) { return }
+        $auth = Get-AuthHeader -User $user -Pass $pass
+        $fixletContent = HttpGetXml -Url $fixletUrl -AuthHeader $auth
+        $xml = [xml]$fixletContent
 
-    $displayName = Parse-FixletTitleToProduct -Title $data.Title
+        $cont = Get-FixletContainer -Xml $xml
+        LogLine ("Detected BES content type: {0}" -f $cont.Type)
 
-    foreach ($action in $GroupIDs.Keys) {
-        $isForce = $false
-        if ($action -eq "Force") { $isForce = $true }
-        $xmlBody = Build-ActionXML -DisplayName $displayName -FixletID $fixletID -ActionScript $data.ActionScript -Relevance $data.Relevance -StartTime $startDT -GroupID $GroupIDs[$action] -IsForce:$isForce
-        Write-Log "Generated XML for $action:`r`n$xmlBody"
-        Post-Action -ServerURL $txtServer.Text -Username $txtUser.Text -Password $txtPass.Text -ActionXML $xmlBody
+        $titleRaw = $cont.Node.Title
+        $displayName = Parse-FixletTitleToProduct -Title $titleRaw
+
+        $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
+        $relevance = $parsed.Relevance
+        $actionScript = $parsed.ActionScript
+
+        LogLine "Parsed title: $displayName"
+        LogLine ("Relevance count: {0}" -f $relevance.Count)
+        LogLine ("Action script length: {0}" -f $actionScript.Length)
+
+        $startLocal = Get-Date "$dStr $tStr"
+        $deadlineLocal = $startLocal.AddHours(24)  # for Force
+
+        $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
+        $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
+        LogLine "POST URL: $postUrl"
+
+        foreach ($a in $actions) {
+            $groupId = "$($GroupMap[$a])"
+            if (-not $groupId) { LogLine "❌ Missing group map for $a"; continue }
+            $isForce = ($a -eq "Force")
+
+            $xmlBody = Build-SingleActionXml `
+                -ActionTitle $a `
+                -DisplayName $displayName `
+                -RelevanceBlocks $relevance `
+                -ActionScript $actionScript `
+                -StartLocal $startLocal `
+                -SetDeadline:$isForce `
+                -DeadlineLocal $deadlineLocal `
+                -GroupId $groupId
+
+            LogLine ("---- SingleAction XML for {0} ----" -f $a)
+            LogLine $xmlBody
+
+            try {
+                HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBody
+                LogLine ("✅ {0} posted successfully." -f $a)
+            } catch {
+                LogLine ("❌ POST failed for {0}: {1}" -f $a, $_)
+            }
+        }
+
+        LogLine "All actions attempted. Log file: $LogFile"
+    }
+    catch {
+        LogLine ("❌ Fatal error: {0}" -f ($_.Exception.GetBaseException().Message))
     }
 })
 
+$form.Topmost = $false
 [void]$form.ShowDialog()
