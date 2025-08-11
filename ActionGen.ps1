@@ -23,16 +23,12 @@ function Get-BaseUrl {
     if (-not $ServerInput) { throw "Server is empty." }
     $s = $ServerInput.Trim()
 
-    # If user enters full base (starts with http), trust it and strip trailing slash
     if ($s -match '^(?i)https?://') {
         return ($s.TrimEnd('/'))
     }
 
-    # Otherwise build default https://<host>:52311
-    # Strip any accidental leading/trailing slashes
     $s = $s.Trim('/')
 
-    # If user already included a port, keep it; else add :52311
     if ($s -match ':\d+$') {
         return "https://$s"
     } else {
@@ -45,7 +41,6 @@ function Join-ApiUrl {
         [string]$BaseUrl,
         [string]$RelativePath   # must start with /
     )
-    # Ensure the relative path starts with a single /
     $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
     return ($BaseUrl.TrimEnd('/') + $rp)
 }
@@ -73,7 +68,6 @@ function Get-FixletDetails {
     $url  = Join-ApiUrl -BaseUrl $base -RelativePath $path
     $auth = Get-AuthHeader -Username $Username -Password $Password
 
-    # Return both URL and content so caller can log the URL easily
     $resp = Invoke-WebRequest -Uri $url -Headers @{ Authorization=$auth } -UseBasicParsing -ErrorAction Stop
     [pscustomobject]@{ Url = $url; Content = $resp.Content }
 }
@@ -124,7 +118,7 @@ function Build-SingleActionXml {
         [string]$GroupId               # "00-12345"
     )
 
-    # IMPORTANT: wrap variables before a colon inside strings to avoid $Drive: parsing
+    # Wrap variables before a colon inside strings to avoid $Drive: parsing
     $titleText = "$($DisplayName): $ActionTitle"
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
@@ -301,13 +295,18 @@ $goBtn.Add_Click({
     }
 
     try {
-        $base = Get-BaseUrl $server
+        # Build and log the FULLY ENCODED Fixlet GET URL before calling it
+        $base        = Get-BaseUrl $server
+        $encodedSite = [System.Uri]::EscapeDataString($SiteName)
+        $fixletPath  = "/api/fixlet/custom/$encodedSite/$fixletId"
+        $fixletUrl   = Join-ApiUrl -BaseUrl $base -RelativePath $fixletPath
 
         $append.Invoke(("Server base URL: {0}" -f $base))
-        $append.Invoke(("Retrieving Fixlet XML from site '{0}' : ID {1}" -f $SiteName, $fixletId))
+        $append.Invoke(("Encoded Fixlet GET URL: {0}" -f $fixletUrl))
 
+        # Now call the API
         $resp = Get-FixletDetails -Server $server -Username $user -Password $pass -FixletID $fixletId
-        $append.Invoke(("GET URL: {0}" -f $resp.Url))
+        $append.Invoke(("GET URL (from func): {0}" -f $resp.Url))
 
         $fixletXml = $resp.Content
         $xml = [xml]$fixletXml
@@ -358,8 +357,12 @@ $goBtn.Add_Click({
             $append.Invoke($xmlBody)
 
             try {
-                $postUrl = Post-ActionXml -Server $server -Username $user -Password $pass -XmlBody $xmlBody
-                $append.Invoke(("POST URL: {0}" -f $postUrl))
+                # Log the encoded POST URL too
+                $postBase = Get-BaseUrl $server
+                $postUrl  = Join-ApiUrl -BaseUrl $postBase -RelativePath "/api/actions"
+                $append.Invoke(("Encoded POST URL: {0}" -f $postUrl))
+
+                $postedUrl = Post-ActionXml -Server $server -Username $user -Password $pass -XmlBody $xmlBody
                 $append.Invoke(("✅ {0} created successfully." -f $a))
             } catch {
                 $append.Invoke(("❌ Failed to create {0}: {1}" -f $a, $_))
