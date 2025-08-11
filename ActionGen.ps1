@@ -15,11 +15,19 @@ $GroupMap = @{
 }
 
 # =========================
-# URL / AUTH HELPERS
+# ENCODING / URL / AUTH HELPERS
 # =========================
+# Use HttpUtility to encode () and other chars; and normalize spaces to %20 (not +)
+Add-Type -AssemblyName System.Web
+function Encode-SiteName {
+    param([string]$Name)
+    $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
+    $enc = $enc -replace '\+','%20'
+    return $enc
+}
+
 function Get-BaseUrl {
     param([string]$ServerInput)
-
     if (-not $ServerInput) { throw "Server is empty." }
     $s = $ServerInput.Trim()
 
@@ -29,11 +37,7 @@ function Get-BaseUrl {
 
     $s = $s.Trim('/')
 
-    if ($s -match ':\d+$') {
-        return "https://$s"
-    } else {
-        return "https://$s:52311"
-    }
+    if ($s -match ':\d+$') { "https://$s" } else { "https://$s:52311" }
 }
 
 function Join-ApiUrl {
@@ -42,7 +46,7 @@ function Join-ApiUrl {
         [string]$RelativePath   # must start with /
     )
     $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
-    return ($BaseUrl.TrimEnd('/') + $rp)
+    $BaseUrl.TrimEnd('/') + $rp
 }
 
 function Get-AuthHeader {
@@ -63,7 +67,7 @@ function Get-FixletDetails {
         [Parameter(Mandatory=$true)][string]$FixletID
     )
     $base = Get-BaseUrl $Server
-    $encodedSite = [uri]::EscapeDataString($SiteName)
+    $encodedSite = Encode-SiteName $SiteName
     $path = "/api/fixlet/custom/$encodedSite/$FixletID"
     $url  = Join-ApiUrl -BaseUrl $base -RelativePath $path
     $auth = Get-AuthHeader -Username $Username -Password $Password
@@ -108,12 +112,12 @@ function Format-LocalBESDateTime {
 
 function Build-SingleActionXml {
     param(
-        [string]$ActionTitle,          # e.g., "Pilot", "Deploy", "Force", "Conference/Training Rooms"
+        [string]$ActionTitle,          # "Pilot" | "Deploy" | "Force" | "Conference/Training Rooms"
         [string]$DisplayName,          # "Vendor AppName Version"
-        [string[]]$RelevanceBlocks,    # array of relevance strings
+        [string[]]$RelevanceBlocks,    # relevance strings
         [string]$ActionScript,         # action script text
         [datetime]$StartLocal,         # scheduled local start
-        [bool]$SetDeadline = $false,   # only for "Force"
+        [bool]$SetDeadline = $false,   # only true for "Force"
         [datetime]$DeadlineLocal = $null,
         [string]$GroupId               # "00-12345"
     )
@@ -297,14 +301,14 @@ $goBtn.Add_Click({
     try {
         # Build and log the FULLY ENCODED Fixlet GET URL before calling it
         $base        = Get-BaseUrl $server
-        $encodedSite = [System.Uri]::EscapeDataString($SiteName)
+        $encodedSite = Encode-SiteName $SiteName
         $fixletPath  = "/api/fixlet/custom/$encodedSite/$fixletId"
         $fixletUrl   = Join-ApiUrl -BaseUrl $base -RelativePath $fixletPath
 
         $append.Invoke(("Server base URL: {0}" -f $base))
         $append.Invoke(("Encoded Fixlet GET URL: {0}" -f $fixletUrl))
 
-        # Now call the API
+        # Now call the API (function also returns its URL)
         $resp = Get-FixletDetails -Server $server -Username $user -Password $pass -FixletID $fixletId
         $append.Invoke(("GET URL (from func): {0}" -f $resp.Url))
 
