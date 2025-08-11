@@ -10,36 +10,14 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
 # =========================
 # CONFIG
 # =========================
-$SiteName = "Test Group Managed (Workstations)"  # hardcoded custom site name
+$SiteName = "Test Group Managed (Workstations)"  # hardcoded site
+
+# Map each action to its Computer Group ID (keep as strings to preserve 00- prefix).
 $GroupMap = @{
     "Pilot"                     = "00-12345"
     "Deploy"                    = "00-12345"
     "Force"                     = "00-12345"
     "Conference/Training Rooms" = "00-12345"
-}
-$BypassCertValidation = $false  # default; can toggle in UI
-
-# =========================
-# NETWORK/TLS HARDENING
-# =========================
-try {
-    [System.Net.ServicePointManager]::SecurityProtocol =
-        [System.Net.SecurityProtocolType]::Tls12 `
-        -bor [System.Net.SecurityProtocolType]::Tls11 `
-        -bor [System.Net.SecurityProtocolType]::Tls
-    [System.Net.ServicePointManager]::Expect100Continue = $false
-    [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
-} catch {}
-
-# Define TrustAllCertsPolicy ONCE, up-front (no Add-Type during click)
-if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(ServicePoint s, X509Certificate c, WebRequest r, int p) { return true; }
-}
-"@
 }
 
 # =========================
@@ -48,10 +26,12 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 Add-Type -AssemblyName System.Web
 function Encode-SiteName {
     param([string]$Name)
+    # Encode, then normalize + to %20 and encode parentheses (to match what works in curl)
     $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
     $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
     return $enc
 }
+
 function Get-BaseUrl([string]$ServerInput) {
     if (-not $ServerInput) { throw "Server is empty." }
     $s = $ServerInput.Trim()
@@ -59,10 +39,12 @@ function Get-BaseUrl([string]$ServerInput) {
     $s = $s.Trim('/')
     if ($s -match ':\d+$') { "https://$s" } else { "https://$s:52311" }
 }
+
 function Join-ApiUrl([string]$BaseUrl,[string]$RelativePath) {
     $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
     $BaseUrl.TrimEnd('/') + $rp
 }
+
 function Get-AuthHeader([string]$Username,[string]$Password) {
     $pair  = "$Username`:$Password"
     $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
@@ -70,7 +52,61 @@ function Get-AuthHeader([string]$Username,[string]$Password) {
 }
 
 # =========================
-# BIGFIX HELPERS
+# HTTP (curl-like) HELPERS
+# =========================
+function HttpGetXml {
+    param([string]$Url,[string]$AuthHeader)
+
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = "GET"
+    $req.Accept = "application/xml"
+    $req.Headers["Authorization"] = $AuthHeader
+    $req.ProtocolVersion = [Version]"1.1"
+    $req.PreAuthenticate = $true
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 30000
+
+    try {
+        $resp = $req.GetResponse()
+        try {
+            $stream = $resp.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+            $content = $reader.ReadToEnd()
+            $reader.Close()
+        } finally { $resp.Close() }
+        return $content
+    } catch {
+        throw ($_.Exception.GetBaseException().Message)
+    }
+}
+
+function HttpPostXml {
+    param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($XmlBody)
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = "POST"
+    $req.Accept = "application/xml"
+    $req.ContentType = "application/xml; charset=utf-8"
+    $req.Headers["Authorization"] = $AuthHeader
+    $req.ProtocolVersion = [Version]"1.1"
+    $req.PreAuthenticate = $true
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 60000
+    $req.ContentLength = $bytes.Length
+
+    try {
+        $reqStream = $req.GetRequestStream()
+        try { $reqStream.Write($bytes, 0, $bytes.Length) } finally { $reqStream.Close() }
+        $resp = $req.GetResponse()
+        $resp.Close()
+    } catch {
+        throw ($_.Exception.GetBaseException().Message)
+    }
+}
+
+# =========================
+# BIGFIX LOGIC
 # =========================
 function Get-FixletDetails {
     param (
@@ -85,32 +121,31 @@ function Get-FixletDetails {
     $url  = Join-ApiUrl -BaseUrl $base -RelativePath $path
     $auth = Get-AuthHeader -Username $Username -Password $Password
 
-    try {
-        $resp = Invoke-WebRequest -Uri $url -Headers @{ Authorization=$auth } -UseBasicParsing -ErrorAction Stop
-        [pscustomobject]@{ Url = $url; Content = $resp.Content }
-    } catch {
-        throw ("GET failed: " + ($_.Exception.GetBaseException().Message))
-    }
+    $content = HttpGetXml -Url $url -AuthHeader $auth
+    [pscustomobject]@{ Url = $url; Content = $content }
 }
 
 function Parse-FixletTitleToProduct([string]$Title) {
     if ($Title -match "^Update:\s*(.+?)\s+Win$") { return $matches[1] }
     return $Title
 }
+
 function Get-NextWednesdays {
     $dates = @()
     $today = Get-Date
-    $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
+    $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7  # Wednesday=3
     $nextWed = $today.AddDays($daysUntilWed)
     for ($i = 0; $i -lt 20; $i++) { $dates += $nextWed.AddDays(7*$i).ToString("yyyy-MM-dd") }
     return $dates
 }
+
 function Get-TimeSlots {
     $slots = @()
     $start = Get-Date "20:00"; $end = Get-Date "23:45"
     while ($start -le $end) { $slots += $start.ToString("h:mm tt"); $start = $start.AddMinutes(15) }
     return $slots
 }
+
 function Format-LocalBESDateTime([datetime]$dt) { $dt.ToString("yyyyMMdd'T'HHmmss") }
 
 function Build-SingleActionXml {
@@ -159,17 +194,8 @@ function Post-ActionXml {
     $base = Get-BaseUrl $Server
     $url  = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
     $auth = Get-AuthHeader -Username $Username -Password $Password
-    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($XmlBody)
-
-    try {
-        Invoke-RestMethod -Uri $url -Method Post -Headers @{
-            Authorization = $auth
-            "Content-Type" = "application/xml"
-        } -Body $bodyBytes -ErrorAction Stop
-        return $url
-    } catch {
-        throw ("POST failed: " + ($_.Exception.GetBaseException().Message))
-    }
+    HttpPostXml -Url $url -AuthHeader $auth -XmlBody $XmlBody | Out-Null
+    return $url
 }
 
 # =========================
@@ -177,7 +203,7 @@ function Post-ActionXml {
 # =========================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Action Generator"
-$form.Size = New-Object System.Drawing.Size(560, 780)
+$form.Size = New-Object System.Drawing.Size(560, 760)
 $form.StartPosition = "CenterScreen"
 
 $y = 20
@@ -242,15 +268,6 @@ $goBtn.Size = New-Object System.Drawing.Size(220, 32)
 $form.Controls.Add($goBtn)
 $y += 42
 
-# TLS bypass toggle (no Add-Type in handler; we only assign the policy)
-$sslChk = New-Object System.Windows.Forms.CheckBox
-$sslChk.Text = "Bypass SSL certificate validation (unsafe)"
-$sslChk.Checked = $BypassCertValidation
-$sslChk.Location = New-Object System.Drawing.Point(10, $y)
-$sslChk.Size = New-Object System.Drawing.Size(360, 24)
-$form.Controls.Add($sslChk)
-$y += 34
-
 # Log box
 $log = New-Object System.Windows.Forms.TextBox
 $log.Multiline = $true
@@ -297,13 +314,8 @@ $goBtn.Add_Click({
         return
     }
 
-    # Toggle cert validation without compiling anything in this thread
-    if ($sslChk.Checked) {
-        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-        $append.Invoke("⚠️ SSL certificate validation is DISABLED for this session.")
-    }
-
     try {
+        # Log the fully encoded Fixlet GET URL before calling it
         $base        = Get-BaseUrl $server
         $encodedSite = Encode-SiteName $SiteName
         $fixletPath  = "/api/fixlet/custom/$encodedSite/$fixletId"
@@ -312,13 +324,17 @@ $goBtn.Add_Click({
         $append.Invoke(("Server base URL: {0}" -f $base))
         $append.Invoke(("Encoded Fixlet GET URL: {0}" -f $fixletUrl))
 
+        # Call GET
+        $resp = $null
         try {
-            $resp = Get-FixletDetails -Server $server -Username $user -Password $pass -FixletID $fixletId
+            $auth = Get-AuthHeader -Username $user -Password $pass
+            $content = HttpGetXml -Url $fixletUrl -AuthHeader $auth
+            $resp = [pscustomobject]@{ Url = $fixletUrl; Content = $content }
         } catch {
-            $append.Invoke(("❌ TLS/Send error on GET: {0}" -f ($_.Exception.GetBaseException().Message)))
+            $append.Invoke(("❌ GET failed: {0}" -f $_))
             throw
         }
-        $append.Invoke(("GET URL (from func): {0}" -f $resp.Url))
+        $append.Invoke(("GET URL (used): {0}" -f $resp.Url))
 
         $fixletXml = $resp.Content
         $xml = [xml]$fixletXml
@@ -326,9 +342,11 @@ $goBtn.Add_Click({
         $titleRaw = $xml.BES.Fixlet.Title
         $displayName = Parse-FixletTitleToProduct -Title $titleRaw
 
+        # Collect relevance
         $relevance = @()
         foreach ($rel in $xml.BES.Fixlet.Relevance) { $relevance += [string]$rel }
 
+        # First Action's ActionScript
         $actionNode = $xml.BES.Fixlet.Action | Select-Object -First 1
         if (-not $actionNode) { throw "No <Action> block found in Fixlet." }
         $actionScript = [string]$actionNode.ActionScript.'#text'
@@ -337,12 +355,15 @@ $goBtn.Add_Click({
         $append.Invoke(("Relevance count: {0}" -f $relevance.Count))
         $append.Invoke(("Action script length: {0} chars" -f $actionScript.Length))
 
+        # Build start (local)
         $startLocal = Get-Date "$dateStr $timeStr"
         $append.Invoke(("Start (local): {0}" -f $startLocal))
 
+        # Force deadline = +24h absolute
         $deadlineLocal = $startLocal.AddHours(24)
         $append.Invoke(("Force deadline (local): {0}" -f $deadlineLocal))
 
+        # Define the four actions
         $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
 
         foreach ($a in $actions) {
@@ -360,15 +381,15 @@ $goBtn.Add_Click({
             $append.Invoke($xmlBody)
 
             try {
-                $postBase = Get-BaseUrl $server
-                $postUrl  = Join-ApiUrl -BaseUrl $postBase -RelativePath "/api/actions"
+                $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
                 $append.Invoke(("Encoded POST URL: {0}" -f $postUrl))
 
                 try {
-                    $postedUrl = Post-ActionXml -Server $server -Username $user -Password $pass -XmlBody $xmlBody
+                    $auth = Get-AuthHeader -Username $user -Password $pass
+                    HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBody
                     $append.Invoke(("✅ {0} created successfully." -f $a))
                 } catch {
-                    $append.Invoke(("❌ TLS/Send error on POST: {0}" -f ($_.Exception.GetBaseException().Message)))
+                    $append.Invoke(("❌ POST failed: {0}" -f $_))
                 }
             } catch {
                 $append.Invoke(("❌ Failed to create {0}: {1}" -f $a, $_))
@@ -378,7 +399,7 @@ $goBtn.Add_Click({
         $append.Invoke(("All actions attempted. See log: {0}" -f $logFile))
     }
     catch {
-        $append.Invoke(("❌ Fatal error: {0}" -f ($_.Exception.GetBaseException().Message)))
+        $append.Invoke(("❌ Fatal error: {0}" -f $_))
     }
 })
 
