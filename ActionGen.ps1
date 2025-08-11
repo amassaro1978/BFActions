@@ -14,6 +14,41 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12345"
 }
 
+# Toggle this to $true ONLY if your test server uses a self-signed/invalid cert
+$BypassCertValidation = $false
+
+# =========================
+# NETWORK/TLS HARDENING
+# =========================
+try {
+    # Prefer TLS 1.2; include TLS 1.1/1.0 only if your server still needs it
+    [System.Net.ServicePointManager]::SecurityProtocol =
+        [System.Net.SecurityProtocolType]::Tls12 `
+        -bor [System.Net.SecurityProtocolType]::Tls11 `
+        -bor [System.Net.SecurityProtocolType]::Tls
+
+    # Avoid 100-Continue stalls
+    [System.Net.ServicePointManager]::Expect100Continue = $false
+
+    # Use system proxy creds if any
+    [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+} catch {}
+
+if ($BypassCertValidation) {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+}
+
 # =========================
 # ENCODING / URL / AUTH HELPERS
 # =========================
@@ -22,9 +57,7 @@ function Encode-SiteName {
     param([string]$Name)
     # Encode, then normalize space and parentheses
     $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
-    $enc = $enc -replace '\+','%20'
-    $enc = $enc -replace '\(','%28'
-    $enc = $enc -replace '\)','%29'
+    $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
     return $enc
 }
 
@@ -38,10 +71,7 @@ function Get-BaseUrl {
 }
 
 function Join-ApiUrl {
-    param(
-        [string]$BaseUrl,
-        [string]$RelativePath   # must start with /
-    )
+    param([string]$BaseUrl,[string]$RelativePath)
     $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
     $BaseUrl.TrimEnd('/') + $rp
 }
@@ -69,8 +99,15 @@ function Get-FixletDetails {
     $url  = Join-ApiUrl -BaseUrl $base -RelativePath $path
     $auth = Get-AuthHeader -Username $Username -Password $Password
 
-    $resp = Invoke-WebRequest -Uri $url -Headers @{ Authorization=$auth } -UseBasicParsing -ErrorAction Stop
-    [pscustomobject]@{ Url = $url; Content = $resp.Content }
+    try {
+        $resp = Invoke-WebRequest -Uri $url -Headers @{
+            Authorization=$auth
+            Connection="Keep-Alive"
+        } -UseBasicParsing -ErrorAction Stop
+        [pscustomobject]@{ Url = $url; Content = $resp.Content }
+    } catch {
+        throw ("GET failed: " + ($_.Exception.GetBaseException().Message))
+    }
 }
 
 function Parse-FixletTitleToProduct {
@@ -166,12 +203,16 @@ function Post-ActionXml {
     $auth = Get-AuthHeader -Username $Username -Password $Password
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($XmlBody)
 
-    Invoke-RestMethod -Uri $url -Method Post -Headers @{
-        Authorization = $auth
-        "Content-Type" = "application/xml"
-    } -Body $bodyBytes -ErrorAction Stop
-
-    return $url
+    try {
+        Invoke-RestMethod -Uri $url -Method Post -Headers @{
+            Authorization = $auth
+            "Content-Type" = "application/xml"
+            Connection     = "Keep-Alive"
+        } -Body $bodyBytes -ErrorAction Stop
+        return $url
+    } catch {
+        throw ("POST failed: " + ($_.Exception.GetBaseException().Message))
+    }
 }
 
 # =========================
@@ -179,16 +220,12 @@ function Post-ActionXml {
 # =========================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Action Generator"
-$form.Size = New-Object System.Drawing.Size(560, 760)
+$form.Size = New-Object System.Drawing.Size(560, 780)
 $form.StartPosition = "CenterScreen"
 
 $y = 20
 function Add-Field {
-    param(
-        [string]$LabelText,
-        [bool]$IsPassword = $false,
-        [ref]$OutTextbox
-    )
+    param([string]$LabelText,[bool]$IsPassword = $false,[ref]$OutTextbox)
     $label = New-Object System.Windows.Forms.Label
     $label.Text = $LabelText
     $label.Location = New-Object System.Drawing.Point(10, $script:y)
@@ -248,6 +285,15 @@ $goBtn.Size = New-Object System.Drawing.Size(220, 32)
 $form.Controls.Add($goBtn)
 $y += 42
 
+# TLS bypass toggle (visible so you can switch without editing script)
+$sslChk = New-Object System.Windows.Forms.CheckBox
+$sslChk.Text = "Bypass SSL certificate validation (unsafe)"
+$sslChk.Checked = $BypassCertValidation
+$sslChk.Location = New-Object System.Drawing.Point(10, $y)
+$sslChk.Size = New-Object System.Drawing.Size(360, 24)
+$form.Controls.Add($sslChk)
+$y += 34
+
 # Log box
 $log = New-Object System.Windows.Forms.TextBox
 $log.Multiline = $true
@@ -294,8 +340,23 @@ $goBtn.Add_Click({
         return
     }
 
+    # If user checked the bypass box at runtime, enable it now
+    if ($sslChk.Checked -and -not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+        $append.Invoke("⚠️ SSL certificate validation is DISABLED for this session.")
+    }
+
     try {
-        # Build and log the FULLY ENCODED Fixlet GET URL before calling it
+        # Build and log the fully encoded Fixlet GET URL before calling it
         $base        = Get-BaseUrl $server
         $encodedSite = Encode-SiteName $SiteName
         $fixletPath  = "/api/fixlet/custom/$encodedSite/$fixletId"
@@ -304,8 +365,13 @@ $goBtn.Add_Click({
         $append.Invoke(("Server base URL: {0}" -f $base))
         $append.Invoke(("Encoded Fixlet GET URL: {0}" -f $fixletUrl))
 
-        # Now call the API (function also returns its URL)
-        $resp = Get-FixletDetails -Server $server -Username $user -Password $pass -FixletID $fixletId
+        # Now call the API
+        try {
+            $resp = Get-FixletDetails -Server $server -Username $user -Password $pass -FixletID $fixletId
+        } catch {
+            $append.Invoke(("❌ TLS/Send error on GET: {0}" -f ($_.Exception.GetBaseException().Message)))
+            throw
+        }
         $append.Invoke(("GET URL (from func): {0}" -f $resp.Url))
 
         $fixletXml = $resp.Content
@@ -357,13 +423,16 @@ $goBtn.Add_Click({
             $append.Invoke($xmlBody)
 
             try {
-                # Log the encoded POST URL too
                 $postBase = Get-BaseUrl $server
                 $postUrl  = Join-ApiUrl -BaseUrl $postBase -RelativePath "/api/actions"
                 $append.Invoke(("Encoded POST URL: {0}" -f $postUrl))
 
-                $postedUrl = Post-ActionXml -Server $server -Username $user -Password $pass -XmlBody $xmlBody
-                $append.Invoke(("✅ {0} created successfully." -f $a))
+                try {
+                    $postedUrl = Post-ActionXml -Server $server -Username $user -Password $pass -XmlBody $xmlBody
+                    $append.Invoke(("✅ {0} created successfully." -f $a))
+                } catch {
+                    $append.Invoke(("❌ TLS/Send error on POST: {0}" -f ($_.Exception.GetBaseException().Message)))
+                }
             } catch {
                 $append.Invoke(("❌ Failed to create {0}: {1}" -f $a, $_))
             }
@@ -372,7 +441,7 @@ $goBtn.Add_Click({
         $append.Invoke(("All actions attempted. See log: {0}" -f $logFile))
     }
     catch {
-        $append.Invoke(("❌ Fatal error: {0}" -f $_))
+        $append.Invoke(("❌ Fatal error: {0}" -f ($_.Exception.GetBaseException().Message)))
     }
 })
 
