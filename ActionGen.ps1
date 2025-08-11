@@ -15,7 +15,50 @@ $GroupMap = @{
 }
 
 # =========================
-# HELPERS
+# URL / AUTH HELPERS
+# =========================
+function Get-BaseUrl {
+    param([string]$ServerInput)
+
+    if (-not $ServerInput) { throw "Server is empty." }
+    $s = $ServerInput.Trim()
+
+    # If user enters full base (starts with http), trust it and strip trailing slash
+    if ($s -match '^(?i)https?://') {
+        return ($s.TrimEnd('/'))
+    }
+
+    # Otherwise build default https://<host>:52311
+    # Strip any accidental leading/trailing slashes
+    $s = $s.Trim('/')
+
+    # If user already included a port, keep it; else add :52311
+    if ($s -match ':\d+$') {
+        return "https://$s"
+    } else {
+        return "https://$s:52311"
+    }
+}
+
+function Join-ApiUrl {
+    param(
+        [string]$BaseUrl,
+        [string]$RelativePath   # must start with /
+    )
+    # Ensure the relative path starts with a single /
+    $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
+    return ($BaseUrl.TrimEnd('/') + $rp)
+}
+
+function Get-AuthHeader {
+    param([string]$Username, [string]$Password)
+    $pair  = "$Username`:$Password"
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    "Basic " + [Convert]::ToBase64String($bytes)
+}
+
+# =========================
+# BIGFIX HELPERS
 # =========================
 function Get-FixletDetails {
     param (
@@ -24,14 +67,15 @@ function Get-FixletDetails {
         [Parameter(Mandatory=$true)][string]$Password,
         [Parameter(Mandatory=$true)][string]$FixletID
     )
+    $base = Get-BaseUrl $Server
     $encodedSite = [uri]::EscapeDataString($SiteName)
-    $url = "https://$Server:52311/api/fixlet/custom/$encodedSite/$FixletID"
+    $path = "/api/fixlet/custom/$encodedSite/$FixletID"
+    $url  = Join-ApiUrl -BaseUrl $base -RelativePath $path
+    $auth = Get-AuthHeader -Username $Username -Password $Password
 
-    $pair = "$Username`:$Password"
-    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
-    $encodedCredentials = [Convert]::ToBase64String($bytes)
-
-    Invoke-WebRequest -Uri $url -Headers @{ Authorization = ("Basic {0}" -f $encodedCredentials) } -UseBasicParsing -ErrorAction Stop
+    # Return both URL and content so caller can log the URL easily
+    $resp = Invoke-WebRequest -Uri $url -Headers @{ Authorization=$auth } -UseBasicParsing -ErrorAction Stop
+    [pscustomobject]@{ Url = $url; Content = $resp.Content }
 }
 
 function Parse-FixletTitleToProduct {
@@ -123,17 +167,17 @@ function Post-ActionXml {
         [string]$Password,
         [string]$XmlBody
     )
-    $url = "https://$Server:52311/api/actions"
-    $pair = "$Username`:$Password"
-    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
-    $auth = [Convert]::ToBase64String($bytes)
-
+    $base = Get-BaseUrl $Server
+    $url  = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
+    $auth = Get-AuthHeader -Username $Username -Password $Password
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($XmlBody)
 
     Invoke-RestMethod -Uri $url -Method Post -Headers @{
-        Authorization = "Basic $auth"
+        Authorization = $auth
         "Content-Type" = "application/xml"
     } -Body $bodyBytes -ErrorAction Stop
+
+    return $url
 }
 
 # =========================
@@ -257,8 +301,14 @@ $goBtn.Add_Click({
     }
 
     try {
+        $base = Get-BaseUrl $server
+
+        $append.Invoke(("Server base URL: {0}" -f $base))
         $append.Invoke(("Retrieving Fixlet XML from site '{0}' : ID {1}" -f $SiteName, $fixletId))
+
         $resp = Get-FixletDetails -Server $server -Username $user -Password $pass -FixletID $fixletId
+        $append.Invoke(("GET URL: {0}" -f $resp.Url))
+
         $fixletXml = $resp.Content
         $xml = [xml]$fixletXml
 
@@ -308,18 +358,18 @@ $goBtn.Add_Click({
             $append.Invoke($xmlBody)
 
             try {
-                $append.Invoke(("Posting {0} to https://{1}:52311/api/actions ..." -f $a, $server))
-                $resp = Post-ActionXml -Server $server -Username $user -Password $pass -XmlBody $xmlBody
-                $append.Invoke(("`u2705 {0} created successfully." -f $a))
+                $postUrl = Post-ActionXml -Server $server -Username $user -Password $pass -XmlBody $xmlBody
+                $append.Invoke(("POST URL: {0}" -f $postUrl))
+                $append.Invoke(("✅ {0} created successfully." -f $a))
             } catch {
-                $append.Invoke(("`u274C Failed to create {0}: {1}" -f $a, $_))
+                $append.Invoke(("❌ Failed to create {0}: {1}" -f $a, $_))
             }
         }
 
         $append.Invoke(("All actions attempted. See log: {0}" -f $logFile))
     }
     catch {
-        $append.Invoke(("`u274C Fatal error: {0}" -f $_))
+        $append.Invoke(("❌ Fatal error: {0}" -f $_))
     }
 })
 
