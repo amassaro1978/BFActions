@@ -1,11 +1,6 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-
-# --- Must be STA for WinForms ---
-if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
-    Write-Host "Please run PowerShell in STA mode:  powershell -STA -File .\ActionGen.ps1"
-    return
-}
+Add-Type -AssemblyName System.Web
 
 # =========================
 # CONFIG
@@ -23,7 +18,6 @@ $GroupMap = @{
 # =========================
 # ENCODING / URL / AUTH HELPERS
 # =========================
-Add-Type -AssemblyName System.Web
 function Encode-SiteName {
     param([string]$Name)
     # Encode, then normalize + to %20 and encode parentheses (to match what works in curl)
@@ -31,7 +25,6 @@ function Encode-SiteName {
     $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
     return $enc
 }
-
 function Get-BaseUrl([string]$ServerInput) {
     if (-not $ServerInput) { throw "Server is empty." }
     $s = $ServerInput.Trim()
@@ -39,12 +32,10 @@ function Get-BaseUrl([string]$ServerInput) {
     $s = $s.Trim('/')
     if ($s -match ':\d+$') { "https://$s" } else { "https://$s:52311" }
 }
-
 function Join-ApiUrl([string]$BaseUrl,[string]$RelativePath) {
     $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
     $BaseUrl.TrimEnd('/') + $rp
 }
-
 function Get-AuthHeader([string]$Username,[string]$Password) {
     $pair  = "$Username`:$Password"
     $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
@@ -56,7 +47,6 @@ function Get-AuthHeader([string]$Username,[string]$Password) {
 # =========================
 function HttpGetXml {
     param([string]$Url,[string]$AuthHeader)
-
     $req = [System.Net.HttpWebRequest]::Create($Url)
     $req.Method = "GET"
     $req.Accept = "application/xml"
@@ -65,7 +55,6 @@ function HttpGetXml {
     $req.PreAuthenticate = $true
     $req.AllowAutoRedirect = $false
     $req.Timeout = 30000
-
     try {
         $resp = $req.GetResponse()
         try {
@@ -79,10 +68,8 @@ function HttpGetXml {
         throw ($_.Exception.GetBaseException().Message)
     }
 }
-
 function HttpPostXml {
     param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
-
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($XmlBody)
     $req = [System.Net.HttpWebRequest]::Create($Url)
     $req.Method = "POST"
@@ -94,42 +81,54 @@ function HttpPostXml {
     $req.AllowAutoRedirect = $false
     $req.Timeout = 60000
     $req.ContentLength = $bytes.Length
-
     try {
-        $reqStream = $req.GetRequestStream()
-        try { $reqStream.Write($bytes, 0, $bytes.Length) } finally { $reqStream.Close() }
-        $resp = $req.GetResponse()
-        $resp.Close()
+        $rs = $req.GetRequestStream()
+        try { $rs.Write($bytes, 0, $bytes.Length) } finally { $rs.Close() }
+        $resp = $req.GetResponse(); $resp.Close()
     } catch {
         throw ($_.Exception.GetBaseException().Message)
     }
 }
 
 # =========================
-# BIGFIX LOGIC
+# BIGFIX PARSING HELPERS (robust)
 # =========================
-function Get-FixletDetails {
-    param (
-        [Parameter(Mandatory=$true)][string]$Server,
-        [Parameter(Mandatory=$true)][string]$Username,
-        [Parameter(Mandatory=$true)][string]$Password,
-        [Parameter(Mandatory=$true)][string]$FixletID
-    )
-    $base = Get-BaseUrl $Server
-    $encodedSite = Encode-SiteName $SiteName
-    $path = "/api/fixlet/custom/$encodedSite/$FixletID"
-    $url  = Join-ApiUrl -BaseUrl $base -RelativePath $path
-    $auth = Get-AuthHeader -Username $Username -Password $Password
+function Get-FixletContainer {
+    param([xml]$Xml)
+    if ($Xml.BES.Fixlet)   { return @{ Type="Fixlet";   Node=$Xml.BES.Fixlet } }
+    if ($Xml.BES.Task)     { return @{ Type="Task";     Node=$Xml.BES.Task } }
+    if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
+    throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline> root)."
+}
+function Get-ActionAndRelevance {
+    param($ContainerNode)
+    # Relevance
+    $relevance = @()
+    foreach ($r in $ContainerNode.Relevance) { $relevance += [string]$r }
 
-    $content = HttpGetXml -Url $url -AuthHeader $auth
-    [pscustomobject]@{ Url = $url; Content = $content }
+    # Action node: prefer explicit <Action>, fall back to <DefaultAction>
+    $actionNode = $null
+    if ($ContainerNode.Action) { $actionNode = $ContainerNode.Action | Select-Object -First 1 }
+    if (-not $actionNode -and $ContainerNode.DefaultAction) { $actionNode = $ContainerNode.DefaultAction }
+
+    if (-not $actionNode) { throw "No <Action> or <DefaultAction> block found." }
+
+    # Extract ActionScript text
+    $script = $null
+    if ($actionNode.ActionScript) {
+        $script = [string]$actionNode.ActionScript.'#text'
+        if ([string]::IsNullOrWhiteSpace($script)) {
+            $script = $actionNode.ActionScript.InnerText  # fallback
+        }
+    }
+    if (-not $script) { throw "Action found but no <ActionScript> content present." }
+
+    return @{ Relevance = $relevance; ActionScript = $script }
 }
 
-function Parse-FixletTitleToProduct([string]$Title) {
-    if ($Title -match "^Update:\s*(.+?)\s+Win$") { return $matches[1] }
-    return $Title
-}
-
+# =========================
+# SCHEDULING HELPERS
+# =========================
 function Get-NextWednesdays {
     $dates = @()
     $today = Get-Date
@@ -138,16 +137,17 @@ function Get-NextWednesdays {
     for ($i = 0; $i -lt 20; $i++) { $dates += $nextWed.AddDays(7*$i).ToString("yyyy-MM-dd") }
     return $dates
 }
-
 function Get-TimeSlots {
     $slots = @()
     $start = Get-Date "20:00"; $end = Get-Date "23:45"
     while ($start -le $end) { $slots += $start.ToString("h:mm tt"); $start = $start.AddMinutes(15) }
     return $slots
 }
-
 function Format-LocalBESDateTime([datetime]$dt) { $dt.ToString("yyyyMMdd'T'HHmmss") }
 
+# =========================
+# XML BUILDER
+# =========================
 function Build-SingleActionXml {
     param(
         [string]$ActionTitle,[string]$DisplayName,[string[]]$RelevanceBlocks,
@@ -189,6 +189,24 @@ $ActionScript
 "@
 }
 
+# =========================
+# BIGFIX API (compose with helpers)
+# =========================
+function Get-FixletDetails {
+    param (
+        [Parameter(Mandatory=$true)][string]$Server,
+        [Parameter(Mandatory=$true)][string]$Username,
+        [Parameter(Mandatory=$true)][string]$Password,
+        [Parameter(Mandatory=$true)][string]$FixletID
+    )
+    $base = Get-BaseUrl $Server
+    $encodedSite = Encode-SiteName $SiteName
+    $path = "/api/fixlet/custom/$encodedSite/$FixletID"
+    $url  = Join-ApiUrl -BaseUrl $base -RelativePath $path
+    $auth = Get-AuthHeader -Username $Username -Password $Password
+    $content = HttpGetXml -Url $url -AuthHeader $auth
+    [pscustomobject]@{ Url = $url; Content = $content }
+}
 function Post-ActionXml {
     param([string]$Server,[string]$Username,[string]$Password,[string]$XmlBody)
     $base = Get-BaseUrl $Server
@@ -336,20 +354,20 @@ $goBtn.Add_Click({
         }
         $append.Invoke(("GET URL (used): {0}" -f $resp.Url))
 
+        # Parse XML robustly (Fixlet/Task/Baseline, Action/DefaultAction)
         $fixletXml = $resp.Content
         $xml = [xml]$fixletXml
 
-        $titleRaw = $xml.BES.Fixlet.Title
+        $contInfo = Get-FixletContainer -Xml $xml
+        $container = $contInfo.Node
+        $append.Invoke(("Detected BES content type: {0}" -f $contInfo.Type))
+
+        $titleRaw = $container.Title
         $displayName = Parse-FixletTitleToProduct -Title $titleRaw
 
-        # Collect relevance
-        $relevance = @()
-        foreach ($rel in $xml.BES.Fixlet.Relevance) { $relevance += [string]$rel }
-
-        # First Action's ActionScript
-        $actionNode = $xml.BES.Fixlet.Action | Select-Object -First 1
-        if (-not $actionNode) { throw "No <Action> block found in Fixlet." }
-        $actionScript = [string]$actionNode.ActionScript.'#text'
+        $parsed = Get-ActionAndRelevance -ContainerNode $container
+        $relevance    = $parsed.Relevance
+        $actionScript = $parsed.ActionScript
 
         $append.Invoke(("Parsed title: {0}" -f $displayName))
         $append.Invoke(("Relevance count: {0}" -f $relevance.Count))
@@ -383,7 +401,6 @@ $goBtn.Add_Click({
             try {
                 $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
                 $append.Invoke(("Encoded POST URL: {0}" -f $postUrl))
-
                 try {
                     $auth = Get-AuthHeader -Username $user -Password $pass
                     HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBody
