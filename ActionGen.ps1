@@ -21,7 +21,7 @@ $BypassCertValidation = $false
 # NETWORK/TLS HARDENING
 # =========================
 try {
-    # Prefer TLS 1.2; include TLS 1.1/1.0 only if your server still needs it
+    # Prefer TLS 1.2; optionally include 1.1/1.0 if your server still needs it
     [System.Net.ServicePointManager]::SecurityProtocol =
         [System.Net.SecurityProtocolType]::Tls12 `
         -bor [System.Net.SecurityProtocolType]::Tls11 `
@@ -100,10 +100,7 @@ function Get-FixletDetails {
     $auth = Get-AuthHeader -Username $Username -Password $Password
 
     try {
-        $resp = Invoke-WebRequest -Uri $url -Headers @{
-            Authorization=$auth
-            Connection="Keep-Alive"
-        } -UseBasicParsing -ErrorAction Stop
+        $resp = Invoke-WebRequest -Uri $url -Headers @{ Authorization=$auth } -UseBasicParsing -ErrorAction Stop
         [pscustomobject]@{ Url = $url; Content = $resp.Content }
     } catch {
         throw ("GET failed: " + ($_.Exception.GetBaseException().Message))
@@ -207,7 +204,6 @@ function Post-ActionXml {
         Invoke-RestMethod -Uri $url -Method Post -Headers @{
             Authorization = $auth
             "Content-Type" = "application/xml"
-            Connection     = "Keep-Alive"
         } -Body $bodyBytes -ErrorAction Stop
         return $url
     } catch {
@@ -285,7 +281,7 @@ $goBtn.Size = New-Object System.Drawing.Size(220, 32)
 $form.Controls.Add($goBtn)
 $y += 42
 
-# TLS bypass toggle (visible so you can switch without editing script)
+# TLS bypass toggle (so you can switch without editing script)
 $sslChk = New-Object System.Windows.Forms.CheckBox
 $sslChk.Text = "Bypass SSL certificate validation (unsafe)"
 $sslChk.Checked = $BypassCertValidation
@@ -301,6 +297,7 @@ $log.ScrollBars = "Vertical"
 $log.ReadOnly = $false
 $log.WordWrap = $false
 $log.Location = New-Object System.Drawing.Point(10, $y)
+# Slightly taller now that we added the checkbox
 $log.Size = New-Object System.Drawing.Size(510, 520)
 $log.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($log)
