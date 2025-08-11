@@ -17,12 +17,14 @@ $GroupMap = @{
 # =========================
 # ENCODING / URL / AUTH HELPERS
 # =========================
-# Use HttpUtility to encode () and other chars; and normalize spaces to %20 (not +)
 Add-Type -AssemblyName System.Web
 function Encode-SiteName {
     param([string]$Name)
+    # Encode, then normalize space and parentheses
     $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
     $enc = $enc -replace '\+','%20'
+    $enc = $enc -replace '\(','%28'
+    $enc = $enc -replace '\)','%29'
     return $enc
 }
 
@@ -30,13 +32,8 @@ function Get-BaseUrl {
     param([string]$ServerInput)
     if (-not $ServerInput) { throw "Server is empty." }
     $s = $ServerInput.Trim()
-
-    if ($s -match '^(?i)https?://') {
-        return ($s.TrimEnd('/'))
-    }
-
+    if ($s -match '^(?i)https?://') { return ($s.TrimEnd('/')) }
     $s = $s.Trim('/')
-
     if ($s -match ':\d+$') { "https://$s" } else { "https://$s:52311" }
 }
 
@@ -122,7 +119,6 @@ function Build-SingleActionXml {
         [string]$GroupId               # "00-12345"
     )
 
-    # Wrap variables before a colon inside strings to avoid $Drive: parsing
     $titleText = "$($DisplayName): $ActionTitle"
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
