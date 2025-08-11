@@ -1,52 +1,45 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# --- Must be STA for WinForms ---
+if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+    Write-Host "Please run PowerShell in STA mode:  powershell -STA -File .\ActionGen.ps1"
+    return
+}
+
 # =========================
 # CONFIG
 # =========================
 $SiteName = "Test Group Managed (Workstations)"  # hardcoded custom site name
-
-# Map each action to its Computer Group ID (keep as strings to preserve 00- prefix).
 $GroupMap = @{
     "Pilot"                     = "00-12345"
     "Deploy"                    = "00-12345"
     "Force"                     = "00-12345"
     "Conference/Training Rooms" = "00-12345"
 }
-
-# Toggle this to $true ONLY if your test server uses a self-signed/invalid cert
-$BypassCertValidation = $false
+$BypassCertValidation = $false  # default; can toggle in UI
 
 # =========================
 # NETWORK/TLS HARDENING
 # =========================
 try {
-    # Prefer TLS 1.2; optionally include 1.1/1.0 if your server still needs it
     [System.Net.ServicePointManager]::SecurityProtocol =
         [System.Net.SecurityProtocolType]::Tls12 `
         -bor [System.Net.SecurityProtocolType]::Tls11 `
         -bor [System.Net.SecurityProtocolType]::Tls
-
-    # Avoid 100-Continue stalls
     [System.Net.ServicePointManager]::Expect100Continue = $false
-
-    # Use system proxy creds if any
     [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
 } catch {}
 
-if ($BypassCertValidation) {
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
+# Define TrustAllCertsPolicy ONCE, up-front (no Add-Type during click)
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+Add-Type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) { return true; }
+    public bool CheckValidationResult(ServicePoint s, X509Certificate c, WebRequest r, int p) { return true; }
 }
 "@
-    }
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 }
 
 # =========================
@@ -55,29 +48,22 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 Add-Type -AssemblyName System.Web
 function Encode-SiteName {
     param([string]$Name)
-    # Encode, then normalize space and parentheses
     $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
     $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
     return $enc
 }
-
-function Get-BaseUrl {
-    param([string]$ServerInput)
+function Get-BaseUrl([string]$ServerInput) {
     if (-not $ServerInput) { throw "Server is empty." }
     $s = $ServerInput.Trim()
     if ($s -match '^(?i)https?://') { return ($s.TrimEnd('/')) }
     $s = $s.Trim('/')
     if ($s -match ':\d+$') { "https://$s" } else { "https://$s:52311" }
 }
-
-function Join-ApiUrl {
-    param([string]$BaseUrl,[string]$RelativePath)
+function Join-ApiUrl([string]$BaseUrl,[string]$RelativePath) {
     $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
     $BaseUrl.TrimEnd('/') + $rp
 }
-
-function Get-AuthHeader {
-    param([string]$Username, [string]$Password)
+function Get-AuthHeader([string]$Username,[string]$Password) {
     $pair  = "$Username`:$Password"
     $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
     "Basic " + [Convert]::ToBase64String($bytes)
@@ -107,52 +93,32 @@ function Get-FixletDetails {
     }
 }
 
-function Parse-FixletTitleToProduct {
-    param([string]$Title)
-    # "Update: Vendor AppName Version Win" -> "Vendor AppName Version"
+function Parse-FixletTitleToProduct([string]$Title) {
     if ($Title -match "^Update:\s*(.+?)\s+Win$") { return $matches[1] }
     return $Title
 }
-
 function Get-NextWednesdays {
     $dates = @()
     $today = Get-Date
-    # Wednesday = 3 (Sunday=0)
     $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
     $nextWed = $today.AddDays($daysUntilWed)
     for ($i = 0; $i -lt 20; $i++) { $dates += $nextWed.AddDays(7*$i).ToString("yyyy-MM-dd") }
     return $dates
 }
-
 function Get-TimeSlots {
     $slots = @()
-    $start = Get-Date "20:00"   # 8:00 PM
-    $end   = Get-Date "23:45"   # 11:45 PM
-    while ($start -le $end) {
-        $slots += $start.ToString("h:mm tt")
-        $start = $start.AddMinutes(15)
-    }
+    $start = Get-Date "20:00"; $end = Get-Date "23:45"
+    while ($start -le $end) { $slots += $start.ToString("h:mm tt"); $start = $start.AddMinutes(15) }
     return $slots
 }
-
-function Format-LocalBESDateTime {
-    param([datetime]$dt)
-    # Local (no Z) yyyymmddTHHMMSS format
-    return $dt.ToString("yyyyMMdd'T'HHmmss")
-}
+function Format-LocalBESDateTime([datetime]$dt) { $dt.ToString("yyyyMMdd'T'HHmmss") }
 
 function Build-SingleActionXml {
     param(
-        [string]$ActionTitle,          # "Pilot" | "Deploy" | "Force" | "Conference/Training Rooms"
-        [string]$DisplayName,          # "Vendor AppName Version"
-        [string[]]$RelevanceBlocks,    # relevance strings
-        [string]$ActionScript,         # action script text
-        [datetime]$StartLocal,         # scheduled local start
-        [bool]$SetDeadline = $false,   # only true for "Force"
-        [datetime]$DeadlineLocal = $null,
-        [string]$GroupId               # "00-12345"
+        [string]$ActionTitle,[string]$DisplayName,[string[]]$RelevanceBlocks,
+        [string]$ActionScript,[datetime]$StartLocal,[bool]$SetDeadline = $false,
+        [datetime]$DeadlineLocal = $null,[string]$GroupId
     )
-
     $titleText = "$($DisplayName): $ActionTitle"
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
@@ -189,12 +155,7 @@ $ActionScript
 }
 
 function Post-ActionXml {
-    param(
-        [string]$Server,
-        [string]$Username,
-        [string]$Password,
-        [string]$XmlBody
-    )
+    param([string]$Server,[string]$Username,[string]$Password,[string]$XmlBody)
     $base = Get-BaseUrl $Server
     $url  = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
     $auth = Get-AuthHeader -Username $Username -Password $Password
@@ -281,7 +242,7 @@ $goBtn.Size = New-Object System.Drawing.Size(220, 32)
 $form.Controls.Add($goBtn)
 $y += 42
 
-# TLS bypass toggle (so you can switch without editing script)
+# TLS bypass toggle (no Add-Type in handler; we only assign the policy)
 $sslChk = New-Object System.Windows.Forms.CheckBox
 $sslChk.Text = "Bypass SSL certificate validation (unsafe)"
 $sslChk.Checked = $BypassCertValidation
@@ -297,7 +258,6 @@ $log.ScrollBars = "Vertical"
 $log.ReadOnly = $false
 $log.WordWrap = $false
 $log.Location = New-Object System.Drawing.Point(10, $y)
-# Slightly taller now that we added the checkbox
 $log.Size = New-Object System.Drawing.Size(510, 520)
 $log.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($log)
@@ -337,23 +297,13 @@ $goBtn.Add_Click({
         return
     }
 
-    # If user checked the bypass box at runtime, enable it now
-    if ($sslChk.Checked -and -not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) { return true; }
-}
-"@
+    # Toggle cert validation without compiling anything in this thread
+    if ($sslChk.Checked) {
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
         $append.Invoke("⚠️ SSL certificate validation is DISABLED for this session.")
     }
 
     try {
-        # Build and log the fully encoded Fixlet GET URL before calling it
         $base        = Get-BaseUrl $server
         $encodedSite = Encode-SiteName $SiteName
         $fixletPath  = "/api/fixlet/custom/$encodedSite/$fixletId"
@@ -362,7 +312,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         $append.Invoke(("Server base URL: {0}" -f $base))
         $append.Invoke(("Encoded Fixlet GET URL: {0}" -f $fixletUrl))
 
-        # Now call the API
         try {
             $resp = Get-FixletDetails -Server $server -Username $user -Password $pass -FixletID $fixletId
         } catch {
@@ -377,11 +326,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         $titleRaw = $xml.BES.Fixlet.Title
         $displayName = Parse-FixletTitleToProduct -Title $titleRaw
 
-        # Collect relevance
         $relevance = @()
         foreach ($rel in $xml.BES.Fixlet.Relevance) { $relevance += [string]$rel }
 
-        # First Action's ActionScript
         $actionNode = $xml.BES.Fixlet.Action | Select-Object -First 1
         if (-not $actionNode) { throw "No <Action> block found in Fixlet." }
         $actionScript = [string]$actionNode.ActionScript.'#text'
@@ -390,15 +337,12 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         $append.Invoke(("Relevance count: {0}" -f $relevance.Count))
         $append.Invoke(("Action script length: {0} chars" -f $actionScript.Length))
 
-        # Build start (local)
         $startLocal = Get-Date "$dateStr $timeStr"
         $append.Invoke(("Start (local): {0}" -f $startLocal))
 
-        # Force deadline = +24h absolute
         $deadlineLocal = $startLocal.AddHours(24)
         $append.Invoke(("Force deadline (local): {0}" -f $deadlineLocal))
 
-        # Define the four actions
         $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
 
         foreach ($a in $actions) {
@@ -407,14 +351,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             $isForce = ($a -eq "Force")
 
             $xmlBody = Build-SingleActionXml `
-                -ActionTitle $a `
-                -DisplayName $displayName `
-                -RelevanceBlocks $relevance `
-                -ActionScript $actionScript `
-                -StartLocal $startLocal `
-                -SetDeadline:$isForce `
-                -DeadlineLocal $deadlineLocal `
-                -GroupId $groupId
+                -ActionTitle $a -DisplayName $displayName `
+                -RelevanceBlocks $relevance -ActionScript $actionScript `
+                -StartLocal $startLocal -SetDeadline:$isForce `
+                -DeadlineLocal $deadlineLocal -GroupId $groupId
 
             $append.Invoke(("---- XML for {0} ----" -f $a))
             $append.Invoke($xmlBody)
