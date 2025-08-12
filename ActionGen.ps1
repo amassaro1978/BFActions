@@ -49,7 +49,6 @@ function LogLine($txt) {
     $LogBox.SelectionStart = $LogBox.Text.Length
     $LogBox.ScrollToCaret()
 }
-function Format-LocalBESDateTime([datetime]$dt) { $dt.ToString("yyyyMMdd'T'HHmmss") }
 function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
@@ -130,7 +129,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# SINGLE ACTION XML (Relevance in CDATA, RunningMessage <Text>)
+# SINGLE ACTION XML (Offset timestamps, CDATA relevance, RunningMessage <Text>)
 # =========================
 function Build-SingleActionXml {
     param(
@@ -155,9 +154,14 @@ function Build-SingleActionXml {
         "    <Relevance><![CDATA[$safe]]></Relevance>"
     }) -join "`r`n"
 
-    $startStr    = (Get-Date $StartLocal).ToString("yyyyMMdd'T'HHmmss")
-    $deadlineStr = if ($SetDeadline -and $DeadlineLocal) { (Get-Date $DeadlineLocal).ToString("yyyyMMdd'T'HHmmss") } else { $null }
-    $deadlineBlock = if ($deadlineStr) { "<Deadline>$deadlineStr</Deadline>" } else { "" }
+    # ISO with timezone offset, like 2025-08-27T20:00:00-04:00
+    $startStr    = (Get-Date $StartLocal).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
+                        [System.Globalization.CultureInfo]::InvariantCulture)
+    $deadlineStr = if ($SetDeadline -and $DeadlineLocal) {
+        (Get-Date $DeadlineLocal).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
+            [System.Globalization.CultureInfo]::InvariantCulture)
+    } else { $null }
+    $deadlineBlock = if ($deadlineStr) { "<EndDateTimeLocalOffset>$deadlineStr</EndDateTimeLocalOffset>" } else { "" }
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -178,7 +182,7 @@ $ActionScript
 
       <HasTimeRange>true</HasTimeRange>
       <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocal>$startStr</StartDateTimeLocal>
+      <StartDateTimeLocalOffset>$startStr</StartDateTimeLocalOffset>
       <HasEndTime>false</HasEndTime>
 
       <HasDeadline>$([string]$SetDeadline)</HasDeadline>
@@ -222,8 +226,8 @@ function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB) {
     } else {
         $tb = New-Object System.Windows.Forms.TextBox
     }
-    $tb.Location = New-Object Drawing.Point(160,$script:y)
-    $tb.Size = New-Object Drawing.Size(420,22)
+    $tb.Location = New-Object System.Drawing.Point(160,$script:y)
+    $tb.Size = New-Object System.Drawing.Size(420,22)
     $form.Controls.Add($tb)
     $OutTB.Value = $tb
     $script:y += 34
@@ -235,16 +239,16 @@ $tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
 $tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
 # Date (future Wednesdays)
-$lblDate = New-Object Windows.Forms.Label
+$lblDate = New-Object System.Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
-$lblDate.Location = New-Object Drawing.Point(10,$y)
-$lblDate.Size = New-Object Drawing.Size(140,22)
+$lblDate.Location = New-Object System.Drawing.Point(10,$y)
+$lblDate.Size = New-Object System.Drawing.Size(140,22)
 $form.Controls.Add($lblDate)
 
-$cbDate = New-Object Windows.Forms.ComboBox
+$cbDate = New-Object System.Windows.Forms.ComboBox
 $cbDate.DropDownStyle = 'DropDownList'
-$cbDate.Location = New-Object Drawing.Point(160,$y)
-$cbDate.Size = New-Object Drawing.Size(160,22)
+$cbDate.Location = New-Object System.Drawing.Point(160,$y)
+$cbDate.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbDate)
 $y += 34
 # populate next 20 Wednesdays
@@ -254,26 +258,26 @@ $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
 # Time (8:00 PM – 11:45 PM, 15m)
-$lblTime = New-Object Windows.Forms.Label
+$lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
-$lblTime.Location = New-Object Drawing.Point(10,$y)
-$lblTime.Size = New-Object Drawing.Size(140,22)
+$lblTime.Location = New-Object System.Drawing.Point(10,$y)
+$lblTime.Size = New-Object System.Drawing.Size(140,22)
 $form.Controls.Add($lblTime)
 
-$cbTime = New-Object Windows.Forms.ComboBox
+$cbTime = New-Object System.Windows.Forms.ComboBox
 $cbTime.DropDownStyle = 'DropDownList'
-$cbTime.Location = New-Object Drawing.Point(160,$y)
-$cbTime.Size = New-Object Drawing.Size(160,22)
+$cbTime.Location = New-Object System.Drawing.Point(160,$y)
+$cbTime.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbTime)
 $y += 42
 $start = Get-Date "20:00"; $end = Get-Date "23:45"
 while ($start -le $end) { [void]$cbTime.Items.Add($start.ToString("h:mm tt")); $start = $start.AddMinutes(15) }
 
 # Button
-$btn = New-Object Windows.Forms.Button
+$btn = New-Object System.Windows.Forms.Button
 $btn.Text = "Generate & Post 4 Single Actions"
-$btn.Location = New-Object Drawing.Point(160,$y)
-$btn.Size = New-Object Drawing.Size(280,32)
+$btn.Location = New-Object System.Drawing.Point(160,$y)
+$btn.Size = New-Object System.Drawing.Size(280,32)
 $form.Controls.Add($btn)
 $y += 42
 
@@ -283,8 +287,8 @@ $LogBox.Multiline = $true
 $LogBox.ScrollBars = "Vertical"
 $LogBox.ReadOnly = $false
 $LogBox.WordWrap = $false
-$LogBox.Location = New-Object Drawing.Point(10,$y)
-$LogBox.Size = New-Object Drawing.Size(570,520)
+$LogBox.Location = New-Object System.Drawing.Point(10,$y)
+$LogBox.Size = New-Object System.Drawing.Size(570,520)
 $LogBox.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($LogBox)
 # Context menu for easy copy/select all
