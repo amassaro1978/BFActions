@@ -130,7 +130,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# SINGLE ACTION XML (targets ComputerGroup in SAME site as fixlet)
+# SINGLE ACTION XML (Relevance in CDATA, RunningMessage <Text>)
 # =========================
 function Build-SingleActionXml {
     param(
@@ -144,11 +144,20 @@ function Build-SingleActionXml {
         [string]$GroupSiteName,        # same site as fixlet
         [string]$GroupIdNumeric        # numeric ID (no 00-)
     )
+
     $titleText = "$($DisplayName): $ActionTitle"
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
-    $rels = ($RelevanceBlocks | ForEach-Object { "    <Relevance>$([System.Security.SecurityElement]::Escape($_))</Relevance>" }) -join "`r`n"
-    $deadlineBlock = if ($SetDeadline -and $DeadlineLocal) { "<Deadline>$(Format-LocalBESDateTime $DeadlineLocal)</Deadline>" } else { "" }
+
+    # Relevance as CDATA (avoid &quot; etc.). Guard against ']]>'.
+    $rels = ($RelevanceBlocks | ForEach-Object {
+        $safe = $_ -replace ']]>', ']]]]><![CDATA[>'
+        "    <Relevance><![CDATA[$safe]]></Relevance>"
+    }) -join "`r`n"
+
+    $startStr    = (Get-Date $StartLocal).ToString("yyyyMMdd'T'HHmmss")
+    $deadlineStr = if ($SetDeadline -and $DeadlineLocal) { (Get-Date $DeadlineLocal).ToString("yyyyMMdd'T'HHmmss") } else { $null }
+    $deadlineBlock = if ($deadlineStr) { "<Deadline>$deadlineStr</Deadline>" } else { "" }
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -160,14 +169,21 @@ $rels
 $ActionScript
 ]]></ActionScript>
     <Settings>
+      <ActionUITitle>$titleEsc</ActionUITitle>
+
       <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage>Updating to $dispEsc. Please wait....</RunningMessage>
+      <RunningMessage>
+        <Text>Updating to $dispEsc. Please wait....</Text>
+      </RunningMessage>
+
       <HasTimeRange>true</HasTimeRange>
       <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocal>$(Format-LocalBESDateTime $StartLocal)</StartDateTimeLocal>
+      <StartDateTimeLocal>$startStr</StartDateTimeLocal>
       <HasEndTime>false</HasEndTime>
+
       <HasDeadline>$([string]$SetDeadline)</HasDeadline>
       $deadlineBlock
+
       <HasReapply>false</HasReapply>
       <HasRetry>false</HasRetry>
       <HasTemporalDistribution>false</HasTemporalDistribution>
@@ -321,7 +337,7 @@ $btn.Add_Click({
         LogLine ("Relevance count: {0}" -f $relevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
-        $startLocal = Get-Date "$dStr $tStr"
+        $startLocal    = Get-Date "$dStr $tStr"
         $deadlineLocal = $startLocal.AddHours(24)  # for Force
 
         $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
