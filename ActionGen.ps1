@@ -3,17 +3,19 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Web
 
 # =========================
-# CONFIG
+# CONFIG (EDIT THESE)
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
-$CustomSiteName = "Test Group Managed (Workstations)"  # hardcoded site
 
-# Action -> Computer Group ID (keep strings to preserve 00- prefix)
+# Site that hosts BOTH the Fixlet content and the Computer Groups
+$CustomSiteName = "Test Group Managed (Workstations)"
+
+# Action -> Computer Group ID (you can keep the 00- prefix; we'll strip it)
 $GroupMap = @{
     "Pilot"                     = "00-12345"
-    "Deploy"                    = "00-12345"
-    "Force"                     = "00-12345"
-    "Conference/Training Rooms" = "00-12345"
+    "Deploy"                    = "00-12346"
+    "Force"                     = "00-12347"
+    "Conference/Training Rooms" = "00-12348"
 }
 
 # =========================
@@ -48,6 +50,10 @@ function LogLine($txt) {
     $LogBox.ScrollToCaret()
 }
 function Format-LocalBESDateTime([datetime]$dt) { $dt.ToString("yyyyMMdd'T'HHmmss") }
+function Get-NumericGroupId([string]$GroupIdWithPrefix) {
+    if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
+    return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
+}
 
 # =========================
 # HTTP (curl-like)
@@ -124,7 +130,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# SINGLE ACTION XML
+# SINGLE ACTION XML (targets ComputerGroup in SAME site as fixlet)
 # =========================
 function Build-SingleActionXml {
     param(
@@ -133,9 +139,10 @@ function Build-SingleActionXml {
         [string[]]$RelevanceBlocks,    # relevance strings
         [string]$ActionScript,         # action script
         [datetime]$StartLocal,         # scheduled local start
-        [bool]$SetDeadline = $false,   # only true for Force
+        [bool]$SetDeadline = $false,   # true only for Force
         [datetime]$DeadlineLocal = $null,
-        [string]$GroupId               # "00-12345"
+        [string]$GroupSiteName,        # same site as fixlet
+        [string]$GroupIdNumeric        # numeric ID (no 00-)
     )
     $titleText = "$($DisplayName): $ActionTitle"
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
@@ -167,7 +174,10 @@ $ActionScript
       <HasAllowNoFixlets>false</HasAllowNoFixlets>
     </Settings>
     <Target>
-      <CustomRelevance>member of group whose (id of it as string = "$GroupId")</CustomRelevance>
+      <ComputerGroup>
+        <SiteName>$([System.Security.SecurityElement]::Escape($GroupSiteName))</SiteName>
+        <ID>$GroupIdNumeric</ID>
+      </ComputerGroup>
     </Target>
   </SingleAction>
 </BES>
@@ -319,8 +329,11 @@ $btn.Add_Click({
         LogLine "POST URL: $postUrl"
 
         foreach ($a in $actions) {
-            $groupId = "$($GroupMap[$a])"
-            if (-not $groupId) { LogLine "❌ Missing group map for $a"; continue }
+            $groupIdRaw = "$($GroupMap[$a])"
+            if (-not $groupIdRaw) { LogLine "❌ Missing group map for $a"; continue }
+            $groupIdNumeric = Get-NumericGroupId $groupIdRaw
+            if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '$groupIdRaw' for $a"; continue }
+
             $isForce = ($a -eq "Force")
 
             $xmlBody = Build-SingleActionXml `
@@ -331,7 +344,8 @@ $btn.Add_Click({
                 -StartLocal $startLocal `
                 -SetDeadline:$isForce `
                 -DeadlineLocal $deadlineLocal `
-                -GroupId $groupId
+                -GroupSiteName $CustomSiteName `
+                -GroupIdNumeric $groupIdNumeric
 
             LogLine ("---- SingleAction XML for {0} ----" -f $a)
             LogLine $xmlBody
