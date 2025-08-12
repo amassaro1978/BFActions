@@ -54,6 +54,13 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
 
+# Format like 2025-08-20T20:00:00-0400 (remove ONLY the colon in the offset)
+function Format-OffsetNoColon([datetime]$dt) {
+    $s = (Get-Date $dt).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
+         [System.Globalization.CultureInfo]::InvariantCulture)
+    return ($s -replace '([+-]\d{2}):(\d{2})$','$1$2')
+}
+
 # =========================
 # HTTP (curl-like)
 # =========================
@@ -154,13 +161,9 @@ function Build-SingleActionXml {
         "    <Relevance><![CDATA[$safe]]></Relevance>"
     }) -join "`r`n"
 
-    # ISO with timezone offset, like 2025-08-27T20:00:00-04:00
-    $startStr    = (Get-Date $StartLocal).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
-                        [System.Globalization.CultureInfo]::InvariantCulture)
-    $deadlineStr = if ($SetDeadline -and $DeadlineLocal) {
-        (Get-Date $DeadlineLocal).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
-            [System.Globalization.CultureInfo]::InvariantCulture)
-    } else { $null }
+    # Offset timestamps with NO colon in the offset, e.g., 2025-08-20T20:00:00-0400
+    $startStr    = Format-OffsetNoColon $StartLocal
+    $deadlineStr = if ($SetDeadline -and $DeadlineLocal) { Format-OffsetNoColon $DeadlineLocal } else { $null }
     $deadlineBlock = if ($deadlineStr) { "<EndDateTimeLocalOffset>$deadlineStr</EndDateTimeLocalOffset>" } else { "" }
 
 @"
@@ -216,8 +219,8 @@ $y = 20
 function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB) {
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = $Label
-    $lbl.Location = New-Object Drawing.Point(10,$script:y)
-    $lbl.Size = New-Object Drawing.Size(140,22)
+    $lbl.Location = New-Object System.Drawing.Point(10,$script:y)
+    $lbl.Size = New-Object System.Drawing.Size(140,22)
     $form.Controls.Add($lbl)
 
     if ($IsPassword) {
