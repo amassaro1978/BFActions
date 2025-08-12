@@ -53,12 +53,9 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
-
-# Format like 2025-08-20T20:00:00-0400 (remove ONLY the colon in the offset)
-function Format-OffsetNoColon([datetime]$dt) {
-    $s = (Get-Date $dt).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
-         [System.Globalization.CultureInfo]::InvariantCulture)
-    return ($s -replace '([+-]\d{2}):(\d{2})$','$1$2')
+function Format-BESLocal([datetime]$dt) {
+    (Get-Date $dt).ToString("yyyyMMdd'T'HHmmss",
+        [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 # =========================
@@ -136,7 +133,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# SINGLE ACTION XML (Offset timestamps, CDATA relevance, RunningMessage <Text>)
+# SINGLE ACTION XML (Local timestamps, CDATA relevance, RunningMessage <Text>)
 # =========================
 function Build-SingleActionXml {
     param(
@@ -161,10 +158,9 @@ function Build-SingleActionXml {
         "    <Relevance><![CDATA[$safe]]></Relevance>"
     }) -join "`r`n"
 
-    # Offset timestamps with NO colon in the offset, e.g., 2025-08-20T20:00:00-0400
-    $startStr    = Format-OffsetNoColon $StartLocal
-    $deadlineStr = if ($SetDeadline -and $DeadlineLocal) { Format-OffsetNoColon $DeadlineLocal } else { $null }
-    $deadlineBlock = if ($deadlineStr) { "<EndDateTimeLocalOffset>$deadlineStr</EndDateTimeLocalOffset>" } else { "" }
+    $startStr    = Format-BESLocal $StartLocal
+    $deadlineStr = if ($SetDeadline -and $DeadlineLocal) { Format-BESLocal $DeadlineLocal } else { $null }
+    $deadlineBlock = if ($deadlineStr) { "<Deadline>$deadlineStr</Deadline>" } else { "" }
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -185,7 +181,7 @@ $ActionScript
 
       <HasTimeRange>true</HasTimeRange>
       <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocalOffset>$startStr</StartDateTimeLocalOffset>
+      <StartDateTimeLocal>$startStr</StartDateTimeLocal>
       <HasEndTime>false</HasEndTime>
 
       <HasDeadline>$([string]$SetDeadline)</HasDeadline>
