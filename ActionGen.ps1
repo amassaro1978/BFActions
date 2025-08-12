@@ -53,9 +53,12 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
-function Format-BESLocal([datetime]$dt) {
-    (Get-Date $dt).ToString("yyyyMMdd'T'HHmmss",
-        [System.Globalization.CultureInfo]::InvariantCulture)
+
+# Format like 2025-08-20T20:00:00-0400 (remove ONLY the colon in offset)
+function Format-OffsetNoColon([datetime]$dt) {
+    $s = (Get-Date $dt).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
+         [System.Globalization.CultureInfo]::InvariantCulture)
+    return ($s -replace '([+-]\d{2}):(\d{2})$','$1$2')
 }
 
 # =========================
@@ -133,7 +136,11 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# SINGLE ACTION XML (Local timestamps, CDATA relevance, RunningMessage <Text>)
+# SINGLE ACTION XML
+#   - Relevance in CDATA
+#   - RunningMessage <Text>
+#   - StartDateTimeLocal (yyyyMMdd'T'HHmmss)
+#   - For "Force": HasEndTime=true + EndDateTimeLocalOffset (start+24h, -0400 style)
 # =========================
 function Build-SingleActionXml {
     param(
@@ -142,8 +149,8 @@ function Build-SingleActionXml {
         [string[]]$RelevanceBlocks,    # relevance strings
         [string]$ActionScript,         # action script
         [datetime]$StartLocal,         # scheduled local start
-        [bool]$SetDeadline = $false,   # true only for Force
-        [datetime]$DeadlineLocal = $null,
+        [bool]$IsForce = $false,       # only Force has an end-time
+        [datetime]$ForceEndLocal = $null, # start + 24h for Force
         [string]$GroupSiteName,        # same site as fixlet
         [string]$GroupIdNumeric        # numeric ID (no 00-)
     )
@@ -158,9 +165,16 @@ function Build-SingleActionXml {
         "    <Relevance><![CDATA[$safe]]></Relevance>"
     }) -join "`r`n"
 
-    $startStr    = Format-BESLocal $StartLocal
-    $deadlineStr = if ($SetDeadline -and $DeadlineLocal) { Format-BESLocal $DeadlineLocal } else { $null }
-    $deadlineBlock = if ($deadlineStr) { "<Deadline>$deadlineStr</Deadline>" } else { "" }
+    $startLocalStr = (Get-Date $StartLocal).ToString("yyyyMMdd'T'HHmmss",
+                        [System.Globalization.CultureInfo]::InvariantCulture)
+
+    $hasEnd = $false
+    $endBlock = ""
+    if ($IsForce -and $ForceEndLocal) {
+        $hasEnd = $true
+        $endStr = Format-OffsetNoColon $ForceEndLocal
+        $endBlock = "      <EndDateTimeLocalOffset>$endStr</EndDateTimeLocalOffset>"
+    }
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -181,11 +195,9 @@ $ActionScript
 
       <HasTimeRange>true</HasTimeRange>
       <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocal>$startStr</StartDateTimeLocal>
-      <HasEndTime>false</HasEndTime>
-
-      <HasDeadline>$([string]$SetDeadline)</HasDeadline>
-      $deadlineBlock
+      <StartDateTimeLocal>$startLocalStr</StartDateTimeLocal>
+      <HasEndTime>$([string]$hasEnd)</HasEndTime>
+$endBlock
 
       <HasReapply>false</HasReapply>
       <HasRetry>false</HasRetry>
@@ -341,7 +353,7 @@ $btn.Add_Click({
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
         $startLocal    = Get-Date "$dStr $tStr"
-        $deadlineLocal = $startLocal.AddHours(24)  # for Force
+        $forceEndLocal = $startLocal.AddHours(24)  # for Force
 
         $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
@@ -361,8 +373,8 @@ $btn.Add_Click({
                 -RelevanceBlocks $relevance `
                 -ActionScript $actionScript `
                 -StartLocal $startLocal `
-                -SetDeadline:$isForce `
-                -DeadlineLocal $deadlineLocal `
+                -IsForce:$isForce `
+                -ForceEndLocal $forceEndLocal `
                 -GroupSiteName $CustomSiteName `
                 -GroupIdNumeric $groupIdNumeric
 
