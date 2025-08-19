@@ -139,20 +139,19 @@ function Parse-FixletTitleToProduct([string]$Title) {
 # SINGLE ACTION XML
 #   - Relevance in CDATA
 #   - RunningMessage <Text>
-#   - StartDateTimeLocal (yyyyMMdd'T'HHmmss)
-#   - For "Force": HasEndTime=true + EndDateTimeLocalOffset (start+24h, -0400 style)
+#   - TimeRange wrapper with Start/optional End (offset, no colon)
 # =========================
 function Build-SingleActionXml {
     param(
-        [string]$ActionTitle,          # Pilot/Deploy/Force/Conference...
-        [string]$DisplayName,          # Vendor App Version
-        [string[]]$RelevanceBlocks,    # relevance strings
-        [string]$ActionScript,         # action script
-        [datetime]$StartLocal,         # scheduled local start
-        [bool]$IsForce = $false,       # only Force has an end-time
-        [datetime]$ForceEndLocal = $null, # start + 24h for Force
-        [string]$GroupSiteName,        # same site as fixlet
-        [string]$GroupIdNumeric        # numeric ID (no 00-)
+        [string]$ActionTitle,            # Pilot/Deploy/Force/Conference...
+        [string]$DisplayName,            # Vendor App Version
+        [string[]]$RelevanceBlocks,      # relevance strings
+        [string]$ActionScript,           # action script
+        [datetime]$StartLocal,           # scheduled local start
+        [bool]$IsForce = $false,         # only Force has an end-time
+        [datetime]$ForceEndLocal = $null,# start + 24h for Force
+        [string]$GroupSiteName,          # same site as fixlet
+        [string]$GroupIdNumeric          # numeric ID (no 00-)
     )
 
     $titleText = "$($DisplayName): $ActionTitle"
@@ -165,16 +164,19 @@ function Build-SingleActionXml {
         "    <Relevance><![CDATA[$safe]]></Relevance>"
     }) -join "`r`n"
 
-    $startLocalStr = (Get-Date $StartLocal).ToString("yyyyMMdd'T'HHmmss",
-                        [System.Globalization.CultureInfo]::InvariantCulture)
-
-    $hasEnd = $false
-    $endBlock = ""
+    # Start/End strings inside <TimeRange>
+    $startStr = Format-OffsetNoColon $StartLocal
+    $timeRange = @"
+      <TimeRange>
+        <StartDateTimeLocalOffset>$startStr</StartDateTimeLocalOffset>
+"@
     if ($IsForce -and $ForceEndLocal) {
-        $hasEnd = $true
         $endStr = Format-OffsetNoColon $ForceEndLocal
-        $endBlock = "      <EndDateTimeLocalOffset>$endStr</EndDateTimeLocalOffset>"
+        $timeRange += "        <EndDateTimeLocalOffset>$endStr</EndDateTimeLocalOffset>`n"
     }
+    $timeRange += "      </TimeRange>"
+
+    $hasEnd = ($IsForce -and $ForceEndLocal)
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -194,10 +196,9 @@ $ActionScript
       </RunningMessage>
 
       <HasTimeRange>true</HasTimeRange>
+$timeRange
       <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocal>$startLocalStr</StartDateTimeLocal>
-      <HasEndTime>$([string]$hasEnd)</HasEndTime>
-$endBlock
+      <HasEndTime>$([bool]$hasEnd -as [string]).ToLower()</HasEndTime>
 
       <HasReapply>false</HasReapply>
       <HasRetry>false</HasRetry>
