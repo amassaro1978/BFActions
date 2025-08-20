@@ -23,6 +23,7 @@ $GroupMap = @{
 # =========================
 function Encode-SiteName([string]$Name) {
     $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
+    # Make it look like curl’s encoding (spaces, parens)
     $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
     return $enc
 }
@@ -58,6 +59,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
 function Format-OffsetNoColon([datetime]$dt) {
     $s = (Get-Date $dt).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
          [System.Globalization.CultureInfo]::InvariantCulture)
+    # Change -04:00 -> -0400 but keep HH:mm:ss intact
     return ($s -replace '([+-]\d{2}):(\d{2})$','$1$2')
 }
 
@@ -136,10 +138,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# SINGLE ACTION XML
-#   - Relevance in CDATA
-#   - RunningMessage <Text>
-#   - TimeRange wrapper with Start/optional End (offset, no colon)
+# SINGLE ACTION XML (TimeRange w/ Offset timestamps, CDATA relevance, RunningMessage <Text>)
 # =========================
 function Build-SingleActionXml {
     param(
@@ -148,7 +147,7 @@ function Build-SingleActionXml {
         [string[]]$RelevanceBlocks,      # relevance strings
         [string]$ActionScript,           # action script
         [datetime]$StartLocal,           # scheduled local start
-        [bool]$IsForce = $false,         # only Force has an end-time
+        [bool]$IsForce = $false,         # Force adds End time
         [datetime]$ForceEndLocal = $null,# start + 24h for Force
         [string]$GroupSiteName,          # same site as fixlet
         [string]$GroupIdNumeric          # numeric ID (no 00-)
@@ -158,13 +157,13 @@ function Build-SingleActionXml {
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Relevance as CDATA (avoid &quot; etc.). Guard against ']]>'.
+    # Relevance as CDATA (avoid &quot; etc.). Guard against ']]>'
     $rels = ($RelevanceBlocks | ForEach-Object {
         $safe = $_ -replace ']]>', ']]]]><![CDATA[>'
         "    <Relevance><![CDATA[$safe]]></Relevance>"
     }) -join "`r`n"
 
-    # Start/End strings inside <TimeRange>
+    # Build TimeRange (offset without colon, e.g., -0400)
     $startStr = Format-OffsetNoColon $StartLocal
     $timeRange = @"
       <TimeRange>
@@ -175,8 +174,6 @@ function Build-SingleActionXml {
         $timeRange += "        <EndDateTimeLocalOffset>$endStr</EndDateTimeLocalOffset>`n"
     }
     $timeRange += "      </TimeRange>"
-
-    $hasEnd = ($IsForce -and $ForceEndLocal)
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -198,7 +195,7 @@ $ActionScript
       <HasTimeRange>true</HasTimeRange>
 $timeRange
       <HasStartTime>true</HasStartTime>
-      <HasEndTime>$([bool]$hasEnd -as [string]).ToLower()</HasEndTime>
+      <HasEndTime>$($IsForce.ToString().ToLower())</HasEndTime>
 
       <HasReapply>false</HasReapply>
       <HasRetry>false</HasRetry>
@@ -228,8 +225,8 @@ $y = 20
 function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB) {
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = $Label
-    $lbl.Location = New-Object System.Drawing.Point(10,$script:y)
-    $lbl.Size = New-Object System.Drawing.Size(140,22)
+    $lbl.Location = New-Object Drawing.Point(10,$script:y)
+    $lbl.Size = New-Object Drawing.Size(140,22)
     $form.Controls.Add($lbl)
 
     if ($IsPassword) {
@@ -251,16 +248,16 @@ $tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
 $tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
 # Date (future Wednesdays)
-$lblDate = New-Object System.Windows.Forms.Label
+$lblDate = New-Object Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
-$lblDate.Location = New-Object System.Drawing.Point(10,$y)
-$lblDate.Size = New-Object System.Drawing.Size(140,22)
+$lblDate.Location = New-Object Drawing.Point(10,$y)
+$lblDate.Size = New-Object Drawing.Size(140,22)
 $form.Controls.Add($lblDate)
 
-$cbDate = New-Object System.Windows.Forms.ComboBox
+$cbDate = New-Object Windows.Forms.ComboBox
 $cbDate.DropDownStyle = 'DropDownList'
-$cbDate.Location = New-Object System.Drawing.Point(160,$y)
-$cbDate.Size = New-Object System.Drawing.Size(160,22)
+$cbDate.Location = New-Object Drawing.Point(160,$y)
+$cbDate.Size = New-Object Drawing.Size(160,22)
 $form.Controls.Add($cbDate)
 $y += 34
 # populate next 20 Wednesdays
@@ -270,16 +267,16 @@ $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
 # Time (8:00 PM – 11:45 PM, 15m)
-$lblTime = New-Object System.Windows.Forms.Label
+$lblTime = New-Object Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
-$lblTime.Location = New-Object System.Drawing.Point(10,$y)
-$lblTime.Size = New-Object System.Drawing.Size(140,22)
+$lblTime.Location = New-Object Drawing.Point(10,$y)
+$lblTime.Size = New-Object Drawing.Size(140,22)
 $form.Controls.Add($lblTime)
 
-$cbTime = New-Object System.Windows.Forms.ComboBox
+$cbTime = New-Object Windows.Forms.ComboBox
 $cbTime.DropDownStyle = 'DropDownList'
-$cbTime.Location = New-Object System.Drawing.Point(160,$y)
-$cbTime.Size = New-Object System.Drawing.Size(160,22)
+$cbTime.Location = New-Object Drawing.Point(160,$y)
+$cbTime.Size = New-Object Drawing.Size(160,22)
 $form.Controls.Add($cbTime)
 $y += 42
 $start = Get-Date "20:00"; $end = Get-Date "23:45"
