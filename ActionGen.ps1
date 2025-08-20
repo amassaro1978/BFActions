@@ -54,12 +54,10 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
-
-# Format like 2025-09-03T20:00:00-0400  (remove ONLY the colon in the offset)
-function Format-OffsetNoColon([datetime]$dt) {
-    $s = (Get-Date $dt).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
-         [System.Globalization.CultureInfo]::InvariantCulture)
-    return ($s -replace '([+-]\d{2}):(\d{2})$','$1$2')
+# Local format: 20250827T200000 (uppercase T)
+function Format-BESLocal([datetime]$dt) {
+    (Get-Date $dt).ToString("yyyyMMdd'T'HHmmss",
+        [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 # =========================
@@ -137,7 +135,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# SINGLE ACTION XML (TimeRange + *DateTimeOffset*, CDATA relevance, RunningMessage <Text>)
+# SINGLE ACTION XML (TimeRange + Local datetimes, CDATA relevance, RunningMessage <Text>)
 # =========================
 function Build-SingleActionXml {
     param(
@@ -162,17 +160,19 @@ function Build-SingleActionXml {
         "    <Relevance><![CDATA[$safe]]></Relevance>"
     }) -join "`r`n"
 
-    # Build TimeRange (offset without colon, e.g., -0400)
-    $startStr = Format-OffsetNoColon $StartLocal
+    $startLocalStr = Format-BESLocal $StartLocal
+    $endLocalStr   = if ($IsForce -and $ForceEndLocal) { Format-BESLocal $ForceEndLocal } else { $null }
+
     $timeRange = @"
       <TimeRange>
-        <StartDateTimeOffset>$startStr</StartDateTimeOffset>
+        <StartDateTimeLocal>$startLocalStr</StartDateTimeLocal>
 "@
-    if ($IsForce -and $ForceEndLocal) {
-        $endStr = Format-OffsetNoColon $ForceEndLocal
-        $timeRange += "        <EndDateTimeOffset>$endStr</EndDateTimeOffset>`n"
+    if ($endLocalStr) {
+        $timeRange += "        <EndDateTimeLocal>$endLocalStr</EndDateTimeLocal>`n"
     }
     $timeRange += "      </TimeRange>"
+
+    $hasEnd = [bool]$endLocalStr
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -194,7 +194,7 @@ $ActionScript
       <HasTimeRange>true</HasTimeRange>
 $timeRange
       <HasStartTime>true</HasStartTime>
-      <HasEndTime>$($IsForce.ToString().ToLower())</HasEndTime>
+      <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
 
       <HasReapply>false</HasReapply>
       <HasRetry>false</HasRetry>
