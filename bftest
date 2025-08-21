@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
+  <SingleAction>
+    <Title>Offset-with-colon test</Title>
+    <Relevance><![CDATA[true]]></Relevance>
+    <ActionScript MIMEType="application/x-Fixlet-Windows-Shell"><![CDATA[waithidden cmd.exe /c echo ok]]></ActionScript>
+    <Settings>
+      <ActionUITitle>Offset-with-colon test</ActionUITitle>
+      <HasTimeRange>true</HasTimeRange>
+      <HasStartTime>true</HasStartTime>
+      <StartDateTimeOffset>2025-09-03T20:00:00-04:00</StartDateTimeOffset>
+      <HasEndTime>false</HasEndTime>
+    </Settings>
+    <Target>
+      <ComputerGroup>
+        <SiteName>Test Group Managed (Workstations)</SiteName>
+        <ID>12345</ID>
+      </ComputerGroup>
+    </Target>
+  </SingleAction>
+</BES>
