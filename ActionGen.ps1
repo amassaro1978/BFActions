@@ -7,10 +7,10 @@ Add-Type -AssemblyName System.Web
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
 
-# Site that hosts BOTH the Fixlet content and the Computer Groups
+# The site that hosts BOTH the Fixlet content and the Computer Groups
 $CustomSiteName = "Test Group Managed (Workstations)"
 
-# Action -> Computer Group ID (you can keep the 00- prefix; we'll strip it)
+# Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric for XML)
 $GroupMap = @{
     "Pilot"                     = "00-12345"
     "Deploy"                    = "00-12346"
@@ -23,7 +23,7 @@ $GroupMap = @{
 # =========================
 function Encode-SiteName([string]$Name) {
     $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
-    # Make it look like curl’s encoding (spaces & parens)
+    # match curl-like encoding for spaces & parens
     $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
     return $enc
 }
@@ -56,7 +56,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
 
-# Build an ISO-8601 duration like PnDTnHnMnS (no sign; BigFix uses positive duration from "now")
+# Build an ISO-8601 duration like PnDTnHnMnS (no sign; server expects positive duration from "now")
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero } # never negative
     $days = [int]$ts.TotalDays
@@ -73,7 +73,7 @@ function To-IsoDuration([TimeSpan]$ts) {
 }
 
 # =========================
-# HTTP (curl-like)
+# HTTP
 # =========================
 function HttpGetXml {
     param([string]$Url,[string]$AuthHeader)
@@ -126,37 +126,42 @@ function Get-FixletContainer { param([xml]$Xml)
     if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
     throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
 }
-function Get-ActionAndRelevance {
-    param($ContainerNode)
-    $rels = @(); foreach ($r in $ContainerNode.Relevance) { $rels += [string]$r }
+
+function Get-ActionAndRelevance { param($ContainerNode)
+    $rels = @()
+    foreach ($r in $ContainerNode.Relevance) { $rels += [string]$r }
+
     $act = $null
     if ($ContainerNode.Action) { $act = $ContainerNode.Action | Select-Object -First 1 }
     if (-not $act -and $ContainerNode.DefaultAction) { $act = $ContainerNode.DefaultAction }
     if (-not $act) { throw "No <Action> or <DefaultAction> block found." }
+
     $script = $null
     if ($act.ActionScript) {
         $script = [string]$act.ActionScript.'#text'
         if ([string]::IsNullOrWhiteSpace($script)) { $script = $act.ActionScript.InnerText }
     }
     if (-not $script) { throw "Action found but no <ActionScript> content present." }
+
     return @{ Relevance=$rels; ActionScript=$script }
 }
+
 function Parse-FixletTitleToProduct([string]$Title) {
     $clean = $Title -replace '^Update:\s*','' -replace '\s+Win$',''
     return $clean.Trim()
 }
 
 # =========================
-# SINGLE ACTION XML (mirror export: duration offsets, no TimeRange)
+# SINGLE ACTION XML (duration offsets, Relevance before ActionScript)
 # =========================
 function Build-SingleActionXml {
     param(
         [string]$ActionTitle,            # Pilot/Deploy/Force/Conference...
         [string]$DisplayName,            # Vendor App Version
-        [string[]]$RelevanceBlocks,      # relevance strings
+        [string[]]$RelevanceBlocks,      # relevance strings (from Fixlet)
         [string]$ActionScript,           # action script
         [datetime]$StartLocal,           # scheduled local start (absolute)
-        [bool]$IsForce = $false,         # Force adds end offset
+        [bool]$IsForce = $false,         # Force adds end offset (start+24h)
         [string]$GroupSiteName,          # same site as fixlet
         [string]$GroupIdNumeric          # numeric ID (no 00-)
     )
@@ -165,11 +170,14 @@ function Build-SingleActionXml {
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Relevance as CDATA (avoid &quot;, <, > issues)
-    $rels = ($RelevanceBlocks | ForEach-Object {
-        $safe = $_ -replace ']]>', ']]]]><![CDATA[>'
-        "    <Relevance><![CDATA[$safe]]></Relevance>"
-    }) -join "`r`n"
+    # Relevance as CDATA; never allow CDATA terminator inside body
+    $rels = ""
+    if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
+        $rels = ($RelevanceBlocks | ForEach-Object {
+            $safe = $_ -replace ']]>', ']]]]><![CDATA[>'
+            "    <Relevance><![CDATA[$safe]]></Relevance>"
+        }) -join "`r`n"
+    }
 
     # Compute duration offsets FROM NOW to the absolute schedule points
     $now = Get-Date
@@ -195,6 +203,7 @@ $rels
     <ActionScript MIMEType="application/x-Fixlet-Windows-Shell"><![CDATA[
 $ActionScript
 ]]></ActionScript>
+    <SuccessCriteria Option="RunToCompletion" />
     <Settings>
       <ActionUITitle>$titleEsc</ActionUITitle>
 
@@ -226,7 +235,6 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
       <HasWhose>false</HasWhose>
       <PreActionCacheDownload>false</PreActionCacheDownload>
 
-      # Reapply / Retry settings — mirror your export defaults
       <Reapply>true</Reapply>
       <HasReapplyLimit>false</HasReapplyLimit>
       <HasReapplyInterval>false</HasReapplyInterval>
@@ -240,6 +248,12 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
       <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
       <IsOffer>false</IsOffer>
     </Settings>
+    <Target>
+      <ComputerGroup>
+        <SiteName>$([System.Security.SecurityElement]::Escape($GroupSiteName))</SiteName>
+        <ID>$GroupIdNumeric</ID>
+      </ComputerGroup>
+    </Target>
   </SingleAction>
 </BES>
 "@
@@ -280,13 +294,13 @@ $tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
 $tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
 # Date (future Wednesdays)
-$lblDate = New-Object Windows.Forms.Label
+$lblDate = New-Object System.Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
 $lblDate.Location = New-Object System.Drawing.Point(10,$y)
 $lblDate.Size = New-Object System.Drawing.Size(140,22)
 $form.Controls.Add($lblDate)
 
-$cbDate = New-Object Windows.Forms.ComboBox
+$cbDate = New-Object System.Windows.Forms.ComboBox
 $cbDate.DropDownStyle = 'DropDownList'
 $cbDate.Location = New-Object System.Drawing.Point(160,$y)
 $cbDate.Size = New-Object System.Drawing.Size(160,22)
@@ -299,13 +313,13 @@ $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
 # Time (8:00 PM – 11:45 PM, 15m)
-$lblTime = New-Object Windows.Forms.Label
+$lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
 $lblTime.Location = New-Object System.Drawing.Point(10,$y)
 $lblTime.Size = New-Object System.Drawing.Size(140,22)
 $form.Controls.Add($lblTime)
 
-$cbTime = New-Object Windows.Forms.ComboBox
+$cbTime = New-Object System.Windows.Forms.ComboBox
 $cbTime.DropDownStyle = 'DropDownList'
 $cbTime.Location = New-Object System.Drawing.Point(160,$y)
 $cbTime.Size = New-Object System.Drawing.Size(160,22)
@@ -330,16 +344,14 @@ $LogBox.ReadOnly = $false
 $LogBox.WordWrap = $false
 $LogBox.Location = New-Object System.Drawing.Point(10,$y)
 $LogBox.Size = New-Object System.Drawing.Size(600,520)
+# allow easy copy/select all
+$LogBox.ContextMenu = New-Object System.Windows.Forms.ContextMenu
+$LogBox.ContextMenu.MenuItems.AddRange(@(
+    (New-Object System.Windows.Forms.MenuItem "Copy",      { $LogBox.Copy() }),
+    (New-Object System.Windows.Forms.MenuItem "Select All", { $LogBox.SelectAll() })
+))
 $LogBox.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($LogBox)
-# Context menu for easy copy/select all
-$cm = New-Object System.Windows.Forms.ContextMenu
-$miCopy = New-Object System.Windows.Forms.MenuItem "Copy"
-$miAll  = New-Object System.Windows.Forms.MenuItem "Select All"
-$cm.MenuItems.AddRange(@($miCopy,$miAll))
-$LogBox.ContextMenu = $cm
-$miCopy.add_Click({ $LogBox.Copy() })
-$miAll.add_Click({ $LogBox.SelectAll() })
 
 # =========================
 # ACTION
@@ -375,7 +387,7 @@ $btn.Add_Click({
         $displayName = Parse-FixletTitleToProduct -Title $titleRaw
 
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
-        $relevance = $parsed.Relevance
+        $relevance    = $parsed.Relevance
         $actionScript = $parsed.ActionScript
 
         LogLine "Parsed title: $displayName"
@@ -383,9 +395,10 @@ $btn.Add_Click({
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
         # Absolute schedule (user picks local date/time)
-        $startLocal = Get-Date "$dStr $tStr"
-        $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
+        $startLocal    = Get-Date "$dStr $tStr"
+        $forceEndLocal = $startLocal.AddHours(24)  # for Force calculation
 
+        $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
         LogLine "POST URL: $postUrl"
 
