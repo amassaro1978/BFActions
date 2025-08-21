@@ -25,9 +25,17 @@ function Encode-SiteName([string]$Name) {
     return $enc
 }
 function Get-BaseUrl([string]$ServerInput) {
+    if (-not $ServerInput) { throw "Server is empty." }
     $s = $ServerInput.Trim()
-    if ($s -notmatch '^(?i)https?://') { $s = ($s -match ':\d+$') ? "https://$s" : "https://$s:52311" }
-    $s.TrimEnd('/')
+    # Add scheme if missing
+    if ($s -notmatch '^(?i)https?://') {
+        if ($s -match ':\d+$') {
+            $s = "https://$s"
+        } else {
+            $s = "https://$s:52311"
+        }
+    }
+    return $s.TrimEnd('/')
 }
 function Join-ApiUrl([string]$BaseUrl,[string]$RelativePath) {
     $BaseUrl.TrimEnd('/') + ($(if ($RelativePath.StartsWith('/')) { $RelativePath } else { "/$RelativePath" }))
@@ -135,13 +143,17 @@ function Build-SingleActionXml {
     # Times: StartDateTime + StartDateTimeLocalOffset (duration)
     $startDT  = Format-LocalDateTime $StartLocal
     $startOff = Get-LocalOffsetDuration $StartLocal
-    $hasEnd   = $false
-    $endBlock = ""
+
+    $hasEnd = $false
+    $timeRange = @"
+      <HasTimeRange>true</HasTimeRange>
+      <HasStartTime>true</HasStartTime>
+"@
     if ($IsForce -and $ForceEndLocal) {
-        $hasEnd   = $true
-        $endDT    = Format-LocalDateTime $ForceEndLocal
-        $endOff   = Get-LocalOffsetDuration $ForceEndLocal
-$endBlock = @"
+        $hasEnd = $true
+        $endDT  = Format-LocalDateTime $ForceEndLocal
+        $endOff = Get-LocalOffsetDuration $ForceEndLocal
+        $timeRange += @"
       <HasEndTime>true</HasEndTime>
       <TimeRange>
         <StartDateTime>$startDT</StartDateTime>
@@ -150,10 +162,8 @@ $endBlock = @"
         <EndDateTimeLocalOffset>$endOff</EndDateTimeLocalOffset>
       </TimeRange>
 "@
-    }
-
-    if (-not $hasEnd) {
-$endBlock = @"
+    } else {
+        $timeRange += @"
       <HasEndTime>false</HasEndTime>
       <TimeRange>
         <StartDateTime>$startDT</StartDateTime>
@@ -189,9 +199,7 @@ $ActionScript
         <Text>Updating to $dispEsc. Please wait....</Text>
       </RunningMessage>
 
-      <HasTimeRange>true</HasTimeRange>
-      <HasStartTime>true</HasStartTime>
-$endBlock
+$timeRange
       <HasReapply>false</HasReapply>
       <HasReapplyLimit>false</HasReapplyLimit>
       <HasRetry>false</HasRetry>
