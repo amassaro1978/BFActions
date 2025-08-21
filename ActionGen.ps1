@@ -29,11 +29,7 @@ function Get-BaseUrl([string]$ServerInput) {
     $s = $ServerInput.Trim()
     # Add scheme if missing
     if ($s -notmatch '^(?i)https?://') {
-        if ($s -match ':\d+$') {
-            $s = "https://$s"
-        } else {
-            $s = "https://$s:52311"
-        }
+        if ($s -match ':\d+$') { $s = "https://$s" } else { $s = "https://$s:52311" }
     }
     return $s.TrimEnd('/')
 }
@@ -54,16 +50,12 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-# Local datetime without TZ: 2025-09-03T20:00:00
-function Format-LocalDateTime([datetime]$dt) {
-    (Get-Date $dt).ToString("yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
-}
-# ISO 8601 duration for LOCAL UTC offset, e.g. -PT4H or +PT5H30M
-function Get-LocalOffsetDuration([datetime]$dt) {
-    $off = ([datetimeoffset]$dt).Offset
-    $sign = if ($off.Ticks -ge 0) { "+" } else { "-" }
-    $h = [math]::Abs($off.Hours); $m = [math]::Abs($off.Minutes)
-    if ($m -gt 0) { return "{0}PT{1}H{2}M" -f $sign,$h,$m } else { return "{0}PT{1}H" -f $sign,$h }
+
+# datetime with numeric offset and NO colon in the offset (e.g., -0400)
+function Format-OffsetNoColon([datetime]$dt) {
+    $s = (Get-Date $dt).ToString("yyyy-MM-dd'T'HH:mm:sszzz",
+         [System.Globalization.CultureInfo]::InvariantCulture)
+    return ($s -replace '([+-]\d{2}):(\d{2})$','$1$2')
 }
 
 # =========================
@@ -120,7 +112,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# BUILD SINGLE ACTION XML  (matches export ordering & tags)
+# BUILD SINGLE ACTION XML  (Start/EndDateTimeOffset under <Settings>)
 # =========================
 function Build-SingleActionXml {
     param(
@@ -140,36 +132,13 @@ function Build-SingleActionXml {
         "    <Relevance><![CDATA[$safe]]></Relevance>"
     }) -join "`r`n"
 
-    # Times: StartDateTime + StartDateTimeLocalOffset (duration)
-    $startDT  = Format-LocalDateTime $StartLocal
-    $startOff = Get-LocalOffsetDuration $StartLocal
-
+    $startOffset = Format-OffsetNoColon $StartLocal
     $hasEnd = $false
-    $timeRange = @"
-      <HasTimeRange>true</HasTimeRange>
-      <HasStartTime>true</HasStartTime>
-"@
+    $endLine = ""
     if ($IsForce -and $ForceEndLocal) {
         $hasEnd = $true
-        $endDT  = Format-LocalDateTime $ForceEndLocal
-        $endOff = Get-LocalOffsetDuration $ForceEndLocal
-        $timeRange += @"
-      <HasEndTime>true</HasEndTime>
-      <TimeRange>
-        <StartDateTime>$startDT</StartDateTime>
-        <StartDateTimeLocalOffset>$startOff</StartDateTimeLocalOffset>
-        <EndDateTime>$endDT</EndDateTime>
-        <EndDateTimeLocalOffset>$endOff</EndDateTimeLocalOffset>
-      </TimeRange>
-"@
-    } else {
-        $timeRange += @"
-      <HasEndTime>false</HasEndTime>
-      <TimeRange>
-        <StartDateTime>$startDT</StartDateTime>
-        <StartDateTimeLocalOffset>$startOff</StartDateTimeLocalOffset>
-      </TimeRange>
-"@
+        $endOffset = Format-OffsetNoColon $ForceEndLocal
+        $endLine = "      <EndDateTimeOffset>$endOffset</EndDateTimeOffset>`n"
     }
 
 @"
@@ -195,12 +164,13 @@ $ActionScript
       </PreAction>
 
       <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage>
-        <Text>Updating to $dispEsc. Please wait....</Text>
-      </RunningMessage>
+      <RunningMessage><Text>Updating to $dispEsc. Please wait....</Text></RunningMessage>
 
-$timeRange
-      <HasReapply>false</HasReapply>
+      <HasTimeRange>true</HasTimeRange>
+      <HasStartTime>true</HasStartTime>
+      <StartDateTimeOffset>$startOffset</StartDateTimeOffset>
+      <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
+$endLine      <HasReapply>false</HasReapply>
       <HasReapplyLimit>false</HasReapplyLimit>
       <HasRetry>false</HasRetry>
       <RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
@@ -238,7 +208,7 @@ function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB) {
     $tb = if ($IsPassword) { New-Object System.Windows.Forms.MaskedTextBox } else { New-Object System.Windows.Forms.TextBox }
     if ($IsPassword) { $tb.PasswordChar='*' }
     $tb.Location = New-Object Drawing.Point(160,$script:y)
-    $tb.Size = New-Object Drawing.Size(420,22)
+    $tb.Size = New-Object System.Drawing.Size(420,22)
     $form.Controls.Add($tb)
     $OutTB.Value = $tb
     $script:y += 34
@@ -259,7 +229,7 @@ $form.Controls.Add($lblDate)
 $cbDate = New-Object Windows.Forms.ComboBox
 $cbDate.DropDownStyle = 'DropDownList'
 $cbDate.Location = New-Object Drawing.Point(160,$y)
-$cbDate.Size = New-Object Drawing.Size(160,22)
+$cbDate.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbDate)
 $y += 34
 
@@ -278,7 +248,7 @@ $form.Controls.Add($lblTime)
 $cbTime = New-Object Windows.Forms.ComboBox
 $cbTime.DropDownStyle = 'DropDownList'
 $cbTime.Location = New-Object Drawing.Point(160,$y)
-$cbTime.Size = New-Object Drawing.Size(160,22)
+$cbTime.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbTime)
 $y += 42
 $start = Get-Date "20:00"; $end = Get-Date "23:45"
@@ -287,16 +257,16 @@ while ($start -le $end) { [void]$cbTime.Items.Add($start.ToString("h:mm tt")); $
 # Button
 $btn = New-Object System.Windows.Forms.Button
 $btn.Text = "Generate & Post 4 Single Actions"
-$btn.Location = New-Object Drawing.Point(160,$y)
-$btn.Size = New-Object Drawing.Size(280,32)
+$btn.Location = New-Object System.Drawing.Point(160,$y)
+$btn.Size = New-Object System.Drawing.Size(280,32)
 $form.Controls.Add($btn)
 $y += 42
 
 # Log box
 $LogBox = New-Object System.Windows.Forms.TextBox
 $LogBox.Multiline = $true; $LogBox.ScrollBars="Vertical"; $LogBox.ReadOnly=$false; $LogBox.WordWrap=$false
-$LogBox.Location = New-Object Drawing.Point(10,$y)
-$LogBox.Size = New-Object Drawing.Size(570,520)
+$LogBox.Location = New-Object System.Drawing.Point(10,$y)
+$LogBox.Size = New-Object System.Drawing.Size(570,520)
 $LogBox.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($LogBox)
 $cm = New-Object System.Windows.Forms.ContextMenu
