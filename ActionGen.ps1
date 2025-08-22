@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Web
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
 
-# The site that hosts BOTH the Fixlet content and (ideally) the Computer Groups (for custom-site lookup first)
+# Match your environment
 $CustomSiteName = "Test Group Managed (Workstations)"
 
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric for API)
@@ -17,6 +17,9 @@ $GroupMap = @{
     "Force"                     = "00-12347"
     "Conference/Training Rooms" = "00-12348"
 }
+
+# If your server uses an untrusted cert and you normally do curl -k, set this to $true
+$IgnoreCertErrors = $true
 
 # =========================
 # UTIL / LOGGING
@@ -54,8 +57,6 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
-
-# Build an ISO-8601 duration like PnDTnHnMnS (positive from "now")
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $days = [int]$ts.TotalDays
@@ -73,6 +74,12 @@ function To-IsoDuration([TimeSpan]$ts) {
 # =========================
 # HTTP
 # =========================
+if ($IgnoreCertErrors) {
+    try {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    } catch { }
+}
+
 function HttpGetXml {
     param([string]$Url,[string]$AuthHeader)
     $req = [System.Net.HttpWebRequest]::Create($Url)
@@ -148,9 +155,17 @@ function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
+# Namespace-agnostic helpers
+function Select-NodeLocal($xmlDoc, [string]$xpath) {
+    return $xmlDoc.SelectSingleNode($xpath)
+}
+function Select-NodesLocal($xmlDoc, [string]$xpath) {
+    return $xmlDoc.SelectNodes($xpath)
+}
+
 # Build client relevance for an Automatic Group:
-# 1) Prefer <Relevance>
-# 2) Else AND-join all <SearchComponentRelevance> blocks
+# 1) Prefer top-level <Relevance> (one or many)
+# 2) Else AND-join all <SearchComponentRelevance> blocks (use nested <Relevance> if present, else InnerText)
 function Get-GroupClientRelevance {
     param(
         [string]$BaseUrl,
@@ -170,30 +185,52 @@ function Get-GroupClientRelevance {
         $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
         try {
             $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
+            $preview = $xmlStr.Substring(0, [Math]::Min(400, $xmlStr.Length)).Replace("`r"," ").Replace("`n"," ")
+            LogLine "Fetched group XML (${url}) preview: $preview"
             $x = [xml]$xmlStr
 
-            # 1) Try top-level <Relevance>
-            $top = $x.BES.ComputerGroup.Relevance
-            if ($top -and (-not [string]::IsNullOrWhiteSpace($top))) {
-                $snippet = $top.Substring(0, [Math]::Min(200, $top.Length))
-                LogLine "Found group <Relevance> at ${url} :: ${snippet}..."
-                return [string]$top
+            # Find ComputerGroup node irrespective of namespace
+            $cg = Select-NodeLocal $x "/*[local-name()='BES']/*[local-name()='ComputerGroup']"
+            if (-not $cg) {
+                LogLine "No <ComputerGroup> node at ${url}"
+                continue
             }
 
-            # 2) Try <SearchComponentRelevance> blocks (common for Auto Groups)
+            # 1) Top-level <Relevance> (could be one or multiple)
+            $topNodes = Select-NodesLocal $cg "./*[local-name()='Relevance']"
+            if ($topNodes -and $topNodes.Count -gt 0) {
+                $vals = @()
+                foreach ($tn in $topNodes) {
+                    $txt = ($tn.InnerText).Trim()
+                    if ($txt) { $vals += $txt }
+                }
+                if ($vals.Count -gt 0) {
+                    $joined = ($vals | ForEach-Object { "($_)" }) -join " AND "
+                    $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
+                    LogLine "Found group <Relevance> at ${url} :: ${snippet}..."
+                    return $joined
+                }
+            }
+
+            # 2) <SearchComponentRelevance> fragments
             $fragments = @()
-            $nodes = $x.SelectNodes("//ComputerGroup/SearchComponentRelevance")
-            if ($nodes -and $nodes.Count -gt 0) {
-                foreach ($n in $nodes) {
-                    # Nodes may contain nested <Relevance> tags; grab inner text
-                    $txt = $n.InnerText
-                    if ($txt -and -not [string]::IsNullOrWhiteSpace($txt)) {
-                        $fragments += $txt.Trim()
+            $scrNodes = Select-NodesLocal $cg ".//*[local-name()='SearchComponentRelevance']"
+            if ($scrNodes -and $scrNodes.Count -gt 0) {
+                foreach ($n in $scrNodes) {
+                    # Prefer nested <Relevance> nodes if present
+                    $innerRels = Select-NodesLocal $n ".//*[local-name()='Relevance']"
+                    if ($innerRels -and $innerRels.Count -gt 0) {
+                        foreach ($ir in $innerRels) {
+                            $t = ($ir.InnerText).Trim()
+                            if ($t) { $fragments += $t }
+                        }
+                    } else {
+                        $t = ($n.InnerText).Trim()
+                        if ($t) { $fragments += $t }
                     }
                 }
             }
             if ($fragments.Count -gt 0) {
-                # AND-join the fragments; wrap each in parentheses for safety
                 $joined = ($fragments | ForEach-Object { "($_)" }) -join " AND "
                 $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
                 LogLine "Built relevance from SearchComponentRelevance at ${url} :: ${snippet}..."
@@ -210,16 +247,16 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# SINGLE ACTION XML (duration offsets, Relevance before ActionScript)
+# SINGLE ACTION XML
 # =========================
 function Build-SingleActionXml {
     param(
-        [string]$ActionTitle,            # Pilot/Deploy/Force/Conference...
-        [string]$DisplayName,            # Vendor App Version
-        [string[]]$RelevanceBlocks,      # Fixlet relevance + group relevance
-        [string]$ActionScript,           # Action script
-        [datetime]$StartLocal,           # scheduled local start (absolute)
-        [bool]$IsForce = $false          # Force adds end offset (start+24h)
+        [string]$ActionTitle,
+        [string]$DisplayName,
+        [string[]]$RelevanceBlocks,
+        [string]$ActionScript,
+        [datetime]$StartLocal,
+        [bool]$IsForce = $false
     )
 
     $titleText = "$($DisplayName): $ActionTitle"
@@ -251,7 +288,6 @@ function Build-SingleActionXml {
         $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
     }
 
-    # PreAction deadline: align to start+24h for Force; otherwise keep a simple notify-at-start behavior
     $deadlineBehaviorBlock = if ($IsForce) {
 @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
@@ -439,6 +475,8 @@ $btn.Add_Click({
 
         $auth = Get-AuthHeader -User $user -Pass $pass
         $fixletContent = HttpGetXml -Url $fixletUrl -AuthHeader $auth
+        $fixletPreview = $fixletContent.Substring(0, [Math]::Min(400, $fixletContent.Length)).Replace("`r"," ").Replace("`n"," ")
+        LogLine "Fetched fixlet XML preview: $fixletPreview"
         $fixletXml = [xml]$fixletContent
 
         $cont = Get-FixletContainer -Xml $fixletXml
@@ -469,8 +507,6 @@ $btn.Add_Click({
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
             if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '${groupIdRaw}' for $($a)"; continue }
 
-            # fetch group's client relevance and combine with fixlet relevance
-            $groupRel = ""
             try {
                 $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
                 LogLine ("Group relevance len ({0}): {1}" -f $a, $groupRel.Length)
