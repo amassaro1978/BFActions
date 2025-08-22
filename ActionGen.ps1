@@ -238,6 +238,7 @@ function Get-ActionAndRelevance {
 }
 
 function Parse-FixletTitleToProduct([string]$Title) {
+    # Keep product-friendly version for messages, but NOT used for ActionUITitle.
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
@@ -324,16 +325,26 @@ function Get-GroupClientRelevance {
 # ACTION XML BUILDERS
 # =========================
 function Build-SingleActionXml {
-    param([string]$ActionTitle,[string]$DisplayName,[string[]]$RelevanceBlocks,[string]$ActionScript,[datetime]$StartLocal,[bool]$IsForce=$false)
-    $titleText = "$($DisplayName): $ActionTitle"
-    $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
+    param(
+        [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
+        [string]$UiBaseTitle,       # Full Fixlet title as shown in Console (e.g., "Update: ... Win")
+        [string]$DisplayName,       # Product-friendly name for messages
+        [string[]]$RelevanceBlocks,
+        [string]$ActionScript,
+        [datetime]$StartLocal,
+        [bool]$IsForce=$false
+    )
+    $fullTitle = "${UiBaseTitle}: $ActionTitle"
+    $titleEsc  = [System.Security.SecurityElement]::Escape($fullTitle)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+
     $relevanceCombined = ""
     if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
         $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { "($_)" }) -join " AND "
     }
     $relSafe = $relevanceCombined -replace ']]>', ']]]]><![CDATA[>'
     $rels = if ([string]::IsNullOrWhiteSpace($relevanceCombined)) { "" } else { "    <Relevance><![CDATA[$relSafe]]></Relevance>" }
+
     $now = Get-Date
     $startOffset = To-IsoDuration ($StartLocal - $now)
     $hasEnd = $false; $endOffsetLine = ""; $deadlineBehaviorBlock = ""
@@ -395,11 +406,12 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
 "@
 }
 
-# PS5.1-safe SourcedFixletAction builder (Target before Settings, no Title, CustomRelevance only)
+# PS5.1-safe SourcedFixletAction builder (SourceFixlet -> Target -> Settings; no Title; CustomRelevance only)
 function Build-SourcedFixletActionXml {
     param(
         [string]$ActionTitle,     # Pilot/Deploy/Force/Conference...
-        [string]$DisplayName,     # Vendor App Version
+        [string]$UiBaseTitle,     # Full Fixlet title ("Update: ... Win")
+        [string]$DisplayName,     # Product-friendly name for messages
         [string]$SiteName,        # Custom site name
         [string]$FixletId,        # Fixlet ID
         [string]$GroupRelevance,  # Group filter to AND with fixlet relevance
@@ -407,8 +419,9 @@ function Build-SourcedFixletActionXml {
         [bool]$IsForce = $false   # Force adds end offset (start+24h)
     )
 
-    $uiTitle = [System.Security.SecurityElement]::Escape("$($DisplayName): $ActionTitle")
-    $dispEsc = [System.Security.SecurityElement]::Escape($DisplayName)
+    $fullTitle = "${UiBaseTitle}: $ActionTitle"
+    $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
+    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
     if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { $groupSafe = "" } else { $groupSafe = $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
@@ -603,14 +616,15 @@ $btn.Add_Click({
         $cont = Get-FixletContainer -Xml $fixletXml
         LogLine ("Detected BES content type: {0}" -f $cont.Type)
 
-        $titleRaw = $cont.Node.Title
-        $displayName = Parse-FixletTitleToProduct -Title $titleRaw
+        $titleRaw = [string]$cont.Node.Title                      # Full console title (e.g., "Update: ... Win")
+        $displayName = Parse-FixletTitleToProduct -Title $titleRaw # Product-friendly for messages
 
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
         $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
         $actionScript = $parsed.ActionScript
 
-        LogLine "Parsed title: ${displayName}"
+        LogLine "Parsed title (console): ${titleRaw}"
+        LogLine "Display name (messages): ${displayName}"
         LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
@@ -638,25 +652,25 @@ $btn.Add_Click({
 
             $isForce = ($a -eq "Force")
 
-            # Build XML per mode
             if ($ActionMode -ieq 'Sourced') {
                 $xmlBody = Build-SourcedFixletActionXml `
-                    -ActionTitle $a `
-                    -DisplayName $displayName `
-                    -SiteName $CustomSiteName `
-                    -FixletId $fixId `
+                    -ActionTitle  $a `
+                    -UiBaseTitle  $titleRaw `
+                    -DisplayName  $displayName `
+                    -SiteName     $CustomSiteName `
+                    -FixletId     $fixId `
                     -GroupRelevance $groupRel `
-                    -StartLocal $startLocal `
+                    -StartLocal   $startLocal `
                     -IsForce:$isForce
             } else {
-                # SingleAction path: combine fixlet + group relevance; include ActionScript
                 $allRel = @(); $allRel += $fixletRelevance; if ($groupRel) { $allRel += $groupRel }
                 $xmlBody = Build-SingleActionXml `
-                    -ActionTitle $a `
-                    -DisplayName $displayName `
+                    -ActionTitle   $a `
+                    -UiBaseTitle   $titleRaw `
+                    -DisplayName   $displayName `
                     -RelevanceBlocks $allRel `
-                    -ActionScript $actionScript `
-                    -StartLocal $startLocal `
+                    -ActionScript  $actionScript `
+                    -StartLocal    $startLocal `
                     -IsForce:$isForce
             }
 
@@ -664,7 +678,6 @@ $btn.Add_Click({
             $hex = Get-FirstBytesHex $xmlBodyToSend 32
             LogLine ("First 32 bytes (hex) for {0}: {1}" -f $a, $hex)
 
-            # Save body we post (UTF-8 no BOM) + curl helper
             $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
             $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
             if ($SaveActionXmlToTemp) {
