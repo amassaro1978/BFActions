@@ -342,7 +342,7 @@ function Build-SingleActionXml {
     param(
         [string]$ActionTitle,            # Pilot/Deploy/Force/Conference...
         [string]$DisplayName,            # Vendor App Version
-        [string[]]$RelevanceBlocks,      # Fixlet relevance + group relevance
+        [string[]]$RelevanceBlocks,      # Fixlet relevance + group relevance (array)
         [string]$ActionScript,           # Action script
         [datetime]$StartLocal,           # scheduled local start (absolute)
         [bool]$IsForce = $false          # Force adds end offset (start+24h)
@@ -352,14 +352,14 @@ function Build-SingleActionXml {
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Relevance (each in CDATA)
-    $rels = ""
+    # Combine ALL relevance into ONE expression (schema allows a single <Relevance>)
+    $relevanceCombined = ""
     if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
-        $rels = ($RelevanceBlocks | ForEach-Object {
-            $safe = $_ -replace ']]>', ']]]]><![CDATA[>'
-            "    <Relevance><![CDATA[$safe]]></Relevance>"
-        }) -join "`r`n"
+        $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } |
+            ForEach-Object { "($_)" }) -join " AND "
     }
+    $relSafe = $relevanceCombined -replace ']]>', ']]]]><![CDATA[>'
+    $rels = if ([string]::IsNullOrWhiteSpace($relevanceCombined)) { "" } else { "    <Relevance><![CDATA[$relSafe]]></Relevance>" }
 
     # Durations from now
     $now = Get-Date
@@ -611,6 +611,7 @@ $btn.Add_Click({
                 continue  # do NOT post without group relevance
             }
 
+            # Combine fixlet relevance + group relevance into ONE expression
             $allRel = @()
             $allRel += $fixletRelevance
             if ($groupRel) { $allRel += $groupRel }
