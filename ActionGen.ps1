@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Web
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
 
-# The site that hosts BOTH the Fixlet content and (ideally) the Computer Groups
+# Your site that hosts the Fixlet and (ideally) the Computer Groups
 $CustomSiteName = "Test Group Managed (Workstations)"
 
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric for API)
@@ -18,11 +18,11 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12348"
 }
 
-# Match curl -k behaviour if lab certs are untrusted
+# Match curl -k behavior if your server uses an untrusted cert
 $IgnoreCertErrors       = $true
-# Also dump fetched XMLs to temp to compare with curl
+# Dump fetched XMLs to temp for side-by-side compare with curl output
 $DumpFetchedXmlToTemp   = $true
-# Use a last-resort regex extractor for <Relevance>…</Relevance>
+# Last-resort regex extractor for <Relevance>…</Relevance> if XML shape is odd
 $AggressiveRegexFallback = $true
 
 # =========================
@@ -61,6 +61,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
+# Build an ISO-8601 duration like PnDTnHnMnS (positive from "now")
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $days = [int]$ts.TotalDays
@@ -136,10 +137,34 @@ function Get-FixletContainer { param([xml]$Xml)
     throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
 }
 
-function Get-ActionAndRelevance { param($ContainerNode)
-    $rels = @()
-    foreach ($r in $ContainerNode.Relevance) { $rels += [string]$r }
+# FIXED: use XPath + InnerText (no more System.Xml.XmlElement)
+function Get-ActionAndRelevance { 
+    param($ContainerNode)
 
+    # --- Relevance (robust) ---
+    $rels = @()
+
+    # 1) Direct children named "Relevance"
+    $direct = $ContainerNode.SelectNodes("./*[local-name()='Relevance']")
+    if ($direct -and $direct.Count -gt 0) {
+        foreach ($n in $direct) {
+            $t = ($n.InnerText).Trim()
+            if ($t) { $rels += $t }
+        }
+    }
+
+    # 2) If none, search anywhere under the Fixlet/Task/Baseline node
+    if ($rels.Count -eq 0) {
+        $any = $ContainerNode.SelectNodes(".//*[local-name()='Relevance']")
+        if ($any -and $any.Count -gt 0) {
+            foreach ($n in $any) {
+                $t = ($n.InnerText).Trim()
+                if ($t) { $rels += $t }
+            }
+        }
+    }
+
+    # --- ActionScript (safe) ---
     $act = $null
     if ($ContainerNode.Action) { $act = $ContainerNode.Action | Select-Object -First 1 }
     if (-not $act -and $ContainerNode.DefaultAction) { $act = $ContainerNode.DefaultAction }
@@ -152,6 +177,7 @@ function Get-ActionAndRelevance { param($ContainerNode)
     }
     if (-not $script) { throw "Action found but no <ActionScript> content present." }
 
+    LogLine ("Fixlet relevance nodes found: {0}" -f $rels.Count)
     return @{ Relevance=$rels; ActionScript=$script }
 }
 
@@ -160,7 +186,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# RELEVANCE EXTRACTION (HARDENED)
+# RELEVANCE EXTRACTION (GROUPS - HARDENED)
 # =========================
 function Extract-AllRelevanceFromXmlString {
     param(
@@ -314,12 +340,12 @@ function Get-GroupClientRelevance {
 # =========================
 function Build-SingleActionXml {
     param(
-        [string]$ActionTitle,
-        [string]$DisplayName,
-        [string[]]$RelevanceBlocks,
-        [string]$ActionScript,
-        [datetime]$StartLocal,
-        [bool]$IsForce = $false
+        [string]$ActionTitle,            # Pilot/Deploy/Force/Conference...
+        [string]$DisplayName,            # Vendor App Version
+        [string[]]$RelevanceBlocks,      # Fixlet relevance + group relevance
+        [string]$ActionScript,           # Action script
+        [datetime]$StartLocal,           # scheduled local start (absolute)
+        [bool]$IsForce = $false          # Force adds end offset (start+24h)
     )
 
     $titleText = "$($DisplayName): $ActionTitle"
@@ -351,6 +377,7 @@ function Build-SingleActionXml {
         $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
     }
 
+    # PreAction deadline: align to start+24h for Force
     $deadlineBehaviorBlock = if ($IsForce) {
 @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
