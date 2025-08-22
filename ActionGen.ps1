@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Web
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
 
-# Match your environment
+# Your site that hosts the Fixlet and (ideally) the Computer Groups
 $CustomSiteName = "Test Group Managed (Workstations)"
 
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric for API)
@@ -18,8 +18,11 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12348"
 }
 
-# If your server uses an untrusted cert and you normally do curl -k, set this to $true
-$IgnoreCertErrors = $true
+# Match curl -k behavior if your server uses an untrusted cert
+$IgnoreCertErrors   = $true
+
+# Diagnostics: write fetched XML to temp files to compare with curl output
+$DumpFetchedXmlToTemp = $true
 
 # =========================
 # UTIL / LOGGING
@@ -85,11 +88,13 @@ function HttpGetXml {
     $req = [System.Net.HttpWebRequest]::Create($Url)
     $req.Method = "GET"
     $req.Accept = "application/xml"
+    $req.Headers["Accept-Encoding"] = "gzip, deflate"
+    $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
     $req.Headers["Authorization"] = $AuthHeader
     $req.ProtocolVersion = [Version]"1.1"
     $req.PreAuthenticate = $true
     $req.AllowAutoRedirect = $false
-    $req.Timeout = 30000
+    $req.Timeout = 45000
     try {
         $resp = $req.GetResponse()
         try {
@@ -155,7 +160,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# Namespace-agnostic helpers
+# Namespace-agnostic selectors
 function Select-NodeLocal($xmlDoc, [string]$xpath) {
     return $xmlDoc.SelectSingleNode($xpath)
 }
@@ -163,9 +168,9 @@ function Select-NodesLocal($xmlDoc, [string]$xpath) {
     return $xmlDoc.SelectNodes($xpath)
 }
 
-# Build client relevance for an Automatic Group:
-# 1) Prefer top-level <Relevance> (one or many)
-# 2) Else AND-join all <SearchComponentRelevance> blocks (use nested <Relevance> if present, else InnerText)
+# Build client relevance for a group:
+# 1) Gather ALL <Relevance> nodes under <ComputerGroup> (namespace-agnostic)
+# 2) If none, AND-join all <SearchComponentRelevance> fragments (preferring nested <Relevance>)
 function Get-GroupClientRelevance {
     param(
         [string]$BaseUrl,
@@ -185,39 +190,50 @@ function Get-GroupClientRelevance {
         $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
         try {
             $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
-            $preview = $xmlStr.Substring(0, [Math]::Min(400, $xmlStr.Length)).Replace("`r"," ").Replace("`n"," ")
-            LogLine "Fetched group XML (${url}) preview: $preview"
+
+            if ($DumpFetchedXmlToTemp) {
+                $tmp = Join-Path $env:TEMP ("BES_ComputerGroup_{0}.xml" -f $GroupIdNumeric)
+                Set-Content -Path $tmp -Value $xmlStr -Encoding UTF8
+                LogLine "Saved fetched group XML to: $tmp"
+            }
+
+            $len = $xmlStr.Length
+            $head = $xmlStr.Substring(0, [Math]::Min(800, $len)).Replace("`r"," ").Replace("`n"," ")
+            $tail = if ($len -gt 240) { $xmlStr.Substring([Math]::Max(0, $len-240)).Replace("`r"," ").Replace("`n"," ") } else { "" }
+            LogLine "Fetched group XML (${url}) len=$len head: $head"
+            if ($tail) { LogLine "Fetched group XML tail: $tail" }
+
             $x = [xml]$xmlStr
 
-            # Find ComputerGroup node irrespective of namespace
+            # Find ComputerGroup node
             $cg = Select-NodeLocal $x "/*[local-name()='BES']/*[local-name()='ComputerGroup']"
             if (-not $cg) {
                 LogLine "No <ComputerGroup> node at ${url}"
                 continue
             }
 
-            # 1) Top-level <Relevance> (could be one or multiple)
+            # 1) All top-level <Relevance> under ComputerGroup (could be multiple)
             $topNodes = Select-NodesLocal $cg "./*[local-name()='Relevance']"
+            $vals = @()
             if ($topNodes -and $topNodes.Count -gt 0) {
-                $vals = @()
                 foreach ($tn in $topNodes) {
                     $txt = ($tn.InnerText).Trim()
                     if ($txt) { $vals += $txt }
                 }
-                if ($vals.Count -gt 0) {
-                    $joined = ($vals | ForEach-Object { "($_)" }) -join " AND "
-                    $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
-                    LogLine "Found group <Relevance> at ${url} :: ${snippet}..."
-                    return $joined
-                }
             }
 
-            # 2) <SearchComponentRelevance> fragments
+            if ($vals.Count -gt 0) {
+                $joined = ($vals | ForEach-Object { "($_)" }) -join " AND "
+                $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
+                LogLine "Found group <Relevance> at ${url} :: ${snippet}..."
+                return $joined
+            }
+
+            # 2) SearchComponentRelevance fragments (prefer nested <Relevance>)
             $fragments = @()
             $scrNodes = Select-NodesLocal $cg ".//*[local-name()='SearchComponentRelevance']"
             if ($scrNodes -and $scrNodes.Count -gt 0) {
                 foreach ($n in $scrNodes) {
-                    # Prefer nested <Relevance> nodes if present
                     $innerRels = Select-NodesLocal $n ".//*[local-name()='Relevance']"
                     if ($innerRels -and $innerRels.Count -gt 0) {
                         foreach ($ir in $innerRels) {
@@ -230,6 +246,7 @@ function Get-GroupClientRelevance {
                     }
                 }
             }
+
             if ($fragments.Count -gt 0) {
                 $joined = ($fragments | ForEach-Object { "($_)" }) -join " AND "
                 $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
@@ -239,7 +256,7 @@ function Get-GroupClientRelevance {
 
             LogLine "No usable relevance at ${url}"
         } catch {
-            LogLine "Fetch failed at ${url}: $($_.Exception.Message)"
+            LogLine "Fetch failed at ${url}: $($_.Exception.GetBaseException().Message)"
         }
     }
 
@@ -475,8 +492,19 @@ $btn.Add_Click({
 
         $auth = Get-AuthHeader -User $user -Pass $pass
         $fixletContent = HttpGetXml -Url $fixletUrl -AuthHeader $auth
-        $fixletPreview = $fixletContent.Substring(0, [Math]::Min(400, $fixletContent.Length)).Replace("`r"," ").Replace("`n"," ")
-        LogLine "Fetched fixlet XML preview: $fixletPreview"
+
+        if ($DumpFetchedXmlToTemp) {
+            $tmpFix = Join-Path $env:TEMP ("BES_Fixlet_{0}.xml" -f $fixId)
+            Set-Content -Path $tmpFix -Value $fixletContent -Encoding UTF8
+            LogLine "Saved fetched fixlet XML to: $tmpFix"
+        }
+
+        $fixLen  = $fixletContent.Length
+        $fixHead = $fixletContent.Substring(0, [Math]::Min(800, $fixLen)).Replace("`r"," ").Replace("`n"," ")
+        $fixTail = if ($fixLen -gt 240) { $fixletContent.Substring([Math]::Max(0, $fixLen-240)).Replace("`r"," ").Replace("`n"," ") } else { "" }
+        LogLine "Fetched fixlet XML len=$fixLen head: $fixHead"
+        if ($fixTail) { LogLine "Fetched fixlet XML tail: $fixTail" }
+
         $fixletXml = [xml]$fixletContent
 
         $cont = Get-FixletContainer -Xml $fixletXml
