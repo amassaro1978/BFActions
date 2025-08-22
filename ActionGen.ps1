@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Web
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
 
-# Your site that hosts the Fixlet and (ideally) the Computer Groups
+# The site that hosts BOTH the Fixlet content and (ideally) the Computer Groups
 $CustomSiteName = "Test Group Managed (Workstations)"
 
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric for API)
@@ -18,11 +18,12 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12348"
 }
 
-# Match curl -k behavior if your server uses an untrusted cert
-$IgnoreCertErrors   = $true
-
-# Diagnostics: write fetched XML to temp files to compare with curl output
-$DumpFetchedXmlToTemp = $true
+# Match curl -k behaviour if lab certs are untrusted
+$IgnoreCertErrors       = $true
+# Also dump fetched XMLs to temp to compare with curl
+$DumpFetchedXmlToTemp   = $true
+# Use a last-resort regex extractor for <Relevance>…</Relevance>
+$AggressiveRegexFallback = $true
 
 # =========================
 # UTIL / LOGGING
@@ -78,9 +79,7 @@ function To-IsoDuration([TimeSpan]$ts) {
 # HTTP
 # =========================
 if ($IgnoreCertErrors) {
-    try {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-    } catch { }
+    try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch { }
 }
 
 function HttpGetXml {
@@ -160,17 +159,97 @@ function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# Namespace-agnostic selectors
-function Select-NodeLocal($xmlDoc, [string]$xpath) {
-    return $xmlDoc.SelectSingleNode($xpath)
-}
-function Select-NodesLocal($xmlDoc, [string]$xpath) {
-    return $xmlDoc.SelectNodes($xpath)
+# =========================
+# RELEVANCE EXTRACTION (HARDENED)
+# =========================
+function Extract-AllRelevanceFromXmlString {
+    param(
+        [string]$XmlString,
+        [string]$Context = "Unknown"
+    )
+
+    $all = @()
+
+    try {
+        $x = [xml]$XmlString
+
+        # 1) Under any ComputerGroup node, namespace-agnostic
+        $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
+        $cnt1 = if ($cgRels) { $cgRels.Count } else { 0 }
+        LogLine "[$Context] Top-level ComputerGroup Relevance nodes: $cnt1"
+        if ($cnt1 -gt 0) {
+            foreach ($n in $cgRels) {
+                $t = ($n.InnerText).Trim()
+                if ($t) { $all += $t }
+            }
+        }
+
+        # 2) If still empty, try global //Relevance anywhere
+        if ($all.Count -eq 0) {
+            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
+            $cnt2 = if ($globalRels) { $globalRels.Count } else { 0 }
+            LogLine "[$Context] Global Relevance nodes: $cnt2"
+            if ($cnt2 -gt 0) {
+                foreach ($n in $globalRels) {
+                    $t = ($n.InnerText).Trim()
+                    if ($t) { $all += $t }
+                }
+            }
+        }
+    } catch {
+        LogLine "[$Context] XML parse failed: $($_.Exception.Message)"
+    }
+
+    # 3) Regex fallback if requested and still nothing
+    if ($AggressiveRegexFallback -and $all.Count -eq 0) {
+        try {
+            $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
+            $m = $regex.Matches($XmlString)
+            $cnt3 = $m.Count
+            LogLine "[$Context] Regex-extracted Relevance nodes: $cnt3"
+            if ($cnt3 -gt 0) {
+                foreach ($mm in $m) {
+                    $t = ($mm.Groups[1].Value).Trim()
+                    if ($t) { $all += $t }
+                }
+            }
+        } catch {
+            LogLine "[$Context] Regex relevance fallback failed: $($_.Exception.Message)"
+        }
+    }
+
+    return ,$all
 }
 
-# Build client relevance for a group:
-# 1) Gather ALL <Relevance> nodes under <ComputerGroup> (namespace-agnostic)
-# 2) If none, AND-join all <SearchComponentRelevance> fragments (preferring nested <Relevance>)
+function Extract-SCRFragments {
+    param([string]$XmlString,[string]$Context="Unknown")
+    $frags = @()
+    try {
+        $x = [xml]$XmlString
+        $scrNodes = $x.SelectNodes("//*[local-name()='SearchComponentRelevance']")
+        $cnt = if ($scrNodes) { $scrNodes.Count } else { 0 }
+        LogLine "[$Context] SearchComponentRelevance nodes: $cnt"
+        if ($cnt -gt 0) {
+            foreach ($n in $scrNodes) {
+                $innerR = $n.SelectNodes(".//*[local-name()='Relevance']")
+                if ($innerR -and $innerR.Count -gt 0) {
+                    foreach ($ir in $innerR) {
+                        $t = ($ir.InnerText).Trim()
+                        if ($t) { $frags += $t }
+                    }
+                } else {
+                    $t = ($n.InnerText).Trim()
+                    if ($t) { $frags += $t }
+                }
+            }
+        }
+    } catch {
+        LogLine "[$Context] SCR parse failed: $($_.Exception.Message)"
+    }
+    return ,$frags
+}
+
+# Build client relevance for a group (tries multiple endpoints)
 function Get-GroupClientRelevance {
     param(
         [string]$BaseUrl,
@@ -182,8 +261,8 @@ function Get-GroupClientRelevance {
     $encSite = Encode-SiteName $SiteName
     $candidates = @(
         "/api/computergroup/custom/$encSite/$GroupIdNumeric",               # custom site
-        "/api/computergroup/master/$GroupIdNumeric",                         # master site
-        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"       # operator site (best guess)
+        "/api/computergroup/master/$GroupIdNumeric",                        # master site
+        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"      # operator site (best guess)
     )
 
     foreach ($relPath in $candidates) {
@@ -203,60 +282,27 @@ function Get-GroupClientRelevance {
             LogLine "Fetched group XML (${url}) len=$len head: $head"
             if ($tail) { LogLine "Fetched group XML tail: $tail" }
 
-            $x = [xml]$xmlStr
-
-            # Find ComputerGroup node
-            $cg = Select-NodeLocal $x "/*[local-name()='BES']/*[local-name()='ComputerGroup']"
-            if (-not $cg) {
-                LogLine "No <ComputerGroup> node at ${url}"
-                continue
-            }
-
-            # 1) All top-level <Relevance> under ComputerGroup (could be multiple)
-            $topNodes = Select-NodesLocal $cg "./*[local-name()='Relevance']"
-            $vals = @()
-            if ($topNodes -and $topNodes.Count -gt 0) {
-                foreach ($tn in $topNodes) {
-                    $txt = ($tn.InnerText).Trim()
-                    if ($txt) { $vals += $txt }
-                }
-            }
-
-            if ($vals.Count -gt 0) {
-                $joined = ($vals | ForEach-Object { "($_)" }) -join " AND "
+            # Try relevance extraction paths
+            $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
+            if ($rels.Count -gt 0) {
+                $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
                 $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
-                LogLine "Found group <Relevance> at ${url} :: ${snippet}..."
+                LogLine "Using group relevance from <Relevance> nodes :: ${snippet}..."
                 return $joined
             }
 
-            # 2) SearchComponentRelevance fragments (prefer nested <Relevance>)
-            $fragments = @()
-            $scrNodes = Select-NodesLocal $cg ".//*[local-name()='SearchComponentRelevance']"
-            if ($scrNodes -and $scrNodes.Count -gt 0) {
-                foreach ($n in $scrNodes) {
-                    $innerRels = Select-NodesLocal $n ".//*[local-name()='Relevance']"
-                    if ($innerRels -and $innerRels.Count -gt 0) {
-                        foreach ($ir in $innerRels) {
-                            $t = ($ir.InnerText).Trim()
-                            if ($t) { $fragments += $t }
-                        }
-                    } else {
-                        $t = ($n.InnerText).Trim()
-                        if ($t) { $fragments += $t }
-                    }
-                }
-            }
-
-            if ($fragments.Count -gt 0) {
-                $joined = ($fragments | ForEach-Object { "($_)" }) -join " AND "
+            # SCR fallback
+            $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
+            if ($frags.Count -gt 0) {
+                $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
                 $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
-                LogLine "Built relevance from SearchComponentRelevance at ${url} :: ${snippet}..."
+                LogLine "Built relevance from SearchComponentRelevance :: ${snippet}..."
                 return $joined
             }
 
             LogLine "No usable relevance at ${url}"
         } catch {
-            LogLine "Fetch failed at ${url}: $($_.Exception.GetBaseException().Message)"
+            LogLine "Fetch failed at ${url}: $($_.Exception.Message)"
         }
     }
 
