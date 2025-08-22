@@ -7,10 +7,10 @@ Add-Type -AssemblyName System.Web
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
 
-# Your site that hosts the Fixlet and (ideally) the Computer Groups
+# Site that hosts the Fixlet + (ideally) the Computer Groups
 $CustomSiteName = "Test Group Managed (Workstations)"
 
-# Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric for API)
+# Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric)
 $GroupMap = @{
     "Pilot"                     = "00-12345"
     "Deploy"                    = "00-12346"
@@ -18,15 +18,21 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12348"
 }
 
-# Match curl -k behavior if your server uses an untrusted cert
-$IgnoreCertErrors        = $true
-# Dump fetched XMLs to temp for side-by-side compare with curl output
-$DumpFetchedXmlToTemp    = $true
-# Last-resort regex extractor for <Relevance>…</Relevance> if XML shape is odd
-$AggressiveRegexFallback = $true
+# ---- IMPORTANT: how to build the XML ----
+# 'Sourced'  => action shows under the Fixlet's custom site in Console (RECOMMENDED for your need)
+# 'Single'   => independent SingleAction (owned by operator); flip only if needed
+$ActionMode = 'Sourced'   # 'Sourced' or 'Single'
 
-# Also save the exact action XML we POST (normalized, UTF8 no BOM)
-$SaveActionXmlToTemp     = $true
+# Match curl -k if your cert is untrusted
+$IgnoreCertErrors           = $true
+# Dump fetched input XMLs
+$DumpFetchedXmlToTemp       = $true
+# Regex fallback for odd XML shapes
+$AggressiveRegexFallback    = $true
+# Save the exact action XML we POST (normalized, UTF8 no BOM)
+$SaveActionXmlToTemp        = $true
+# Post like curl using Invoke-WebRequest -InFile
+$PostUsingInvokeWebRequest  = $true
 
 # =========================
 # UTIL / LOGGING
@@ -62,7 +68,7 @@ function LogLine($txt) {
 }
 function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
-    return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
+    return ($GroupIdWithPrefix -replace '[^\d]','')
 }
 # ISO-8601 duration PnDTnHnMnS (positive from now)
 function To-IsoDuration([TimeSpan]$ts) {
@@ -90,25 +96,20 @@ function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
-# Hex dump first N bytes for logging (PowerShell-safe)
+# Hex preview (debug)
 function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     if (-not $s) { return "" }
     $bytes = [Text.Encoding]::UTF8.GetBytes($s)
     $take = [Math]::Min($n, $bytes.Length)
     $sb = New-Object System.Text.StringBuilder
-    for ($i = 0; $i -lt $take; $i++) {
-        [void]$sb.AppendFormat("{0:X2} ", $bytes[$i])
-    }
-    return $sb.ToString().TrimEnd()
+    for ($i = 0; $i -lt $take; $i++) { [void]$sb.AppendFormat("{0:X2} ", $bytes[$i]) }
+    $sb.ToString().TrimEnd()
 }
 
 # =========================
 # HTTP
 # =========================
-if ($IgnoreCertErrors) {
-    try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch { }
-}
-# Some servers dislike Expect: 100-continue
+if ($IgnoreCertErrors) { try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch { } }
 [System.Net.ServicePointManager]::Expect100Continue = $false
 
 function HttpGetXml {
@@ -134,6 +135,32 @@ function HttpGetXml {
         throw ($_.Exception.GetBaseException().Message)
     }
 }
+
+# curl-like POST using a file on disk
+function Post-XmlFile-InFile {
+    param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
+    try {
+        $pair  = "$User`:$Pass"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+        $basic = "Basic " + [Convert]::ToBase64String($bytes)
+        $resp = Invoke-WebRequest -Method Post -Uri $Url `
+            -Headers @{ "Authorization" = $basic } `
+            -ContentType "application/xml" `
+            -InFile $XmlFilePath `
+            -UseBasicParsing
+        if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
+    } catch {
+        if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
+            $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream(), [Text.Encoding]::UTF8)
+            $errBody = $sr.ReadToEnd(); $sr.Close()
+            throw "Invoke-WebRequest POST failed :: $errBody"
+        } else {
+            throw ($_.Exception.Message)
+        }
+    }
+}
+
+# Legacy direct-bytes POST (kept as fallback)
 function HttpPostXml {
     param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
     $bytes = [Text.Encoding]::UTF8.GetBytes($XmlBody)
@@ -187,25 +214,14 @@ function Get-FixletContainer { param([xml]$Xml)
     throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
 }
 
-# FIXED: use XPath + InnerText for relevance
-function Get-ActionAndRelevance { 
+function Get-ActionAndRelevance {
     param($ContainerNode)
     $rels = @()
     $direct = $ContainerNode.SelectNodes("./*[local-name()='Relevance']")
-    if ($direct -and $direct.Count -gt 0) {
-        foreach ($n in $direct) {
-            $t = ($n.InnerText).Trim()
-            if ($t) { $rels += $t }
-        }
-    }
+    if ($direct) { foreach ($n in $direct) { $t = ($n.InnerText).Trim(); if ($t) { $rels += $t } } }
     if ($rels.Count -eq 0) {
         $any = $ContainerNode.SelectNodes(".//*[local-name()='Relevance']")
-        if ($any -and $any.Count -gt 0) {
-            foreach ($n in $any) {
-                $t = ($n.InnerText).Trim()
-                if ($t) { $rels += $t }
-            }
-        }
+        if ($any) { foreach ($n in $any) { $t = ($n.InnerText).Trim(); if ($t) { $rels += $t } } }
     }
     $act = $null
     if ($ContainerNode.Action) { $act = $ContainerNode.Action | Select-Object -First 1 }
@@ -220,18 +236,14 @@ function Get-ActionAndRelevance {
     LogLine ("Fixlet relevance nodes found: {0}" -f $rels.Count)
     return @{ Relevance=$rels; ActionScript=$script }
 }
+
 function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# =========================
-# RELEVANCE (GROUPS - HARDENED)
-# =========================
+# GROUP relevance helpers
 function Extract-AllRelevanceFromXmlString {
-    param(
-        [string]$XmlString,
-        [string]$Context = "Unknown"
-    )
+    param([string]$XmlString,[string]$Context = "Unknown")
     $all = @()
     try {
         $x = [xml]$XmlString
@@ -241,16 +253,11 @@ function Extract-AllRelevanceFromXmlString {
             $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
             if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
         }
-    } catch {
-        LogLine "[$Context] XML parse failed: $($_.Exception.Message)"
-    }
+    } catch { LogLine "[$Context] XML parse failed: $($_.Exception.Message)" }
     if ($AggressiveRegexFallback -and $all.Count -eq 0) {
         try {
             $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
-            foreach ($mm in $regex.Matches($XmlString)) {
-                $t = ($mm.Groups[1].Value).Trim()
-                if ($t) { $all += $t }
-            }
+            foreach ($mm in $regex.Matches($XmlString)) { $t = ($mm.Groups[1].Value).Trim(); if ($t) { $all += $t } }
         } catch { LogLine "[$Context] Regex relevance fallback failed: $($_.Exception.Message)" }
     }
     return ,$all
@@ -275,12 +282,7 @@ function Extract-SCRFragments {
     return ,$frags
 }
 function Get-GroupClientRelevance {
-    param(
-        [string]$BaseUrl,
-        [string]$AuthHeader,
-        [string]$SiteName,
-        [string]$GroupIdNumeric
-    )
+    param([string]$BaseUrl,[string]$AuthHeader,[string]$SiteName,[string]$GroupIdNumeric)
     $encSite = Encode-SiteName $SiteName
     $candidates = @(
         "/api/computergroup/custom/$encSite/$GroupIdNumeric",
@@ -319,55 +321,32 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# SINGLE ACTION XML
+# ACTION XML BUILDERS
 # =========================
 function Build-SingleActionXml {
-    param(
-        [string]$ActionTitle,            # Pilot/Deploy/Force/Conference...
-        [string]$DisplayName,            # Vendor App Version
-        [string[]]$RelevanceBlocks,      # Fixlet relevance + group relevance
-        [string]$ActionScript,           # Action script
-        [datetime]$StartLocal,           # scheduled local start (absolute)
-        [bool]$IsForce = $false          # Force adds end offset (start+24h)
-    )
+    param([string]$ActionTitle,[string]$DisplayName,[string[]]$RelevanceBlocks,[string]$ActionScript,[datetime]$StartLocal,[bool]$IsForce=$false)
     $titleText = "$($DisplayName): $ActionTitle"
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
-
-    # Combine all relevance into ONE expression (single <Relevance>)
     $relevanceCombined = ""
     if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
-        $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } |
-            ForEach-Object { "($_)" }) -join " AND "
+        $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { "($_)" }) -join " AND "
     }
     $relSafe = $relevanceCombined -replace ']]>', ']]]]><![CDATA[>'
     $rels = if ([string]::IsNullOrWhiteSpace($relevanceCombined)) { "" } else { "    <Relevance><![CDATA[$relSafe]]></Relevance>" }
-
-    # Durations from now
     $now = Get-Date
-    $startTs = $StartLocal - $now
-    $startOffset = To-IsoDuration $startTs
-
-    $hasEnd = $false
-    $endOffset = $null
-    $endOffsetLine = ""
+    $startOffset = To-IsoDuration ($StartLocal - $now)
+    $hasEnd = $false; $endOffsetLine = ""; $deadlineBehaviorBlock = ""
     if ($IsForce) {
-        $endAbs = $StartLocal.AddHours(24)
-        $endTs  = $endAbs - $now
-        $endOffset = To-IsoDuration $endTs
+        $endOffset = To-IsoDuration (($StartLocal.AddHours(24)) - $now)
         $hasEnd = $true
         $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
-    }
-
-    # Only include deadline nodes when Force is true
-    $deadlineBehaviorBlock = if ($IsForce) {
-@"
+        $deadlineBehaviorBlock = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
         <DeadlineLocalOffset>$endOffset</DeadlineLocalOffset>
 "@
-    } else { "" }
-
+    }
 @"
 <?xml version="1.0" encoding="UTF-8"?>
 <BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
@@ -380,7 +359,6 @@ $ActionScript
     <SuccessCriteria Option="RunToCompletion" />
     <Settings>
       <ActionUITitle>$titleEsc</ActionUITitle>
-
       <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
         <Text>$dispEsc update will be enforced on $((Get-Date $StartLocal).ToString('M/d/yy h:mm tt')). Please save your work.</Text>
@@ -388,10 +366,8 @@ $ActionScript
         <ShowActionButton>false</ShowActionButton>
         <ShowCancelButton>false</ShowCancelButton>$deadlineBehaviorBlock        <ShowConfirmation>false</ShowConfirmation>
       </PreAction>
-
       <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
-
       <HasTimeRange>false</HasTimeRange>
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
@@ -402,15 +378,98 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
       <ActiveUserType>AllUsers</ActiveUserType>
       <HasWhose>false</HasWhose>
       <PreActionCacheDownload>false</PreActionCacheDownload>
-
       <Reapply>true</Reapply>
       <HasReapplyLimit>false</HasReapplyLimit>
       <HasReapplyInterval>false</HasReapplyInterval>
-
       <HasRetry>true</HasRetry>
       <RetryCount>3</RetryCount>
       <RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
+      <HasTemporalDistribution>false</HasTemporalDistribution>
+      <ContinueOnErrors>true</ContinueOnErrors>
+      <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
+      <IsOffer>false</IsOffer>
+    </Settings>
+    <Target><AllComputers>true</AllComputers></Target>
+  </SingleAction>
+</BES>
+"@
+}
 
+# PS5.1-safe SourcedFixletAction builder
+function Build-SourcedFixletActionXml {
+    param(
+        [string]$ActionTitle,     # Pilot/Deploy/Force/Conference...
+        [string]$DisplayName,     # Vendor App Version
+        [string]$SiteName,        # Custom site name
+        [string]$FixletId,        # Fixlet ID
+        [string]$GroupRelevance,  # Group filter to AND with fixlet relevance
+        [datetime]$StartLocal,    # Scheduled local start (absolute)
+        [bool]$IsForce = $false   # Force adds end offset (start+24h)
+    )
+
+    $titleText = "$($DisplayName): $ActionTitle"
+    $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
+    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+
+    # Default empty if null/whitespace, then make CDATA-safe
+    if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { $groupSafe = "" } else { $groupSafe = $GroupRelevance }
+    $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
+
+    # Durations from now
+    $now = Get-Date
+    $startOffset = To-IsoDuration ($StartLocal - $now)
+
+    $hasEnd = $false
+    $endOffsetLine = ""
+    $deadlineBehaviorBlock = ""
+    if ($IsForce) {
+        $endOffset = To-IsoDuration (($StartLocal.AddHours(24)) - $now)
+        $hasEnd = $true
+        $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
+        $deadlineBehaviorBlock = @"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalOffset>$endOffset</DeadlineLocalOffset>
+"@
+    }
+
+@"
+<?xml version="1.0" encoding="UTF-8"?>
+<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
+  <SourcedFixletAction>
+    <Title>$titleEsc</Title>
+    <SourceFixlet>
+      <Sitename>$SiteName</Sitename>
+      <FixletID>$FixletId</FixletID>
+      <Action>Action1</Action>
+    </SourceFixlet>
+    <Settings>
+      <ActionUITitle>$titleEsc</ActionUITitle>
+      <PreActionShowUI>true</PreActionShowUI>
+      <PreAction>
+        <Text>$dispEsc update will be enforced on $((Get-Date $StartLocal).ToString('M/d/yy h:mm tt')). Please save your work.</Text>
+        <AskToSaveWork>true</AskToSaveWork>
+        <ShowActionButton>false</ShowActionButton>
+        <ShowCancelButton>false</ShowCancelButton>$deadlineBehaviorBlock        <ShowConfirmation>false</ShowConfirmation>
+      </PreAction>
+      <HasRunningMessage>true</HasRunningMessage>
+      <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
+      <HasTimeRange>false</HasTimeRange>
+      <HasStartTime>true</HasStartTime>
+      <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
+      <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
+$endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
+      <UseUTCTime>false</UseUTCTime>
+      <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
+      <ActiveUserType>AllUsers</ActiveUserType>
+      <HasWhose>false</HasWhose>
+      <PreActionCacheDownload>false</PreActionCacheDownload>
+      <Reapply>true</Reapply>
+      <HasReapplyLimit>false</HasReapplyLimit>
+      <HasReapplyInterval>false</HasReapplyInterval>
+      <HasRetry>true</HasRetry>
+      <RetryCount>3</RetryCount>
+      <RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
       <HasTemporalDistribution>false</HasTemporalDistribution>
       <ContinueOnErrors>true</ContinueOnErrors>
       <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
@@ -418,8 +477,9 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
     </Settings>
     <Target>
       <AllComputers>true</AllComputers>
+      <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
     </Target>
-  </SingleAction>
+  </SourcedFixletAction>
 </BES>
 "@
 }
@@ -440,12 +500,8 @@ function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB) {
     $lbl.Size = New-Object System.Drawing.Size(140,22)
     $form.Controls.Add($lbl)
 
-    if ($IsPassword) {
-        $tb = New-Object System.Windows.Forms.MaskedTextBox
-        $tb.PasswordChar = '*'
-    } else {
-        $tb = New-Object System.Windows.Forms.TextBox
-    }
+    if ($IsPassword) { $tb = New-Object System.Windows.Forms.MaskedTextBox; $tb.PasswordChar = '*' }
+    else { $tb = New-Object System.Windows.Forms.TextBox }
     $tb.Location = New-Object System.Drawing.Point(160,$script:y)
     $tb.Size = New-Object System.Drawing.Size(440,22)
     $form.Controls.Add($tb)
@@ -471,7 +527,7 @@ $cbDate.Location = New-Object System.Drawing.Point(160,$y)
 $cbDate.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbDate)
 $y += 34
-# populate next 20 Wednesdays
+# next 20 Wednesdays
 $today = Get-Date
 $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
@@ -495,9 +551,9 @@ while ($start -le $end) { [void]$cbTime.Items.Add($start.ToString("h:mm tt")); $
 
 # Button
 $btn = New-Object System.Windows.Forms.Button
-$btn.Text = "Generate & Post 4 Single Actions"
+$btn.Text = "Generate & Post 4 Actions (Pilot/Deploy/Force/Conf)"
 $btn.Location = New-Object System.Drawing.Point(160,$y)
-$btn.Size = New-Object System.Drawing.Size(280,32)
+$btn.Size = New-Object System.Drawing.Size(320,32)
 $form.Controls.Add($btn)
 $y += 42
 
@@ -542,7 +598,6 @@ $btn.Add_Click({
 
         $auth = Get-AuthHeader -User $user -Pass $pass
         $fixletContent = HttpGetXml -Url $fixletUrl -AuthHeader $auth
-
         if ($DumpFetchedXmlToTemp) {
             $tmpFix = Join-Path $env:TEMP ("BES_Fixlet_{0}.xml" -f $fixId)
             Write-Utf8NoBom -Path $tmpFix -Content $fixletContent
@@ -550,7 +605,6 @@ $btn.Add_Click({
         }
 
         $fixletXml = [xml]$fixletContent
-
         $cont = Get-FixletContainer -Xml $fixletXml
         LogLine ("Detected BES content type: {0}" -f $cont.Type)
 
@@ -558,8 +612,7 @@ $btn.Add_Click({
         $displayName = Parse-FixletTitleToProduct -Title $titleRaw
 
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
-        $fixletRelevance = @()
-        if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
+        $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
         $actionScript = $parsed.ActionScript
 
         LogLine "Parsed title: ${displayName}"
@@ -579,46 +632,61 @@ $btn.Add_Click({
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
             if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '${groupIdRaw}' for $($a)"; continue }
 
+            # fetch group relevance
             try {
                 $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
                 LogLine ("Group relevance len ({0}): {1}" -f $a, $groupRel.Length)
             } catch {
                 LogLine "❌ Could not fetch/build group relevance for $($a): $($_.Exception.Message)"
-                continue  # do NOT post without group relevance
+                continue
             }
-
-            # Combine fixlet relevance + group relevance into ONE expression
-            $allRel = @()
-            $allRel += $fixletRelevance
-            if ($groupRel) { $allRel += $groupRel }
 
             $isForce = ($a -eq "Force")
 
-            $xmlBody = Build-SingleActionXml `
-                -ActionTitle $a `
-                -DisplayName $displayName `
-                -RelevanceBlocks $allRel `
-                -ActionScript $actionScript `
-                -StartLocal $startLocal `
-                -IsForce:$isForce
+            # Build XML per mode
+            if ($ActionMode -ieq 'Sourced') {
+                $xmlBody = Build-SourcedFixletActionXml `
+                    -ActionTitle $a `
+                    -DisplayName $displayName `
+                    -SiteName $CustomSiteName `
+                    -FixletId $fixId `
+                    -GroupRelevance $groupRel `
+                    -StartLocal $startLocal `
+                    -IsForce:$isForce
+            } else {
+                # SingleAction path: combine fixlet + group relevance; include ActionScript
+                $allRel = @(); $allRel += $fixletRelevance; if ($groupRel) { $allRel += $groupRel }
+                $xmlBody = Build-SingleActionXml `
+                    -ActionTitle $a `
+                    -DisplayName $displayName `
+                    -RelevanceBlocks $allRel `
+                    -ActionScript $actionScript `
+                    -StartLocal $startLocal `
+                    -IsForce:$isForce
+            }
 
             $xmlBodyToSend = Normalize-XmlForPost $xmlBody
-
-            # Hex preview to prove the first bytes are '<?xml'
             $hex = Get-FirstBytesHex $xmlBodyToSend 32
             LogLine ("First 32 bytes (hex) for {0}: {1}" -f $a, $hex)
 
-            # Save exact body we post (UTF-8 no BOM) + show curl helper
+            # Save body we post (UTF-8 no BOM) + curl helper
+            $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
+            $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
             if ($SaveActionXmlToTemp) {
-                $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
-                $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
                 Write-Utf8NoBom -Path $tmpAction -Content $xmlBodyToSend
                 LogLine "Saved action XML for $a to: $tmpAction"
                 LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
             }
 
             try {
-                HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBodyToSend
+                if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
+                    LogLine "Posting via Invoke-WebRequest (curl-like) using file: $tmpAction"
+                    Post-XmlFile-InFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
+                } else {
+                    LogLine "Posting via HttpWebRequest body (direct bytes)"
+                    $authHeader = Get-AuthHeader -User $user -Pass $pass
+                    HttpPostXml -Url $postUrl -AuthHeader $authHeader -XmlBody $xmlBodyToSend
+                }
                 LogLine ("✅ {0} posted successfully." -f $a)
             } catch {
                 LogLine ("❌ POST failed for {0}: {1}" -f $a, $_.Exception.Message)
