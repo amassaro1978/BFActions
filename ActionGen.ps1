@@ -25,6 +25,9 @@ $DumpFetchedXmlToTemp    = $true
 # Last-resort regex extractor for <Relevance>…</Relevance> if XML shape is odd
 $AggressiveRegexFallback = $true
 
+# Also save the exact action XML we POST (normalized, UTF8 no BOM)
+$SaveActionXmlToTemp     = $true
+
 # =========================
 # UTIL / LOGGING
 # =========================
@@ -61,7 +64,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
-# Build an ISO-8601 duration like PnDTnHnMnS (positive from "now")
+# ISO-8601 duration PnDTnHnMnS (positive from now)
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $days = [int]$ts.TotalDays
@@ -82,6 +85,18 @@ function Normalize-XmlForPost([string]$s) {
     $noLeadWs = $noBom -replace '^\s+',''
     return $noLeadWs
 }
+# UTF8 (no BOM) file write
+function Write-Utf8NoBom([string]$Path,[string]$Content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+# Hex dump first N bytes for logging
+function Get-FirstBytesHex([string]$s,[int]$n=32) {
+    if (-not $s) { return "" }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($s)
+    $take = [Math]::Min($n, $bytes.Length)
+    -join (for ($i=0;$i -lt $take;$i++) { "{0:X2}" -f $bytes[$i] + " " })
+}
 
 # =========================
 # HTTP
@@ -89,6 +104,8 @@ function Normalize-XmlForPost([string]$s) {
 if ($IgnoreCertErrors) {
     try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch { }
 }
+# Some servers dislike Expect: 100-continue
+[System.Net.ServicePointManager]::Expect100Continue = $false
 
 function HttpGetXml {
     param([string]$Url,[string]$AuthHeader)
@@ -120,6 +137,8 @@ function HttpPostXml {
     $req.Method = "POST"
     $req.Accept = "application/xml"
     $req.ContentType = "application/xml; charset=utf-8"
+    $req.UserAgent = "BigFixActionGenerator/1.0"
+    $req.KeepAlive = $false
     $req.Headers["Authorization"] = $AuthHeader
     $req.ProtocolVersion = [Version]"1.1"
     $req.PreAuthenticate = $true
@@ -140,9 +159,9 @@ function HttpPostXml {
             try {
                 $sr = New-Object IO.StreamReader($we.Response.GetResponseStream(), [Text.Encoding]::UTF8)
                 $errBody = $sr.ReadToEnd(); $sr.Close()
-                throw "HTTP $($we.Status) :: $($we.Message) :: $errBody"
+                throw "HTTP $($we.Response.StatusCode) :: $($we.Message) :: $errBody"
             } catch {
-                throw "HTTP $($we.Status) :: $($we.Message)"
+                throw "HTTP error :: $($we.Message)"
             } finally {
                 $we.Response.Close()
             }
@@ -164,14 +183,10 @@ function Get-FixletContainer { param([xml]$Xml)
     throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
 }
 
-# FIXED: use XPath + InnerText (no more System.Xml.XmlElement)
+# FIXED: use XPath + InnerText for relevance
 function Get-ActionAndRelevance { 
     param($ContainerNode)
-
-    # --- Relevance (robust) ---
     $rels = @()
-
-    # 1) Direct children named "Relevance"
     $direct = $ContainerNode.SelectNodes("./*[local-name()='Relevance']")
     if ($direct -and $direct.Count -gt 0) {
         foreach ($n in $direct) {
@@ -179,8 +194,6 @@ function Get-ActionAndRelevance {
             if ($t) { $rels += $t }
         }
     }
-
-    # 2) If none, search anywhere under the Fixlet/Task/Baseline node
     if ($rels.Count -eq 0) {
         $any = $ContainerNode.SelectNodes(".//*[local-name()='Relevance']")
         if ($any -and $any.Count -gt 0) {
@@ -190,24 +203,19 @@ function Get-ActionAndRelevance {
             }
         }
     }
-
-    # --- ActionScript (safe) ---
     $act = $null
     if ($ContainerNode.Action) { $act = $ContainerNode.Action | Select-Object -First 1 }
     if (-not $act -and $ContainerNode.DefaultAction) { $act = $ContainerNode.DefaultAction }
     if (-not $act) { throw "No <Action> or <DefaultAction> block found." }
-
     $script = $null
     if ($act.ActionScript) {
         $script = [string]$act.ActionScript.'#text'
         if ([string]::IsNullOrWhiteSpace($script)) { $script = $act.ActionScript.InnerText }
     }
     if (-not $script) { throw "Action found but no <ActionScript> content present." }
-
     LogLine ("Fixlet relevance nodes found: {0}" -f $rels.Count)
     return @{ Relevance=$rels; ActionScript=$script }
 }
-
 function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
@@ -223,50 +231,23 @@ function Extract-AllRelevanceFromXmlString {
     $all = @()
     try {
         $x = [xml]$XmlString
-
-        # 1) Under any ComputerGroup node, namespace-agnostic
         $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
-        $cnt1 = if ($cgRels) { $cgRels.Count } else { 0 }
-        LogLine "[$Context] Top-level ComputerGroup Relevance nodes: $cnt1"
-        if ($cnt1 -gt 0) {
-            foreach ($n in $cgRels) {
-                $t = ($n.InnerText).Trim()
-                if ($t) { $all += $t }
-            }
-        }
-
-        # 2) If still empty, try global //Relevance anywhere
+        if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
         if ($all.Count -eq 0) {
             $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
-            $cnt2 = if ($globalRels) { $globalRels.Count } else { 0 }
-            LogLine "[$Context] Global Relevance nodes: $cnt2"
-            if ($cnt2 -gt 0) {
-                foreach ($n in $globalRels) {
-                    $t = ($n.InnerText).Trim()
-                    if ($t) { $all += $t }
-                }
-            }
+            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
         }
     } catch {
         LogLine "[$Context] XML parse failed: $($_.Exception.Message)"
     }
-
-    # 3) Regex fallback if requested and still nothing
     if ($AggressiveRegexFallback -and $all.Count -eq 0) {
         try {
             $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
-            $m = $regex.Matches($XmlString)
-            $cnt3 = $m.Count
-            LogLine "[$Context] Regex-extracted Relevance nodes: $cnt3"
-            if ($cnt3 -gt 0) {
-                foreach ($mm in $m) {
-                    $t = ($mm.Groups[1].Value).Trim()
-                    if ($t) { $all += $t }
-                }
+            foreach ($mm in $regex.Matches($XmlString)) {
+                $t = ($mm.Groups[1].Value).Trim()
+                if ($t) { $all += $t }
             }
-        } catch {
-            LogLine "[$Context] Regex relevance fallback failed: $($_.Exception.Message)"
-        }
+        } catch { LogLine "[$Context] Regex relevance fallback failed: $($_.Exception.Message)" }
     }
     return ,$all
 }
@@ -276,25 +257,17 @@ function Extract-SCRFragments {
     try {
         $x = [xml]$XmlString
         $scrNodes = $x.SelectNodes("//*[local-name()='SearchComponentRelevance']")
-        $cnt = if ($scrNodes) { $scrNodes.Count } else { 0 }
-        LogLine "[$Context] SearchComponentRelevance nodes: $cnt"
-        if ($cnt -gt 0) {
+        if ($scrNodes) {
             foreach ($n in $scrNodes) {
                 $innerR = $n.SelectNodes(".//*[local-name()='Relevance']")
                 if ($innerR -and $innerR.Count -gt 0) {
-                    foreach ($ir in $innerR) {
-                        $t = ($ir.InnerText).Trim()
-                        if ($t) { $frags += $t }
-                    }
+                    foreach ($ir in $innerR) { $t = ($ir.InnerText).Trim(); if ($t) { $frags += $t } }
                 } else {
-                    $t = ($n.InnerText).Trim()
-                    if ($t) { $frags += $t }
+                    $t = ($n.InnerText).Trim(); if ($t) { $frags += $t }
                 }
             }
         }
-    } catch {
-        LogLine "[$Context] SCR parse failed: $($_.Exception.Message)"
-    }
+    } catch { LogLine "[$Context] SCR parse failed: $($_.Exception.Message)" }
     return ,$frags
 }
 function Get-GroupClientRelevance {
@@ -316,15 +289,9 @@ function Get-GroupClientRelevance {
             $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
             if ($DumpFetchedXmlToTemp) {
                 $tmp = Join-Path $env:TEMP ("BES_ComputerGroup_{0}.xml" -f $GroupIdNumeric)
-                Set-Content -Path $tmp -Value $xmlStr -Encoding UTF8
+                Write-Utf8NoBom -Path $tmp -Content $xmlStr
                 LogLine "Saved fetched group XML to: $tmp"
             }
-            $len = $xmlStr.Length
-            $head = $xmlStr.Substring(0, [Math]::Min(800, $len)).Replace("`r"," ").Replace("`n"," ")
-            $tail = if ($len -gt 240) { $xmlStr.Substring([Math]::Max(0, $len-240)).Replace("`r"," ").Replace("`n"," ") } else { "" }
-            LogLine "Fetched group XML (${url}) len=$len head: $head"
-            if ($tail) { LogLine "Fetched group XML tail: $tail" }
-
             $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
             if ($rels.Count -gt 0) {
                 $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
@@ -574,15 +541,9 @@ $btn.Add_Click({
 
         if ($DumpFetchedXmlToTemp) {
             $tmpFix = Join-Path $env:TEMP ("BES_Fixlet_{0}.xml" -f $fixId)
-            Set-Content -Path $tmpFix -Value $fixletContent -Encoding UTF8
+            Write-Utf8NoBom -Path $tmpFix -Content $fixletContent
             LogLine "Saved fetched fixlet XML to: $tmpFix"
         }
-
-        $fixLen  = $fixletContent.Length
-        $fixHead = $fixletContent.Substring(0, [Math]::Min(800, $fixLen)).Replace("`r"," ").Replace("`n"," ")
-        $fixTail = if ($fixLen -gt 240) { $fixletContent.Substring([Math]::Max(0, $fixLen-240)).Replace("`r"," ").Replace("`n"," ") } else { "" }
-        LogLine "Fetched fixlet XML len=$fixLen head: $fixHead"
-        if ($fixTail) { LogLine "Fetched fixlet XML tail: $fixTail" }
 
         $fixletXml = [xml]$fixletContent
 
@@ -639,8 +600,18 @@ $btn.Add_Click({
 
             $xmlBodyToSend = Normalize-XmlForPost $xmlBody
 
-            LogLine ("---- SingleAction XML for {0} ----" -f $a)
-            LogLine $xmlBodyToSend
+            # Hex preview to prove the first bytes are '<?xml'
+            $hex = Get-FirstBytesHex $xmlBodyToSend 32
+            LogLine ("First 32 bytes (hex) for {0}: {1}" -f $a, $hex)
+
+            # Save exact body we post (UTF-8 no BOM) + show curl helper
+            if ($SaveActionXmlToTemp) {
+                $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
+                $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
+                Write-Utf8NoBom -Path $tmpAction -Content $xmlBodyToSend
+                LogLine "Saved action XML for $a to: $tmpAction"
+                LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
+            }
 
             try {
                 HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBodyToSend
