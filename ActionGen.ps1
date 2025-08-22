@@ -19,9 +19,9 @@ $GroupMap = @{
 }
 
 # Match curl -k behavior if your server uses an untrusted cert
-$IgnoreCertErrors       = $true
+$IgnoreCertErrors        = $true
 # Dump fetched XMLs to temp for side-by-side compare with curl output
-$DumpFetchedXmlToTemp   = $true
+$DumpFetchedXmlToTemp    = $true
 # Last-resort regex extractor for <Relevance>…</Relevance> if XML shape is odd
 $AggressiveRegexFallback = $true
 
@@ -377,19 +377,14 @@ function Build-SingleActionXml {
         $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
     }
 
-    # PreAction deadline: align to start+24h for Force
+    # Only include deadline nodes when Force is true (avoid invalid 'None' enums)
     $deadlineBehaviorBlock = if ($IsForce) {
 @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
         <DeadlineLocalOffset>$endOffset</DeadlineLocalOffset>
 "@
-    } else {
-@"
-        <DeadlineBehavior>None</DeadlineBehavior>
-        <DeadlineType>None</DeadlineType>
-"@
-    }
+    } else { "" }
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
