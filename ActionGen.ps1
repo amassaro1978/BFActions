@@ -19,8 +19,8 @@ $GroupMap = @{
 }
 
 # ---- IMPORTANT: how to build the XML ----
-# 'Sourced'  => action shows under the Fixlet's custom site in Console (RECOMMENDED for your need)
-# 'Single'   => independent SingleAction (owned by operator); flip only if needed
+# 'Sourced'  => action shows under the Fixlet's custom site in Console (RECOMMENDED)
+# 'Single'   => independent SingleAction (owned by operator)
 $ActionMode = 'Sourced'   # 'Sourced' or 'Single'
 
 # Match curl -k if your cert is untrusted
@@ -395,7 +395,7 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
 "@
 }
 
-# PS5.1-safe SourcedFixletAction builder
+# PS5.1-safe SourcedFixletAction builder (Target before Settings, no Title, CustomRelevance only)
 function Build-SourcedFixletActionXml {
     param(
         [string]$ActionTitle,     # Pilot/Deploy/Force/Conference...
@@ -407,15 +407,12 @@ function Build-SourcedFixletActionXml {
         [bool]$IsForce = $false   # Force adds end offset (start+24h)
     )
 
-    $titleText = "$($DisplayName): $ActionTitle"
-    $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
-    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+    $uiTitle = [System.Security.SecurityElement]::Escape("$($DisplayName): $ActionTitle")
+    $dispEsc = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Default empty if null/whitespace, then make CDATA-safe
     if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { $groupSafe = "" } else { $groupSafe = $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # Durations from now
     $now = Get-Date
     $startOffset = To-IsoDuration ($StartLocal - $now)
 
@@ -437,14 +434,16 @@ function Build-SourcedFixletActionXml {
 <?xml version="1.0" encoding="UTF-8"?>
 <BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
   <SourcedFixletAction>
-    <Title>$titleEsc</Title>
     <SourceFixlet>
       <Sitename>$SiteName</Sitename>
       <FixletID>$FixletId</FixletID>
       <Action>Action1</Action>
     </SourceFixlet>
+    <Target>
+      <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
+    </Target>
     <Settings>
-      <ActionUITitle>$titleEsc</ActionUITitle>
+      <ActionUITitle>$uiTitle</ActionUITitle>
       <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
         <Text>$dispEsc update will be enforced on $((Get-Date $StartLocal).ToString('M/d/yy h:mm tt')). Please save your work.</Text>
@@ -475,10 +474,6 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
       <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
       <IsOffer>false</IsOffer>
     </Settings>
-    <Target>
-      <AllComputers>true</AllComputers>
-      <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
-    </Target>
   </SourcedFixletAction>
 </BES>
 "@
