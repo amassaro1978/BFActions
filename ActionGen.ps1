@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Web
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
 
-# The site that hosts BOTH the Fixlet content and the Computer Groups
+# The site that hosts BOTH the Fixlet content and (ideally) the Computer Groups (for custom-site lookup first)
 $CustomSiteName = "Test Group Managed (Workstations)"
 
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric for API)
@@ -148,7 +148,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# Pull the group's client relevance via REST and inject it as an extra <Relevance>
+# Auto-detect group site path (custom -> master -> operator) and return the group's client relevance
 function Get-GroupClientRelevance {
     param(
         [string]$BaseUrl,
@@ -157,13 +157,31 @@ function Get-GroupClientRelevance {
         [string]$GroupIdNumeric
     )
     $encSite = Encode-SiteName $SiteName
-    $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath "/api/computergroup/custom/$encSite/$GroupIdNumeric"
-    LogLine "Fetching group relevance: $url"
-    $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
-    try { $x = [xml]$xmlStr } catch { throw "Group XML parse error: $($_.Exception.Message)" }
-    $rel = $x.BES.ComputerGroup.Relevance
-    if (-not $rel) { throw "Group relevance not found in response." }
-    return [string]$rel
+
+    $candidates = @(
+        "/api/computergroup/custom/$encSite/$GroupIdNumeric",               # custom site
+        "/api/computergroup/master/$GroupIdNumeric",                         # master site
+        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"       # operator site (best guess)
+    )
+
+    foreach ($relPath in $candidates) {
+        $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
+        try {
+            $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
+            $x = [xml]$xmlStr
+            $rel = $x.BES.ComputerGroup.Relevance
+            if ($rel) {
+                LogLine "Found group relevance at ${url}"
+                return [string]$rel
+            } else {
+                LogLine "No <Relevance> at ${url}"
+            }
+        } catch {
+            LogLine "Fetch failed at ${url}: $($_.Exception.Message)"
+        }
+    }
+
+    throw "No relevance found for group ${GroupIdNumeric} in custom/master/operator."
 }
 
 # =========================
@@ -321,7 +339,7 @@ $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
 # Time (8:00 PM – 11:45 PM, 15m)
-$lblTime = New-Object Windows.Forms.Label
+$lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
 $lblTime.Location = New-Object System.Drawing.Point(10,$y)
 $lblTime.Size = New-Object System.Drawing.Size(140,22)
@@ -381,7 +399,7 @@ $btn.Add_Click({
         $base = Get-BaseUrl $server
         $encodedSite = Encode-SiteName $CustomSiteName
         $fixletUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/fixlet/custom/$encodedSite/$fixId"
-        LogLine "Encoded Fixlet GET URL: $fixletUrl"
+        LogLine "Encoded Fixlet GET URL: ${fixletUrl}"
 
         $auth = Get-AuthHeader -User $user -Pass $pass
         $fixletContent = HttpGetXml -Url $fixletUrl -AuthHeader $auth
@@ -398,7 +416,7 @@ $btn.Add_Click({
         if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
         $actionScript = $parsed.ActionScript
 
-        LogLine "Parsed title: $displayName"
+        LogLine "Parsed title: ${displayName}"
         LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
@@ -407,13 +425,13 @@ $btn.Add_Click({
 
         $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
-        LogLine "POST URL: $postUrl"
+        LogLine "POST URL: ${postUrl}"
 
         foreach ($a in $actions) {
             $groupIdRaw = "$($GroupMap[$a])"
             if (-not $groupIdRaw) { LogLine "❌ Missing group id for $($a)"; continue }
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
-            if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '$groupIdRaw' for $($a)"; continue }
+            if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '${groupIdRaw}' for $($a)"; continue }
 
             # fetch group's client relevance and combine with fixlet relevance
             $groupRel = ""
@@ -422,7 +440,7 @@ $btn.Add_Click({
                 LogLine "Group relevance len ($($a)): $($groupRel.Length)"
             } catch {
                 LogLine "❌ Could not fetch group relevance for $($a): $($_.Exception.Message)"
-                continue
+                continue  # do NOT post without group relevance
             }
 
             $allRel = @()
