@@ -75,6 +75,13 @@ function To-IsoDuration([TimeSpan]$ts) {
     if ($hPart -eq "" -and $mPart -eq "" -and $sPart -eq "") { $sPart = "0S" }
     return $dPart + "T" + $hPart + $mPart + $sPart
 }
+# Remove BOM/leading whitespace so POST starts with '<'
+function Normalize-XmlForPost([string]$s) {
+    if (-not $s) { return $s }
+    $noBom = $s -replace "^\uFEFF",""
+    $noLeadWs = $noBom -replace '^\s+',''
+    return $noLeadWs
+}
 
 # =========================
 # HTTP
@@ -121,7 +128,27 @@ function HttpPostXml {
     $req.ContentLength = $bytes.Length
     try {
         $rs = $req.GetRequestStream(); $rs.Write($bytes,0,$bytes.Length); $rs.Close()
-        $resp = $req.GetResponse(); $resp.Close()
+        $resp = $req.GetResponse()
+        try {
+            $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+            $body = $sr.ReadToEnd(); $sr.Close()
+            if ($body) { LogLine "POST response: $body" }
+        } finally { $resp.Close() }
+    } catch [System.Net.WebException] {
+        $we = $_.Exception
+        if ($we.Response) {
+            try {
+                $sr = New-Object IO.StreamReader($we.Response.GetResponseStream(), [Text.Encoding]::UTF8)
+                $errBody = $sr.ReadToEnd(); $sr.Close()
+                throw "HTTP $($we.Status) :: $($we.Message) :: $errBody"
+            } catch {
+                throw "HTTP $($we.Status) :: $($we.Message)"
+            } finally {
+                $we.Response.Close()
+            }
+        } else {
+            throw ($we.GetBaseException().Message)
+        }
     } catch {
         throw ($_.Exception.GetBaseException().Message)
     }
@@ -186,16 +213,14 @@ function Parse-FixletTitleToProduct([string]$Title) {
 }
 
 # =========================
-# RELEVANCE EXTRACTION (GROUPS - HARDENED)
+# RELEVANCE (GROUPS - HARDENED)
 # =========================
 function Extract-AllRelevanceFromXmlString {
     param(
         [string]$XmlString,
         [string]$Context = "Unknown"
     )
-
     $all = @()
-
     try {
         $x = [xml]$XmlString
 
@@ -243,10 +268,8 @@ function Extract-AllRelevanceFromXmlString {
             LogLine "[$Context] Regex relevance fallback failed: $($_.Exception.Message)"
         }
     }
-
     return ,$all
 }
-
 function Extract-SCRFragments {
     param([string]$XmlString,[string]$Context="Unknown")
     $frags = @()
@@ -274,8 +297,6 @@ function Extract-SCRFragments {
     }
     return ,$frags
 }
-
-# Build client relevance for a group (tries multiple endpoints)
 function Get-GroupClientRelevance {
     param(
         [string]$BaseUrl,
@@ -283,32 +304,27 @@ function Get-GroupClientRelevance {
         [string]$SiteName,
         [string]$GroupIdNumeric
     )
-
     $encSite = Encode-SiteName $SiteName
     $candidates = @(
-        "/api/computergroup/custom/$encSite/$GroupIdNumeric",               # custom site
-        "/api/computergroup/master/$GroupIdNumeric",                        # master site
-        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"      # operator site (best guess)
+        "/api/computergroup/custom/$encSite/$GroupIdNumeric",
+        "/api/computergroup/master/$GroupIdNumeric",
+        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"
     )
-
     foreach ($relPath in $candidates) {
         $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
         try {
             $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
-
             if ($DumpFetchedXmlToTemp) {
                 $tmp = Join-Path $env:TEMP ("BES_ComputerGroup_{0}.xml" -f $GroupIdNumeric)
                 Set-Content -Path $tmp -Value $xmlStr -Encoding UTF8
                 LogLine "Saved fetched group XML to: $tmp"
             }
-
             $len = $xmlStr.Length
             $head = $xmlStr.Substring(0, [Math]::Min(800, $len)).Replace("`r"," ").Replace("`n"," ")
             $tail = if ($len -gt 240) { $xmlStr.Substring([Math]::Max(0, $len-240)).Replace("`r"," ").Replace("`n"," ") } else { "" }
             LogLine "Fetched group XML (${url}) len=$len head: $head"
             if ($tail) { LogLine "Fetched group XML tail: $tail" }
 
-            # Try relevance extraction paths
             $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
             if ($rels.Count -gt 0) {
                 $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
@@ -316,8 +332,6 @@ function Get-GroupClientRelevance {
                 LogLine "Using group relevance from <Relevance> nodes :: ${snippet}..."
                 return $joined
             }
-
-            # SCR fallback
             $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
             if ($frags.Count -gt 0) {
                 $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
@@ -325,13 +339,11 @@ function Get-GroupClientRelevance {
                 LogLine "Built relevance from SearchComponentRelevance :: ${snippet}..."
                 return $joined
             }
-
             LogLine "No usable relevance at ${url}"
         } catch {
             LogLine "Fetch failed at ${url}: $($_.Exception.Message)"
         }
     }
-
     throw "No relevance found or derivable for group ${GroupIdNumeric} in custom/master/operator."
 }
 
@@ -342,17 +354,16 @@ function Build-SingleActionXml {
     param(
         [string]$ActionTitle,            # Pilot/Deploy/Force/Conference...
         [string]$DisplayName,            # Vendor App Version
-        [string[]]$RelevanceBlocks,      # Fixlet relevance + group relevance (array)
+        [string[]]$RelevanceBlocks,      # Fixlet relevance + group relevance
         [string]$ActionScript,           # Action script
         [datetime]$StartLocal,           # scheduled local start (absolute)
         [bool]$IsForce = $false          # Force adds end offset (start+24h)
     )
-
     $titleText = "$($DisplayName): $ActionTitle"
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Combine ALL relevance into ONE expression (schema allows a single <Relevance>)
+    # Combine all relevance into ONE expression
     $relevanceCombined = ""
     if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
         $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } |
@@ -377,7 +388,7 @@ function Build-SingleActionXml {
         $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
     }
 
-    # Only include deadline nodes when Force is true (avoid invalid 'None' enums)
+    # Only include deadline nodes when Force is true
     $deadlineBehaviorBlock = if ($IsForce) {
 @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
@@ -626,11 +637,13 @@ $btn.Add_Click({
                 -StartLocal $startLocal `
                 -IsForce:$isForce
 
+            $xmlBodyToSend = Normalize-XmlForPost $xmlBody
+
             LogLine ("---- SingleAction XML for {0} ----" -f $a)
-            LogLine $xmlBody
+            LogLine $xmlBodyToSend
 
             try {
-                HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBody
+                HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBodyToSend
                 LogLine ("✅ {0} posted successfully." -f $a)
             } catch {
                 LogLine ("❌ POST failed for {0}: {1}" -f $a, $_.Exception.Message)
