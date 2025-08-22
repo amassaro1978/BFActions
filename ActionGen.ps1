@@ -90,12 +90,16 @@ function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
-# Hex dump first N bytes for logging
-function Get-FirstBytesHex([string]$s,[int]$n=32) {
+# Hex dump first N bytes for logging (PowerShell-safe)
+function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     if (-not $s) { return "" }
     $bytes = [Text.Encoding]::UTF8.GetBytes($s)
     $take = [Math]::Min($n, $bytes.Length)
-    -join (for ($i=0;$i -lt $take;$i++) { "{0:X2}" -f $bytes[$i] + " " })
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $take; $i++) {
+        [void]$sb.AppendFormat("{0:X2} ", $bytes[$i])
+    }
+    return $sb.ToString().TrimEnd()
 }
 
 # =========================
@@ -330,7 +334,7 @@ function Build-SingleActionXml {
     $titleEsc  = [System.Security.SecurityElement]::Escape($titleText)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Combine all relevance into ONE expression
+    # Combine all relevance into ONE expression (single <Relevance>)
     $relevanceCombined = ""
     if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
         $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } |
