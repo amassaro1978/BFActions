@@ -67,7 +67,7 @@ function To-IsoDuration([TimeSpan]$ts) {
     $mPart = if ($mins  -gt 0) { "{0}M" -f $mins  } else { "" }
     $sPart = if ($secs  -gt 0) { "{0}S" -f $secs  } else { "" }
     if ($hPart -eq "" -and $mPart -eq "" -and $sPart -eq "") { $sPart = "0S" }
-    return $dPart + "T" + $hPart + $mPart + $sPart   # e.g. P6DT6H51M18S
+    return $dPart + "T" + $hPart + $mPart + $sPart
 }
 
 # =========================
@@ -148,7 +148,9 @@ function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# Auto-detect group site path (custom -> master -> operator) and return the group's client relevance
+# Build client relevance for an Automatic Group:
+# 1) Prefer <Relevance>
+# 2) Else AND-join all <SearchComponentRelevance> blocks
 function Get-GroupClientRelevance {
     param(
         [string]$BaseUrl,
@@ -156,8 +158,8 @@ function Get-GroupClientRelevance {
         [string]$SiteName,
         [string]$GroupIdNumeric
     )
-    $encSite = Encode-SiteName $SiteName
 
+    $encSite = Encode-SiteName $SiteName
     $candidates = @(
         "/api/computergroup/custom/$encSite/$GroupIdNumeric",               # custom site
         "/api/computergroup/master/$GroupIdNumeric",                         # master site
@@ -169,19 +171,42 @@ function Get-GroupClientRelevance {
         try {
             $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
             $x = [xml]$xmlStr
-            $rel = $x.BES.ComputerGroup.Relevance
-            if ($rel) {
-                LogLine "Found group relevance at ${url}"
-                return [string]$rel
-            } else {
-                LogLine "No <Relevance> at ${url}"
+
+            # 1) Try top-level <Relevance>
+            $top = $x.BES.ComputerGroup.Relevance
+            if ($top -and (-not [string]::IsNullOrWhiteSpace($top))) {
+                $snippet = $top.Substring(0, [Math]::Min(200, $top.Length))
+                LogLine "Found group <Relevance> at ${url} :: ${snippet}..."
+                return [string]$top
             }
+
+            # 2) Try <SearchComponentRelevance> blocks (common for Auto Groups)
+            $fragments = @()
+            $nodes = $x.SelectNodes("//ComputerGroup/SearchComponentRelevance")
+            if ($nodes -and $nodes.Count -gt 0) {
+                foreach ($n in $nodes) {
+                    # Nodes may contain nested <Relevance> tags; grab inner text
+                    $txt = $n.InnerText
+                    if ($txt -and -not [string]::IsNullOrWhiteSpace($txt)) {
+                        $fragments += $txt.Trim()
+                    }
+                }
+            }
+            if ($fragments.Count -gt 0) {
+                # AND-join the fragments; wrap each in parentheses for safety
+                $joined = ($fragments | ForEach-Object { "($_)" }) -join " AND "
+                $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
+                LogLine "Built relevance from SearchComponentRelevance at ${url} :: ${snippet}..."
+                return $joined
+            }
+
+            LogLine "No usable relevance at ${url}"
         } catch {
             LogLine "Fetch failed at ${url}: $($_.Exception.Message)"
         }
     }
 
-    throw "No relevance found for group ${GroupIdNumeric} in custom/master/operator."
+    throw "No relevance found or derivable for group ${GroupIdNumeric} in custom/master/operator."
 }
 
 # =========================
@@ -216,6 +241,7 @@ function Build-SingleActionXml {
     $startOffset = To-IsoDuration $startTs
 
     $hasEnd = $false
+    $endOffset = $null
     $endOffsetLine = ""
     if ($IsForce) {
         $endAbs = $StartLocal.AddHours(24)
@@ -223,6 +249,20 @@ function Build-SingleActionXml {
         $endOffset = To-IsoDuration $endTs
         $hasEnd = $true
         $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
+    }
+
+    # PreAction deadline: align to start+24h for Force; otherwise keep a simple notify-at-start behavior
+    $deadlineBehaviorBlock = if ($IsForce) {
+@"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalOffset>$endOffset</DeadlineLocalOffset>
+"@
+    } else {
+@"
+        <DeadlineBehavior>None</DeadlineBehavior>
+        <DeadlineType>None</DeadlineType>
+"@
     }
 
 @"
@@ -243,11 +283,7 @@ $ActionScript
         <Text>$dispEsc update will be enforced on $((Get-Date $StartLocal).ToString('M/d/yy h:mm tt')). Please save your work.</Text>
         <AskToSaveWork>true</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
-        <ShowCancelButton>false</ShowCancelButton>
-        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-        <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalOffset>$startOffset</DeadlineLocalOffset>
-        <ShowConfirmation>false</ShowConfirmation>
+        <ShowCancelButton>false</ShowCancelButton>$deadlineBehaviorBlock        <ShowConfirmation>false</ShowConfirmation>
       </PreAction>
 
       <HasRunningMessage>true</HasRunningMessage>
@@ -326,7 +362,7 @@ $lblDate.Location = New-Object System.Drawing.Point(10,$y)
 $lblDate.Size = New-Object System.Drawing.Size(140,22)
 $form.Controls.Add($lblDate)
 
-$cbDate = New-Object Windows.Forms.ComboBox
+$cbDate = New-Object System.Windows.Forms.ComboBox
 $cbDate.DropDownStyle = 'DropDownList'
 $cbDate.Location = New-Object System.Drawing.Point(160,$y)
 $cbDate.Size = New-Object System.Drawing.Size(160,22)
@@ -437,9 +473,9 @@ $btn.Add_Click({
             $groupRel = ""
             try {
                 $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
-                LogLine "Group relevance len ($($a)): $($groupRel.Length)"
+                LogLine ("Group relevance len ({0}): {1}" -f $a, $groupRel.Length)
             } catch {
-                LogLine "❌ Could not fetch group relevance for $($a): $($_.Exception.Message)"
+                LogLine "❌ Could not fetch/build group relevance for $($a): $($_.Exception.Message)"
                 continue  # do NOT post without group relevance
             }
 
@@ -462,16 +498,16 @@ $btn.Add_Click({
 
             try {
                 HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBody
-                LogLine ("✅ $($a) posted successfully.")
+                LogLine ("✅ {0} posted successfully." -f $a)
             } catch {
-                LogLine ("❌ POST failed for $($a): $($_.Exception.Message)")
+                LogLine ("❌ POST failed for {0}: {1}" -f $a, $_.Exception.Message)
             }
         }
 
         LogLine "All actions attempted. Log file: $LogFile"
     }
     catch {
-        LogLine ("❌ Fatal error: $($_.Exception.GetBaseException().Message)")
+        LogLine ("❌ Fatal error: {0}" -f ($_.Exception.GetBaseException().Message))
     }
 })
 
