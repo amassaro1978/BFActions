@@ -148,7 +148,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# Pull the group's client relevance from the REST API so we can inject it into <Relevance>
+# Pull the group's client relevance via REST and inject it as an extra <Relevance>
 function Get-GroupClientRelevance {
     param(
         [string]$BaseUrl,
@@ -161,7 +161,6 @@ function Get-GroupClientRelevance {
     LogLine "Fetching group relevance: $url"
     $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
     try { $x = [xml]$xmlStr } catch { throw "Group XML parse error: $($_.Exception.Message)" }
-    # Most exports place client relevance under <Relevance> directly
     $rel = $x.BES.ComputerGroup.Relevance
     if (-not $rel) { throw "Group relevance not found in response." }
     return [string]$rel
@@ -412,17 +411,17 @@ $btn.Add_Click({
 
         foreach ($a in $actions) {
             $groupIdRaw = "$($GroupMap[$a])"
-            if (-not $groupIdRaw) { LogLine "❌ Missing group id for $a"; continue }
+            if (-not $groupIdRaw) { LogLine "❌ Missing group id for $($a)"; continue }
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
-            if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '$groupIdRaw' for $a"; continue }
+            if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '$groupIdRaw' for $($a)"; continue }
 
             # fetch group's client relevance and combine with fixlet relevance
             $groupRel = ""
             try {
                 $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
-                LogLine "Group relevance len ($a): $($groupRel.Length)"
+                LogLine "Group relevance len ($($a)): $($groupRel.Length)"
             } catch {
-                LogLine "❌ Could not fetch group relevance for $a: $($_.Exception.Message)"
+                LogLine "❌ Could not fetch group relevance for $($a): $($_.Exception.Message)"
                 continue
             }
 
@@ -445,16 +444,16 @@ $btn.Add_Click({
 
             try {
                 HttpPostXml -Url $postUrl -AuthHeader $auth -XmlBody $xmlBody
-                LogLine ("✅ {0} posted successfully." -f $a)
+                LogLine ("✅ $($a) posted successfully.")
             } catch {
-                LogLine ("❌ POST failed for {0}: {1}" -f $a, $_)
+                LogLine ("❌ POST failed for $($a): $($_.Exception.Message)")
             }
         }
 
         LogLine "All actions attempted. Log file: $LogFile"
     }
     catch {
-        LogLine ("❌ Fatal error: {0}" -f ($_.Exception.GetBaseException().Message))
+        LogLine ("❌ Fatal error: $($_.Exception.GetBaseException().Message)")
     }
 })
 
