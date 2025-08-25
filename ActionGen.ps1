@@ -18,7 +18,7 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12348"
 }
 
-# Map rollout to the **existing Fixlet Action name** to invoke.
+# Map rollout to the existing Fixlet Action name to invoke.
 $FixletActionNameMap = @{
     "Pilot"                     = "Action1"
     "Deploy"                    = "Action1"
@@ -26,8 +26,8 @@ $FixletActionNameMap = @{
     "Conference/Training Rooms" = "Action1"
 }
 
-# Always use Sourced (lives under the Fixlet's site).
-$ActionMode = 'Sourced'   # 'Sourced' or 'Single'
+# Use SourcedFixletAction (lives under the Fixlet's site).
+$ActionMode = 'Sourced'   # 'Sourced' or 'Single' (Single not used in this build)
 
 # Behavior toggles
 $IgnoreCertErrors           = $true
@@ -286,14 +286,14 @@ function Get-GroupClientRelevance {
             }
             LogLine "No usable relevance at ${url}"
         } catch {
-            LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
+            LogLine ("❌ Could not fetch/build group relevance: {0}" -f $_.Exception.Message)
         }
     }
     throw "No relevance found or derivable for group ${GroupIdNumeric} in custom/master/operator."
 }
 
 # =========================
-# ACTION XML (SourcedFixletAction with ABSOLUTE times; TimeRange always emitted)
+# ACTION XML (SourcedFixletAction; schema-safe order; absolute times)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -302,45 +302,45 @@ function Build-SourcedFixletActionXml {
         [string]$DisplayName,       # For user messages ("The GIMP Team GIMP 3.0.4")
         [string]$SiteName,          # Custom site name
         [string]$FixletId,          # Fixlet ID
-        [string]$FixletActionName,  # "Action1" or a named action that exists in the Fixlet
+        [string]$FixletActionName,  # "Action1" or named action in the Fixlet
         [string]$GroupRelevance,    # Group filter
         [datetime]$StartLocal,      # absolute start (local)
-        [Nullable[datetime]]$EndLocal = $null,           # optional absolute end (local)
-        [Nullable[datetime]]$DeadlineLocal = $null,      # optional absolute deadline (local)
+        [datetime]$EndLocal = $null,# optional absolute end (local)
+        [datetime]$DeadlineLocal = $null,  # optional absolute deadline (local) (Force)
         [bool]$HasTimeRange = $false,
-        [Nullable[TimeSpan]]$TimeRangeStart = $null,     # time-of-day from midnight
-        [Nullable[TimeSpan]]$TimeRangeEnd = $null,       # time-of-day from midnight
+        [TimeSpan]$TimeRangeStart = $null, # time-of-day from midnight
+        [TimeSpan]$TimeRangeEnd   = $null, # time-of-day from midnight
         [bool]$ShowPreActionUI = $false,
         [string]$PreActionText = "",
         [bool]$AskToSaveWork = $false
     )
 
     # Console action name (keeps suffix like ": Pilot")
-    $fullTitle = "${UiBaseTitle}: $ActionTitle"
+    $fullTitle = ("{0}: {1}" -f $UiBaseTitle, $ActionTitle)
     $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
     # Exact seconds (:00)
-    $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
-    if ($EndLocal.HasValue)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
-    if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
+    if ($StartLocal)   { $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute) }
+    if ($EndLocal)     { $EndLocal     = $EndLocal.Date.AddHours($EndLocal.Hour).AddMinutes($EndLocal.Minute) }
+    if ($DeadlineLocal){ $DeadlineLocal= $DeadlineLocal.Date.AddHours($DeadlineLocal.Hour).AddMinutes($DeadlineLocal.Minute) }
 
     # Group relevance
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
     # End block
-    $hasEnd = $false; $endLine = ""
-    if ($EndLocal.HasValue) {
-        $hasEnd = $true
-        $endLine = "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
+    $hasEnd = [bool]$EndLocal
+    $endLine = ""
+    if ($hasEnd) {
+        $endLine = "      <EndDateTimeLocal>$($EndLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
     }
 
-    # TimeRange: ALWAYS emit HasTimeRange; include TimeRange only when true
-    $timeRangeBlock = ""
-    if ($HasTimeRange -and $TimeRangeStart.HasValue -and $TimeRangeEnd.HasValue) {
-        $trs = if ($TimeRangeStart.Value.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes } else { "PT{0}H" -f $TimeRangeStart.Value.Hours }
-        $tre = if ($TimeRangeEnd.Value.Minutes -gt 0)   { "PT{0}H{1}M" -f $TimeRangeEnd.Value.Hours,   $TimeRangeEnd.Value.Minutes   } else { "PT{0}H" -f $TimeRangeEnd.Value.Hours }
+    # TimeRange: ALWAYS emit HasTimeRange; include TimeRange only when true and values provided
+    $emitTR = $HasTimeRange -and $TimeRangeStart -ne $null -and $TimeRangeEnd -ne $null
+    if ($emitTR) {
+        $trs = if ($TimeRangeStart.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeStart.Hours, $TimeRangeStart.Minutes } else { "PT{0}H" -f $TimeRangeStart.Hours }
+        $tre = if ($TimeRangeEnd.Minutes   -gt 0) { "PT{0}H{1}M" -f $TimeRangeEnd.Hours,   $TimeRangeEnd.Minutes   } else { "PT{0}H" -f $TimeRangeEnd.Hours }
         $timeRangeBlock = @"
       <HasTimeRange>true</HasTimeRange>
       <TimeRange>
@@ -352,22 +352,22 @@ function Build-SourcedFixletActionXml {
         $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     }
 
-    # PreAction (ONLY when needed). Deadline is absolute and lives INSIDE PreAction for SourcedFixletAction.
+    # PreAction (ONLY when needed). Absolute deadline lives INSIDE PreAction for SourcedFixletAction.
     $preActionBlock = ""
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
         $deadlineInner = ""
-        if ($DeadlineLocal.HasValue) {
+        if ($DeadlineLocal) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
+        <DeadlineLocalTime>$($DeadlineLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
 "@
         }
 $preActionBlock = @"
       <PreAction>
         <Text>$preEsc</Text>
-        <AskToSaveWork>$($AskToSaveWork.ToString().ToLower())</AskToSaveWork>
+        <AskToSaveWork>$([string]$AskToSaveWork).ToLower()</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
         <ShowCancelButton>false</ShowCancelButton>
 $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
@@ -389,19 +389,21 @@ $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
     </Target>
     <Settings>
       <ActionUITitle>$uiTitle</ActionUITitle>
+
 $timeRangeBlock
-$preActionBlock
-      <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocal>$($StartLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</StartDateTimeLocal>
       <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
-$endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
-      <UseUTCTime>false</UseUTCTime>
+$endLine      <UseUTCTime>false</UseUTCTime>
+
+      <HasRunningMessage>true</HasRunningMessage>
+      <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
+$preActionBlock
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
       <HasWhose>false</HasWhose>
       <PreActionCacheDownload>false</PreActionCacheDownload>
+
       <Reapply>true</Reapply>
       <HasReapplyLimit>false</HasReapplyLimit>
       <HasReapplyInterval>false</HasReapplyInterval>
@@ -418,6 +420,9 @@ $endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
 </BES>
 "@
 }
+
+# (SingleAction builder kept inert)
+function Build-SingleActionXml { "<!-- SingleAction path intentionally omitted in this build -->" }
 
 # =========================
 # GUI
@@ -551,7 +556,7 @@ $btn.Add_Click({
         LogLine "Console title: ${titleRaw}"
         LogLine "Display name (messages): ${displayName}"
 
-        # Exact absolute schedule
+        # Exact absolute schedule :00
         $pilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
         $pilotStart = $pilotStart.Date.AddHours($pilotStart.Hour).AddMinutes($pilotStart.Minute)
 
@@ -560,6 +565,7 @@ $btn.Add_Click({
         $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)
         $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55)
 
+        # Force: next Tuesday 7:00 AM after Pilot, with absolute deadline Wednesday 7:00 AM
         $forceStartDate  = Get-NextWeekday -base $pilotStart -weekday ([DayOfWeek]::Tuesday)
         $forceStart      = $forceStartDate.AddHours(7)     # Tue 7:00 AM
         $forceEnforce    = $forceStart.AddDays(1)          # Wed 7:00 AM
