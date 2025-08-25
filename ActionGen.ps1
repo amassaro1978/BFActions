@@ -13,18 +13,18 @@ $CustomSiteName = "Test Group Managed (Workstations)"
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric)
 $GroupMap = @{
     "Pilot"                       = "00-12345"
-    "Deploy"                       = "00-12345"
-    "Force"                     = "00-12345"
-    "Conference/Training Rooms" = "00-12345"
+    "Deploy"                      = "00-12345"
+    "Force"                       = "00-12345"
+    "Conference/Training Rooms"   = "00-12345"
 }
 
 # Map rollout to the **existing Fixlet Action name** to invoke.
 # Leave as "Action1" if your Fixlet only has one action; otherwise match your named action(s).
 $FixletActionNameMap = @{
     "Pilot"                       = "Action1"
-    "Deploy"                       = "Action1"
-    "Force"                     = "Action1"
-    "Conference/Training Rooms" = "Action1"
+    "Deploy"                      = "Action1"
+    "Force"                       = "Action1"
+    "Conference/Training Rooms"   = "Action1"
 }
 
 # Always use Sourced (lives under the Fixlet's site). Single kept for completeness.
@@ -73,7 +73,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-# ISO-8601 duration PnDTnHnMnS (positive from now)
+# ISO-8601 duration PnDTnHnMnS (kept for SingleAction path)
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $days = [int]$ts.TotalDays
@@ -388,7 +388,7 @@ $ActionScript
 "@
 }
 
-# SourcedFixletAction builder — emits only the elements we request for each action
+# SourcedFixletAction builder — **absolute** times + optional run-between + optional PreAction+Deadline
 function Build-SourcedFixletActionXml {
     param(
         [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
@@ -399,80 +399,73 @@ function Build-SourcedFixletActionXml {
         [string]$FixletActionName,  # "Action1" or a named action that exists in the Fixlet
         [string]$GroupRelevance,    # Group filter to AND with fixlet relevance
         [datetime]$StartLocal,      # scheduled local start (absolute)
-        [NulDeployle[datetime]]$EndLocal = $null,   # optional absolute end
-        [NulDeployle[datetime]]$DeadlineLocal = $null, # optional absolute deadline
+        [Nullable[datetime]]$EndLocal = $null,          # optional absolute end
+        [Nullable[datetime]]$DeadlineLocal = $null,     # optional absolute deadline
         [bool]$HasTimeRange = $false,
-        [NulDeployle[TimeSpan]]$TimeRangeStart = $null, # time-of-day from midnight
-        [NulDeployle[TimeSpan]]$TimeRangeEnd = $null,   # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeStart = $null,    # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeEnd   = $null,    # time-of-day from midnight
         [bool]$ShowPreActionUI = $false,
         [string]$PreActionText = "",   # shown only if ShowPreActionUI=true
         [bool]$AskToSaveWork = $false  # only meaningful when ShowPreActionUI=true
     )
 
+    # Console action name
     $fullTitle = "${UiBaseTitle}: $ActionTitle"
     $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Sanitize relevance
-    if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { $groupSafe = "" } else { $groupSafe = $GroupRelevance }
+    # Snap to :00
+    $StartLocal = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
+    if ($EndLocal.HasValue)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
+    if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
+
+    $startAbs = $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss')
+    $endLine  = if ($EndLocal.HasValue) { "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n" } else { "" }
+
+    # Group relevance (safe CDATA)
+    $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # Offsets
-    $now = Get-Date
-    $startOffset = To-IsoDuration ($StartLocal - $now)
-    $hasEnd = $false; $endOffsetLine = ""
-    if ($EndLocal.HasValue) {
-        $hasEnd = $true
-        $endOffsetLine = "      <EndDateTimeLocalOffset>$((To-IsoDuration ($EndLocal.Value - $now)))</EndDateTimeLocalOffset>`n"
-    }
-
-    # Deadline (Force)
-    $deadlineBlock = ""
-    if ($DeadlineLocal.HasValue) {
-        $deadlineOffset = To-IsoDuration ($DeadlineLocal.Value - $now)
-        $deadlineBlock = @"
-        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-        <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalOffset>$deadlineOffset</DeadlineLocalOffset>
-"@
-    }
-
     # TimeRange block
-    $timeRangeBlock = ""
-    if ($HasTimeRange -and $TimeRangeStart.HasValue -and $TimeRangeEnd.HasValue) {
-        $trs = To-IsoTimeOfDay($TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes, $TimeRangeStart.Value.Seconds)
-        $tre = To-IsoTimeOfDay($TimeRangeEnd.Value.Hours,   $TimeRangeEnd.Value.Minutes,   $TimeRangeEnd.Value.Seconds)
-        $timeRangeBlock = @"
+    $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
+    if ($HasTimeRange) {
+        if (-not $TimeRangeStart.HasValue) { $TimeRangeStart = [TimeSpan]::FromHours(19) }                              # 19:00
+        if (-not $TimeRangeEnd.HasValue)   { $TimeRangeEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) } # 06:59
+        $trs = To-IsoTimeOfDay $TimeRangeStart.Value.Hours $TimeRangeStart.Value.Minutes $TimeRangeStart.Value.Seconds
+        $tre = To-IsoTimeOfDay $TimeRangeEnd.Value.Hours   $TimeRangeEnd.Value.Minutes   $TimeRangeEnd.Value.Seconds
+$timeRangeBlock = @"
       <HasTimeRange>true</HasTimeRange>
       <TimeRange>
         <StartTime>$trs</StartTime>
         <EndTime>$tre</EndTime>
       </TimeRange>
 "@
-    } else {
-        $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     }
 
-    # PreAction (only if requested)
+    # PreAction block (Force uses this + absolute Deadline)
     $preActionBlock = ""
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
-        $preActionBlock = @"
+        $deadlineInner = ""
+        if ($DeadlineLocal.HasValue) {
+$deadlineInner = @"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
+"@
+        }
+$preActionBlock = @"
       <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
         <Text>$preEsc</Text>
-        <AskToSaveWork>$($AskToSaveWork.ToString().ToLower())</AskToSaveWork>
+        <AskToSaveWork>$([string]$AskToSaveWork).ToLower()</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
-        <ShowCancelButton>false</ShowCancelButton>$deadlineBlock        <ShowConfirmation>false</ShowConfirmation>
+        <ShowCancelButton>false</ShowCancelButton>
+$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
       </PreAction>
 "@
     } else {
-        # No pre-action UI
         $preActionBlock = "      <PreActionShowUI>false</PreActionShowUI>"
-        if ($deadlineBlock) {
-            # Deadline without showing UI: still allowed; add only the deadline elements under Settings
-            $preActionBlock += "`n      " + $deadlineBlock.Trim()
-        }
     }
 
 @"
@@ -491,13 +484,12 @@ function Build-SourcedFixletActionXml {
       <ActionUITitle>$uiTitle</ActionUITitle>
 $preActionBlock
       <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
+      <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
 $timeRangeBlock
       <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
-      <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
-$endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
-      <UseUTCTime>false</UseUTCTime>
+      <StartDateTimeLocal>$startAbs</StartDateTimeLocal>
+      <HasEndTime>$([string]$EndLocal.HasValue).ToLower()</HasEndTime>
+$endLine      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
       <HasWhose>false</HasWhose>
@@ -528,9 +520,9 @@ $form.Size = New-Object System.Drawing.Size(640, 780)
 $form.StartPosition = "CenterScreen"
 
 $y = 20
-function Add-Field([string]$Deployel,[bool]$IsPassword,[ref]$OutTB) {
-    $lbl = New-Object System.Windows.Forms.Deployel
-    $lbl.Text = $Deployel
+function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB) {
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Label
     $lbl.Location = New-Object System.Drawing.Point(10,$script:y)
     $lbl.Size = New-Object System.Drawing.Size(140,22)
     $form.Controls.Add($lbl)
@@ -550,7 +542,7 @@ $tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
 $tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
 # Date (future Wednesdays)
-$lblDate = New-Object Windows.Forms.Deployel
+$lblDate = New-Object Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
 $lblDate.Location = New-Object System.Drawing.Point(10,$y)
 $lblDate.Size = New-Object System.Drawing.Size(140,22)
@@ -569,7 +561,7 @@ $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
 # Time (8:00 PM – 11:45 PM, 15m)
-$lblTime = New-Object System.Windows.Forms.Deployel
+$lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
 $lblTime.Location = New-Object System.Drawing.Point(10,$y)
 $lblTime.Size = New-Object System.Drawing.Size(140,22)
@@ -655,25 +647,28 @@ $btn.Add_Click({
         LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
-        # Absolute schedule (user picks local date/time)
-        $PilotStart = Get-Date "$dStr $tStr"
+        # Absolute schedule (user picks local date/time) — snap to :00 seconds
+        $PilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
+        $PilotStart = $PilotStart.Date.AddHours($PilotStart.Hour).AddMinutes($PilotStart.Minute)
 
         # Derived schedules per action
         $DeployStart     = $PilotStart.AddDays(1)
         $confStart       = $PilotStart.AddDays(1)
         $PilotEnd        = $PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59) # next day 6:59 AM
         $DeployEnd       = $DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning 6:55 AM
+
+        # Force: next Tuesday 7:00 AM after Pilot, with deadline Wednesday 7:00 AM
         $forceStartDate  = Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)
-        $forceStart      = $forceStartDate.AddHours(7) # 7:00 AM
-        $forceEnforce    = $forceStart.AddHours(24)    # message date + deadline
+        $forceStart      = $forceStartDate.AddHours(7) # Tue 7:00 AM
+        $forceEnforce    = $forceStart.AddDays(1)      # Wed 7:00 AM
 
         # TimeRange window (7:00 PM–6:59 AM)
-        $trStart = [TimeSpan]::FromHours(19)               # 7:00 PM -> PT19H
-        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))  # 6:59 AM -> PT6H59M
+        $trStart = [TimeSpan]::FromHours(19)
+        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))
 
         $actions = @(
-            @{ Name="Pilot"; Start=$PilotStart; End=$PilotEnd; TR=$true;  TRS=$trStart; TRE=$trEnd; UI=$false; Msg="";    Save=$false; Deadline=$null },
-            @{ Name="Deploy";Start=$DeployStart;End=$DeployEnd;TR=$false; TRS=$null;   TRE=$null; UI=$false; Msg="";    Save=$false; Deadline=$null },
+            @{ Name="Pilot"; Start=$PilotStart; End=$PilotEnd; TR=$true;  TRS=$trStart; TRE=$trEnd; UI=$false; Msg=""; Save=$false; Deadline=$null },
+            @{ Name="Deploy";Start=$DeployStart;End=$DeployEnd;TR=$true;  TRS=$trStart; TRE=$trEnd; UI=$false; Msg=""; Save=$false; Deadline=$null },
             @{ Name="Conference/Training Rooms"; Start=$confStart; End=$null; TR=$true; TRS=$trStart; TRE=$trEnd; UI=$false; Msg=""; Save=$false; Deadline=$null },
             @{ Name="Force"; Start=$forceStart; End=$null; TR=$false; TRS=$null; TRE=$null; UI=$true;
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
