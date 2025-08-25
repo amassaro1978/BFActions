@@ -73,20 +73,36 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-# ISO-8601 duration PnDTnHnMnS (positive from now)
+
+# Build “Update: Vendor App Version” for messages (strip trailing " Win", no action suffix)
+function Build-MessageTitle([string]$FixletTitle) {
+    $t = $FixletTitle
+    $t = $t -replace '\s+Win$',''     # drop trailing " Win"
+    return $t.Trim()
+}
+
+# ISO-8601 duration PnDTnHnMnS from an already-rounded TimeSpan
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
-    $days = [int]$ts.TotalDays
-    $hours = $ts.Hours
-    $mins  = $ts.Minutes
-    $secs  = $ts.Seconds
+    $days = [int][Math]::Floor($ts.TotalDays)
+    $rem  = $ts - [TimeSpan]::FromDays($days)
+    $h = $rem.Hours; $m = $rem.Minutes; $s = $rem.Seconds
     $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
-    $hPart = if ($hours -gt 0) { "{0}H" -f $hours } else { "" }
-    $mPart = if ($mins  -gt 0) { "{0}M" -f $mins  } else { "" }
-    $sPart = if ($secs  -gt 0) { "{0}S" -f $secs  } else { "" }
+    $hPart = if ($h -gt 0) { "{0}H" -f $h } else { "" }
+    $mPart = if ($m -gt 0) { "{0}M" -f $m } else { "" }
+    $sPart = if ($s -gt 0) { "{0}S" -f $s } else { "" }
     if ($hPart -eq "" -and $mPart -eq "" -and $sPart -eq "") { $sPart = "0S" }
     return $dPart + "T" + $hPart + $mPart + $sPart
 }
+
+# Round a target DateTime to an ISO offset (ceil to whole second)
+function Get-OffsetIso([datetime]$target) {
+    $now = Get-Date
+    $deltaSec = [Math]::Ceiling(($target - $now).TotalSeconds)
+    $deltaSec = [Math]::Max(0, $deltaSec)
+    return To-IsoDuration ([TimeSpan]::FromSeconds($deltaSec))
+}
+
 # Time-of-day as ISO 8601 duration from midnight, e.g., 19:00 -> PT19H, 6:59 -> PT6H59M
 function To-IsoTimeOfDay([int]$hour,[int]$minute=0,[int]$second=0) {
     $parts = @()
@@ -95,6 +111,15 @@ function To-IsoTimeOfDay([int]$hour,[int]$minute=0,[int]$second=0) {
     if ($second -gt 0 -or $parts.Count -eq 0) { $parts += ("{0}S" -f $second) }
     return "PT" + ($parts -join "")
 }
+
+# Next specific weekday AFTER the given date (never same day)
+function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
+    $anchor = $base.Date
+    $delta = ([int]$weekday - [int]$anchor.DayOfWeek + 7) % 7
+    if ($delta -le 0) { $delta += 7 }
+    return $anchor.AddDays($delta)
+}
+
 # Normalize leading BOM/whitespace so POST starts with '<'
 function Normalize-XmlForPost([string]$s) {
     if (-not $s) { return $s }
@@ -115,12 +140,6 @@ function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     $sb = New-Object System.Text.StringBuilder
     for ($i = 0; $i -lt $take; $i++) { [void]$sb.AppendFormat("{0:X2} ", $bytes[$i]) }
     $sb.ToString().TrimEnd()
-}
-# Next specific weekday AFTER the given date (never same day)
-function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
-    $delta = ([int]$weekday - [int]$base.DayOfWeek + 7) % 7
-    if ($delta -le 0) { $delta += 7 }
-    return $base.Date.AddDays($delta)
 }
 
 # =========================
@@ -323,77 +342,11 @@ function Get-GroupClientRelevance {
 # =========================
 # ACTION XML BUILDERS
 # =========================
-function Build-SingleActionXml {  # unchanged, kept for completeness
-    param(
-        [string]$ActionTitle,
-        [string]$UiBaseTitle,
-        [string]$DisplayName,
-        [string[]]$RelevanceBlocks,
-        [string]$ActionScript,
-        [datetime]$StartLocal,
-        [bool]$IsForce=$false
-    )
-    $fullTitle = "${UiBaseTitle}: $ActionTitle"
-    $titleEsc  = [System.Security.SecurityElement]::Escape($fullTitle)
-    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
-
-    $relevanceCombined = ""
-    if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
-        $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { "($_)" }) -join " AND "
-    }
-    $relSafe = $relevanceCombined -replace ']]>', ']]]]><![CDATA[>'
-    $rels = if ([string]::IsNullOrWhiteSpace($relevanceCombined)) { "" } else { "    <Relevance><![CDATA[$relSafe]]></Relevance>" }
-
-    $now = Get-Date
-    $startOffset = To-IsoDuration ($StartLocal - $now)
-@"
-<?xml version="1.0" encoding="UTF-8"?>
-<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
-  <SingleAction>
-    <Title>$titleEsc</Title>
-$rels
-    <ActionScript MIMEType="application/x-Fixlet-Windows-Shell"><![CDATA[
-$ActionScript
-]]></ActionScript>
-    <SuccessCriteria Option="RunToCompletion" />
-    <Settings>
-      <ActionUITitle>$titleEsc</ActionUITitle>
-      <PreActionShowUI>false</PreActionShowUI>
-      <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
-      <HasTimeRange>false</HasTimeRange>
-      <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
-      <HasEndTime>false</HasEndTime>
-      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
-      <UseUTCTime>false</UseUTCTime>
-      <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
-      <ActiveUserType>AllUsers</ActiveUserType>
-      <HasWhose>false</HasWhose>
-      <PreActionCacheDownload>false</PreActionCacheDownload>
-      <Reapply>true</Reapply>
-      <HasReapplyLimit>false</HasReapplyLimit>
-      <HasReapplyInterval>false</HasReapplyInterval>
-      <HasRetry>true</HasRetry>
-      <RetryCount>3</RetryCount>
-      <RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
-      <HasTemporalDistribution>false</HasTemporalDistribution>
-      <ContinueOnErrors>true</ContinueOnErrors>
-      <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
-      <IsOffer>false</IsOffer>
-    </Settings>
-    <Target><AllComputers>true</AllComputers></Target>
-  </SingleAction>
-</BES>
-"@
-}
-
-# SourcedFixletAction builder — emits only the elements we request for each action
 function Build-SourcedFixletActionXml {
     param(
         [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
         [string]$UiBaseTitle,       # Full Fixlet title ("Update: ... Win")
-        [string]$DisplayName,       # Product-friendly name for messages
+        [string]$MessageTitle,      # Clean message title ("Update: ...")
         [string]$SiteName,          # Custom site name
         [string]$FixletId,          # Fixlet ID
         [string]$FixletActionName,  # "Action1" or a named action that exists in the Fixlet
@@ -409,27 +362,26 @@ function Build-SourcedFixletActionXml {
         [bool]$AskToSaveWork = $false  # only meaningful when ShowPreActionUI=true
     )
 
-    $fullTitle = "${UiBaseTitle}: $ActionTitle"
+    $fullTitle = "${UiBaseTitle}: $ActionTitle"              # Console action name
     $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
-    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+    $msgTitle  = [System.Security.SecurityElement]::Escape($MessageTitle)
 
     # Sanitize relevance
     if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { $groupSafe = "" } else { $groupSafe = $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # Offsets
-    $now = Get-Date
-    $startOffset = To-IsoDuration ($StartLocal - $now)
+    # Rounded offsets from now
+    $startOffset = Get-OffsetIso $StartLocal
     $hasEnd = $false; $endOffsetLine = ""
     if ($EndLocal.HasValue) {
+        $endOffsetLine = "      <EndDateTimeLocalOffset>$((Get-OffsetIso $EndLocal.Value))</EndDateTimeLocalOffset>`n"
         $hasEnd = $true
-        $endOffsetLine = "      <EndDateTimeLocalOffset>$((To-IsoDuration ($EndLocal.Value - $now)))</EndDateTimeLocalOffset>`n"
     }
 
     # Deadline (Force)
     $deadlineBlock = ""
     if ($DeadlineLocal.HasValue) {
-        $deadlineOffset = To-IsoDuration ($DeadlineLocal.Value - $now)
+        $deadlineOffset = Get-OffsetIso $DeadlineLocal.Value
         $deadlineBlock = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
@@ -467,10 +419,8 @@ function Build-SourcedFixletActionXml {
       </PreAction>
 "@
     } else {
-        # No pre-action UI
         $preActionBlock = "      <PreActionShowUI>false</PreActionShowUI>"
         if ($deadlineBlock) {
-            # Deadline without showing UI: still allowed; add only the deadline elements under Settings
             $preActionBlock += "`n      " + $deadlineBlock.Trim()
         }
     }
@@ -491,7 +441,7 @@ function Build-SourcedFixletActionXml {
       <ActionUITitle>$uiTitle</ActionUITitle>
 $preActionBlock
       <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
+      <RunningMessage><Text>Updating to $msgTitle...please wait.</Text></RunningMessage>
 $timeRangeBlock
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
@@ -568,7 +518,7 @@ $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# Time (8:00 PM – 11:45 PM, 15m)
+# Time (8:00 PM – 11:45 PM, 15m) – strictly exact user choice
 $lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
 $lblTime.Location = New-Object System.Drawing.Point(10,$y)
@@ -644,40 +594,43 @@ $btn.Add_Click({
         LogLine ("Detected BES content type: {0}" -f $cont.Type)
 
         $titleRaw = [string]$cont.Node.Title
-        $displayName = Parse-FixletTitleToProduct -Title $titleRaw
+        $messageTitle = Build-MessageTitle $titleRaw
+        $displayName  = Parse-FixletTitleToProduct -Title $titleRaw
 
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
         $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
         $actionScript = $parsed.ActionScript
 
         LogLine "Parsed title (console): ${titleRaw}"
-        LogLine "Display name (messages): ${displayName}"
+        LogLine "Message title: ${messageTitle}"
         LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
-        # Absolute schedule (user picks local date/time)
-        $pilotStart = Get-Date "$dStr $tStr"
+        # Absolute schedule (user picks local date/time) – strictly exact seconds=00
+        $pilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
 
         # Derived schedules per action
         $deployStart     = $pilotStart.AddDays(1)
         $confStart       = $pilotStart.AddDays(1)
         $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59) # next day 6:59 AM
         $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning 6:55 AM
+
+        # Force: next Tuesday 7:00 AM after Pilot
         $forceStartDate  = Get-NextWeekday -base $pilotStart -weekday ([DayOfWeek]::Tuesday)
-        $forceStart      = $forceStartDate.AddHours(7) # 7:00 AM
-        $forceEnforce    = $forceStart.AddHours(24)    # message date + deadline
+        $forceStart      = $forceStartDate.AddHours(7) # 7:00 AM sharp
+        $forceEnforce    = $forceStart.AddHours(24)    # message + deadline exact
 
         # TimeRange window (7:00 PM–6:59 AM)
-        $trStart = [TimeSpan]::FromHours(19)               # 7:00 PM -> PT19H
-        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))  # 6:59 AM -> PT6H59M
+        $trStart = [TimeSpan]::FromHours(19)               # 7:00 PM
+        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))  # 6:59 AM
 
         $actions = @(
             @{ Name="Pilot"; Start=$pilotStart; End=$pilotEnd; TR=$true;  TRS=$trStart; TRE=$trEnd; UI=$false; Msg="";    Save=$false; Deadline=$null },
-            @{ Name="Deploy";Start=$deployStart;End=$deployEnd;TR=$false; TRS=$null;   TRE=$null; UI=$false; Msg="";    Save=$false; Deadline=$null },
+            @{ Name="Deploy";Start=$deployStart;End=$deployEnd;TR=$true;  TRS=$trStart; TRE=$trEnd; UI=$false; Msg="";    Save=$false; Deadline=$null },
             @{ Name="Conference/Training Rooms"; Start=$confStart; End=$null; TR=$true; TRS=$trStart; TRE=$trEnd; UI=$false; Msg=""; Save=$false; Deadline=$null },
             @{ Name="Force"; Start=$forceStart; End=$null; TR=$false; TRS=$null; TRE=$null; UI=$true;
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
-                    $displayName, $forceEnforce.ToString("M/d/yyyy h:mm tt"));
+                    $messageTitle, $forceEnforce.ToString("M/d/yyyy h:mm tt"));
                Save=$true; Deadline=$forceEnforce }
         )
 
@@ -706,7 +659,7 @@ $btn.Add_Click({
                 $xmlBody = Build-SourcedFixletActionXml `
                     -ActionTitle      $a `
                     -UiBaseTitle      $titleRaw `
-                    -DisplayName      $displayName `
+                    -MessageTitle     $messageTitle `
                     -SiteName         $CustomSiteName `
                     -FixletId         $fixId `
                     -FixletActionName $fixletActionName `
@@ -721,16 +674,9 @@ $btn.Add_Click({
                     -PreActionText    $cfg.Msg `
                     -AskToSaveWork    $cfg.Save
             } else {
-                # (SingleAction path retained but not used by default)
+                # (SingleAction path not used by default)
                 $allRel = @(); $allRel += $fixletRelevance; if ($groupRel) { $allRel += $groupRel }
-                $xmlBody = Build-SingleActionXml `
-                    -ActionTitle     $a `
-                    -UiBaseTitle     $titleRaw `
-                    -DisplayName     $displayName `
-                    -RelevanceBlocks $allRel `
-                    -ActionScript    $actionScript `
-                    -StartLocal      $cfg.Start `
-                    -IsForce:($a -eq "Force")
+                $xmlBody = "<!-- SingleAction path intentionally omitted in this run -->"
             }
 
             $xmlBodyToSend = Normalize-XmlForPost $xmlBody
