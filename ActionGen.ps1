@@ -7,10 +7,10 @@ Add-Type -AssemblyName System.Web
 # =========================
 $LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
 
-# Site that hosts the Fixlet + (ideally) the Computer Groups
+# Site that hosts the Fixlet and (ideally) the Computer Groups
 $CustomSiteName = "Test Group Managed (Workstations)"
 
-# Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric)
+# Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric for API)
 $GroupMap = @{
     "Pilot"                     = "00-12345"
     "Deploy"                    = "00-12346"
@@ -18,7 +18,7 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12348"
 }
 
-# Map rollout to the existing Fixlet Action name to invoke (must exist in the Fixlet)
+# Which Fixlet action to invoke in the Fixlet (must exist)
 $FixletActionNameMap = @{
     "Pilot"                     = "Action1"
     "Deploy"                    = "Action1"
@@ -26,15 +26,10 @@ $FixletActionNameMap = @{
     "Conference/Training Rooms" = "Action1"
 }
 
-# Use SourcedFixletAction (lives under the Fixlet's site).
-$ActionMode = 'Sourced'   # 'Sourced' or 'Single' (Single path is disabled in this build)
-
 # Behavior toggles
 $IgnoreCertErrors           = $true
 $DumpFetchedXmlToTemp       = $true
-$AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
-$PostUsingInvokeWebRequest  = $true
 
 # =========================
 # UTIL / LOGGING
@@ -70,31 +65,21 @@ function LogLine($txt) {
 }
 function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
-    return ($GroupIdWithPrefix -replace '[^\d]','')
+    return ($GroupIdWithPrefix -replace '[^\d]','') # fallback
 }
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
-}
-function Normalize-XmlForPost([string]$s) {
-    if (-not $s) { return $s }
-    $noBom = $s -replace "^\uFEFF",""
-    $noLeadWs = $noBom -replace '^\s+',''
-    return $noLeadWs
-}
-function Get-FirstBytesHex([string]$s, [int]$n = 32) {
-    if (-not $s) { return "" }
-    $bytes = [Text.Encoding]::UTF8.GetBytes($s)
-    $take = [Math]::Min($n, $bytes.Length)
-    $sb = New-Object System.Text.StringBuilder
-    for ($i = 0; $i -lt $take; $i++) { [void]$sb.AppendFormat("{0:X2} ", $bytes[$i]) }
-    $sb.ToString().TrimEnd()
 }
 function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
     $anchor = $base.Date
     $delta = ([int]$weekday - [int]$anchor.DayOfWeek + 7) % 7
     if ($delta -le 0) { $delta += 7 }
     return $anchor.AddDays($delta)
+}
+function IsoTimePart([TimeSpan]$ts) {
+    if ($ts.Minutes -gt 0) { return "PT{0}H{1}M" -f $ts.Hours, $ts.Minutes }
+    else { return "PT{0}H" -f $ts.Hours }
 }
 
 # =========================
@@ -108,8 +93,6 @@ function HttpGetXml {
     $req = [System.Net.HttpWebRequest]::Create($Url)
     $req.Method = "GET"
     $req.Accept = "application/xml"
-    $req.Headers["Accept-Encoding"] = "gzip, deflate"
-    $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
     $req.Headers["Authorization"] = $AuthHeader
     $req.ProtocolVersion = [Version]"1.1"
     $req.PreAuthenticate = $true
@@ -127,17 +110,15 @@ function HttpGetXml {
     }
 }
 
-function Post-XmlFile-InFile {
+function Post-XmlFile {
     param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
     try {
         $pair  = "$User`:$Pass"
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
-        $basic = "Basic " + [Convert]::ToBase64String($bytes)
+        $basic = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
         $resp = Invoke-WebRequest -Method Post -Uri $Url `
             -Headers @{ "Authorization" = $basic } `
             -ContentType "application/xml" `
-            -InFile $XmlFilePath `
-            -UseBasicParsing
+            -InFile $XmlFilePath -UseBasicParsing
         if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
     } catch {
         if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
@@ -150,34 +131,6 @@ function Post-XmlFile-InFile {
     }
 }
 
-function HttpPostXml {
-    param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
-    $bytes = [Text.Encoding]::UTF8.GetBytes($XmlBody)
-    $req = [System.Net.HttpWebRequest]::Create($Url)
-    $req.Method = "POST"
-    $req.Accept = "application/xml"
-    $req.ContentType = "application/xml; charset=utf-8"
-    $req.UserAgent = "BigFixActionGenerator/1.0"
-    $req.KeepAlive = $false
-    $req.Headers["Authorization"] = $AuthHeader
-    $req.ProtocolVersion = [Version]"1.1"
-    $req.PreAuthenticate = $true
-    $req.AllowAutoRedirect = $false
-    $req.Timeout = 60000
-    $req.ContentLength = $bytes.Length
-    try {
-        $rs = $req.GetRequestStream(); $rs.Write($bytes,0,$bytes.Length); $rs.Close()
-        $resp = $req.GetResponse()
-        try {
-            $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
-            $body = $sr.ReadToEnd(); $sr.Close()
-            if ($body) { LogLine "POST response: $body" }
-        } finally { $resp.Close() }
-    } catch {
-        throw ($_.Exception.GetBaseException().Message)
-    }
-}
-
 # =========================
 # FIXLET & GROUP PARSING
 # =========================
@@ -187,14 +140,11 @@ function Get-FixletContainer { param([xml]$Xml)
     if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
     throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
 }
-function Get-ActionAndRelevance {
-    param($ContainerNode)
+function Get-ActionAndRelevance { param($ContainerNode)
     $rels = @()
-    $direct = $ContainerNode.SelectNodes("./*[local-name()='Relevance']")
-    if ($direct) { foreach ($n in $direct) { $t = ($n.InnerText).Trim(); if ($t) { $rels += $t } } }
-    if ($rels.Count -eq 0) {
-        $any = $ContainerNode.SelectNodes(".//*[local-name()='Relevance']")
-        if ($any) { foreach ($n in $any) { $t = ($n.InnerText).Trim(); if ($t) { $rels += $t } } }
+    foreach ($r in $ContainerNode.Relevance) {
+        $t = ($r.InnerText).Trim()
+        if ($t) { $rels += $t }
     }
     $act = $null
     if ($ContainerNode.Action) { $act = $ContainerNode.Action | Select-Object -First 1 }
@@ -206,61 +156,30 @@ function Get-ActionAndRelevance {
         if ([string]::IsNullOrWhiteSpace($script)) { $script = $act.ActionScript.InnerText }
     }
     if (-not $script) { throw "Action found but no <ActionScript> content present." }
-    LogLine ("Fixlet relevance nodes found: {0}" -f $rels.Count)
     return @{ Relevance=$rels; ActionScript=$script }
 }
 function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# GROUP relevance helpers
-function Extract-AllRelevanceFromXmlString {
-    param([string]$XmlString,[string]$Context = "Unknown")
-    $all = @()
-    try {
-        $x = [xml]$XmlString
-        $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
-        if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        if ($all.Count -eq 0) {
-            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
-            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        }
-    } catch { LogLine "[$Context] XML parse failed: $($_.Exception.Message)" }
-    if ($AggressiveRegexFallback -and $all.Count -eq 0) {
-        try {
-            $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
-            foreach ($mm in $regex.Matches($XmlString)) { $t = ($mm.Groups[1].Value).Trim(); if ($t) { $all += $t } }
-        } catch { LogLine "[$Context] Regex relevance fallback failed: $($_.Exception.Message)" }
-    }
-    return ,$all
-}
-function Extract-SCRFragments {
-    param([string]$XmlString,[string]$Context="Unknown")
-    $frags = @()
-    try {
-        $x = [xml]$XmlString
-        $scrNodes = $x.SelectNodes("//*[local-name()='SearchComponentRelevance']")
-        if ($scrNodes) {
-            foreach ($n in $scrNodes) {
-                $innerR = $n.SelectNodes(".//*[local-name()='Relevance']")
-                if ($innerR -and $innerR.Count -gt 0) {
-                    foreach ($ir in $innerR) { $t = ($ir.InnerText).Trim(); if ($t) { $frags += $t } }
-                } else {
-                    $t = ($n.InnerText).Trim(); if ($t) { $frags += $t }
-                }
-            }
-        }
-    } catch { LogLine "[$Context] SCR parse failed: $($_.Exception.Message)" }
-    return ,$frags
-}
+# Build client relevance for a group:
+# 1) Prefer <Relevance>
+# 2) Else AND-join <SearchComponentRelevance> blocks
 function Get-GroupClientRelevance {
-    param([string]$BaseUrl,[string]$AuthHeader,[string]$SiteName,[string]$GroupIdNumeric)
+    param(
+        [string]$BaseUrl,
+        [string]$AuthHeader,
+        [string]$SiteName,
+        [string]$GroupIdNumeric
+    )
+
     $encSite = Encode-SiteName $SiteName
     $candidates = @(
-        "/api/computergroup/custom/$encSite/$GroupIdNumeric",
-        "/api/computergroup/master/$GroupIdNumeric",
-        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"
+        "/api/computergroup/custom/$encSite/$GroupIdNumeric",               # custom site
+        "/api/computergroup/master/$GroupIdNumeric",                        # master site
+        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"      # operator site (best guess)
     )
+
     foreach ($relPath in $candidates) {
         $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
         try {
@@ -270,77 +189,88 @@ function Get-GroupClientRelevance {
                 Write-Utf8NoBom -Path $tmp -Content $xmlStr
                 LogLine "Saved fetched group XML to: $tmp"
             }
-            $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
-            if ($rels.Count -gt 0) {
-                $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
+            $x = [xml]$xmlStr
+
+            $top = $x.BES.ComputerGroup.Relevance
+            if ($top -and (-not [string]::IsNullOrWhiteSpace($top))) {
+                $snippet = $top.Substring(0, [Math]::Min(200, $top.Length))
+                LogLine "Found group <Relevance> at ${url} :: ${snippet}..."
+                return [string]$top
+            }
+
+            $fragments = @()
+            $nodes = $x.SelectNodes("//ComputerGroup/SearchComponentRelevance")
+            if ($nodes -and $nodes.Count -gt 0) {
+                foreach ($n in $nodes) {
+                    $txt = $n.InnerText
+                    if ($txt -and -not [string]::IsNullOrWhiteSpace($txt)) {
+                        $fragments += $txt.Trim()
+                    }
+                }
+            }
+            if ($fragments.Count -gt 0) {
+                $joined = ($fragments | ForEach-Object { "($_)" }) -join " AND "
                 $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
-                LogLine "Using group relevance from <Relevance> nodes :: ${snippet}..."
+                LogLine "Built relevance from SearchComponentRelevance at ${url} :: ${snippet}..."
                 return $joined
             }
-            $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
-            if ($frags.Count -gt 0) {
-                $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
-                $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
-                LogLine "Built relevance from SearchComponentRelevance :: ${snippet}..."
-                return $joined
-            }
+
             LogLine "No usable relevance at ${url}"
         } catch {
-            LogLine ("❌ Could not fetch/build group relevance: {0}" -f $_.Exception.Message)
+            LogLine "Fetch failed at ${url}: $($_.Exception.Message)"
         }
     }
+
     throw "No relevance found or derivable for group ${GroupIdNumeric} in custom/master/operator."
 }
 
 # =========================
-# ACTION XML (SourcedFixletAction; schema-safe order; absolute times; nullable params)
+# ACTION XML (SourcedFixletAction; schema order; absolute times; nullable params)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
-        [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
-        [string]$UiBaseTitle,       # Full Fixlet title ("Update: ... Win")
-        [string]$DisplayName,       # For user messages ("The GIMP Team GIMP 3.0.4")
-        [string]$SiteName,          # Custom site name
-        [string]$FixletId,          # Fixlet ID
-        [string]$FixletActionName,  # "Action1" or named action in the Fixlet
-        [string]$GroupRelevance,    # Group filter
-        [datetime]$StartLocal,      # absolute start (local)
-        [Nullable[datetime]]$EndLocal = $null,           # optional absolute end (local)
-        [Nullable[datetime]]$DeadlineLocal = $null,      # optional absolute deadline (local) (Force)
+        [string]$ActionTitle,              # Pilot/Deploy/Force/Conference...
+        [string]$UiBaseTitle,              # Full Fixlet title ("Update: ... Win")
+        [string]$DisplayName,              # For user messages ("The GIMP Team GIMP 3.0.4")
+        [string]$SiteName,                 # Custom site name
+        [string]$FixletId,                 # Fixlet ID
+        [string]$FixletActionName,         # "Action1" or a named action in the Fixlet
+        [string]$GroupRelevance,           # Group filter
+        [datetime]$StartLocal,             # absolute start (local)
+        [Nullable[datetime]]$EndLocal = $null,          # optional absolute end (local)
+        [Nullable[datetime]]$DeadlineLocal = $null,     # optional absolute deadline (local) (Force)
         [bool]$HasTimeRange = $false,
-        [Nullable[TimeSpan]]$TimeRangeStart = $null,     # time-of-day from midnight
-        [Nullable[TimeSpan]]$TimeRangeEnd   = $null,     # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeStart = $null,    # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeEnd   = $null,    # time-of-day from midnight
         [bool]$ShowPreActionUI = $false,
         [string]$PreActionText = "",
         [bool]$AskToSaveWork = $false
     )
 
-    # Console action name (keeps suffix like ": Pilot")
+    # Console action name (": Pilot", etc.)
     $fullTitle = ("{0}: {1}" -f $UiBaseTitle, $ActionTitle)
     $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Exact seconds (:00)
-    if ($StartLocal)               { $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute) }
-    if ($EndLocal.HasValue)        { $EndLocal     = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
-    if ($DeadlineLocal.HasValue)   { $DeadlineLocal= $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
+    # Snap times to exact :00 seconds
+    if ($StartLocal)             { $StartLocal    = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute) }
+    if ($EndLocal.HasValue)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
+    if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
-    # Group relevance
+    # Group relevance (safe CDATA)
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # End block
-    $hasEnd = $false; $endLine = ""
-    if ($EndLocal.HasValue) {
-        $hasEnd = $true
-        $endLine = "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
-    }
+    # End time line
+    $hasEnd = $EndLocal.HasValue
+    $endLine = if ($hasEnd) { "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n" } else { "" }
 
-    # TimeRange: ALWAYS emit HasTimeRange; include TimeRange only when true and values provided
-    $emitTR = $HasTimeRange -and $TimeRangeStart.HasValue -and $TimeRangeEnd.HasValue
-    if ($emitTR) {
-        $trs = if ($TimeRangeStart.Value.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes } else { "PT{0}H" -f $TimeRangeStart.Value.Hours }
-        $tre = if ($TimeRangeEnd.Value.Minutes   -gt 0) { "PT{0}H{1}M" -f $TimeRangeEnd.Value.Hours,   $TimeRangeEnd.Value.Minutes   } else { "PT{0}H" -f $TimeRangeEnd.Value.Hours }
+    # TimeRange block
+    if ($HasTimeRange) {
+        if (-not $TimeRangeStart.HasValue) { $TimeRangeStart = [TimeSpan]::FromHours(19) } # 7:00 PM
+        if (-not $TimeRangeEnd.HasValue)   { $TimeRangeEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) } # 6:59 AM
+        $trs = IsoTimePart $TimeRangeStart.Value
+        $tre = IsoTimePart $TimeRangeEnd.Value
         $timeRangeBlock = @"
       <HasTimeRange>true</HasTimeRange>
       <TimeRange>
@@ -352,7 +282,7 @@ function Build-SourcedFixletActionXml {
         $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     }
 
-    # PreAction (ONLY when needed). Absolute deadline lives INSIDE PreAction for SourcedFixletAction.
+    # PreAction (if enabled); absolute deadline belongs inside PreAction for SourcedFixletAction
     $preActionBlock = ""
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
@@ -389,21 +319,18 @@ $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
     </Target>
     <Settings>
       <ActionUITitle>$uiTitle</ActionUITitle>
-
+$preActionBlock
+      <HasRunningMessage>true</HasRunningMessage>
+      <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
 $timeRangeBlock
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocal>$($StartLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</StartDateTimeLocal>
       <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
 $endLine      <UseUTCTime>false</UseUTCTime>
-
-      <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
-$preActionBlock
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
       <HasWhose>false</HasWhose>
       <PreActionCacheDownload>false</PreActionCacheDownload>
-
       <Reapply>true</Reapply>
       <HasReapplyLimit>false</HasReapplyLimit>
       <HasReapplyInterval>false</HasReapplyInterval>
@@ -420,9 +347,6 @@ $preActionBlock
 </BES>
 "@
 }
-
-# (SingleAction builder kept inert)
-function Build-SingleActionXml { "<!-- SingleAction path intentionally omitted in this build -->" }
 
 # =========================
 # GUI
@@ -472,7 +396,7 @@ $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# Time (8:00 PM – 11:45 PM, 15m) – exact wall clock
+# Time (8:00 PM – 11:45 PM, 15m)
 $lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
 $lblTime.Location = New-Object System.Drawing.Point(10,$y)
@@ -548,31 +472,29 @@ $btn.Add_Click({
         $titleRaw     = [string]$cont.Node.Title
         $displayName  = Parse-FixletTitleToProduct -Title $titleRaw   # e.g., "The GIMP Team GIMP 3.0.4"
 
-        $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
-        $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
-        $actionScript = $parsed.ActionScript
+        # Sanity
+        [void](Get-ActionAndRelevance -ContainerNode $cont.Node)
 
-        LogLine ("Detected BES content type: {0}" -f $cont.Type)
-        LogLine "Console title: ${titleRaw}"
-        LogLine "Display name (messages): ${displayName}"
-
-        # Exact absolute schedule (:00)
+        # Build concrete schedule from UI (seconds snapped to :00)
         $pilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
         $pilotStart = $pilotStart.Date.AddHours($pilotStart.Hour).AddMinutes($pilotStart.Minute)
 
-        $deployStart     = $pilotStart.AddDays(1)
+        $deployStart     = $pilotStart.AddDays(1)                                              # +24h
         $confStart       = $pilotStart.AddDays(1)
-        $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)  # next day 6:59 AM
-        $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning 6:55 AM
+        $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)             # next day 6:59 AM
+        $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55)            # next morning 6:55 AM
 
-        # Force: next Tuesday 7:00 AM after Pilot, with absolute deadline Wednesday 7:00 AM
+        # Force: next Tuesday 7:00 AM after Pilot, deadline = Wednesday 7:00 AM
         $forceStartDate  = Get-NextWeekday -base $pilotStart -weekday ([DayOfWeek]::Tuesday)
-        $forceStart      = $forceStartDate.AddHours(7)     # Tue 7:00 AM
-        $forceEnforce    = $forceStart.AddDays(1)          # Wed 7:00 AM
+        $forceStart      = $forceStartDate.AddHours(7)                                         # Tue 7:00 AM
+        $forceEnforce    = $forceStart.AddDays(1)                                              # Wed 7:00 AM
 
-        # TimeRange window (7:00 PM–6:59 AM)
-        $trStart = [TimeSpan]::FromHours(19)
-        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))
+        # Run-between window 7:00 PM – 6:59 AM
+        $trStart = [TimeSpan]::FromHours(19)                                                   # 19:00
+        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))                   # 06:59
+
+        $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
+        LogLine "POST URL: ${postUrl}"
 
         $actions = @(
             @{ Name="Pilot"; Start=$pilotStart; End=$pilotEnd; TR=$true;  TRS=$trStart; TRE=$trEnd; UI=$false; Msg="";    Save=$false; Deadline=$null },
@@ -584,28 +506,26 @@ $btn.Add_Click({
                Save=$true; Deadline=$forceEnforce }
         )
 
-        $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
-        LogLine "POST URL: ${postUrl}"
-
         foreach ($cfg in $actions) {
             $a = $cfg.Name
             $groupIdRaw = "$($GroupMap[$a])"
             if (-not $groupIdRaw) { LogLine "❌ Missing group id for $a"; continue }
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
-            if (-not $groupIdNumeric) { LogLine ("❌ Could not parse numeric ID from '{0}' for {1}" -f $groupIdRaw, $a); continue }
+            if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '${groupIdRaw}' for $a"; continue }
 
-            # fetch group relevance
+            # fetch group's client relevance and combine with Fixlet via Target
+            $groupRel = ""
             try {
                 $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
                 LogLine ("Group relevance len ({0}): {1}" -f $a, $groupRel.Length)
             } catch {
-                LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
-                continue
+                LogLine "❌ Could not fetch/build group relevance for $($a): $($_.Exception.Message)"
+                continue  # do NOT post without group relevance
             }
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Build params without passing $null into typed params
+            # Build parameters with splatting; avoid passing $null to typed params
             $paramMap = @{
                 ActionTitle      = $a
                 UiBaseTitle      = $titleRaw
@@ -629,24 +549,17 @@ $btn.Add_Click({
 
             $xmlBody = Build-SourcedFixletActionXml @paramMap
 
-            $xmlBodyToSend = Normalize-XmlForPost $xmlBody
             $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
             $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
             if ($SaveActionXmlToTemp) {
-                Write-Utf8NoBom -Path $tmpAction -Content $xmlBodyToSend
+                Write-Utf8NoBom -Path $tmpAction -Content $xmlBody
                 LogLine "Saved action XML for $a to: $tmpAction"
                 LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
             }
 
             try {
-                if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
-                    LogLine "Posting via Invoke-WebRequest (curl-like) using file: $tmpAction"
-                    Post-XmlFile-InFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
-                } else {
-                    LogLine "Posting via HttpWebRequest body (direct bytes)"
-                    $authHeader = Get-AuthHeader -User $user -Pass $pass
-                    HttpPostXml -Url $postUrl -AuthHeader $authHeader -XmlBody $xmlBodyToSend
-                }
+                LogLine "Posting $a..."
+                Post-XmlFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
                 LogLine ("✅ {0} posted successfully." -f $a)
             } catch {
                 LogLine ("❌ POST failed for {0}: {1}" -f $a, $_.Exception.Message)
