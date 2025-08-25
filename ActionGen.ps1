@@ -18,7 +18,17 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12348"
 }
 
-# ---- IMPORTANT: how to build the XML ----
+# Map rollout to the **existing Fixlet Action name** to invoke.
+# If your Fixlet only has one action (usually "Action1"), leave as "Action1".
+# If you created/renamed actions to "Pilot", "Deploy", etc., put those names here.
+$FixletActionNameMap = @{
+    "Pilot"                     = "Action1"
+    "Deploy"                    = "Action1"
+    "Force"                     = "Action1"
+    "Conference/Training Rooms" = "Action1"
+}
+
+# How to build the XML:
 # 'Sourced'  => action shows under the Fixlet's custom site in Console (RECOMMENDED)
 # 'Single'   => independent SingleAction (owned by operator)
 $ActionMode = 'Sourced'   # 'Sourced' or 'Single'
@@ -238,7 +248,6 @@ function Get-ActionAndRelevance {
 }
 
 function Parse-FixletTitleToProduct([string]$Title) {
-    # Keep product-friendly version for messages, but NOT used for ActionUITitle.
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
@@ -406,17 +415,18 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
 "@
 }
 
-# PS5.1-safe SourcedFixletAction builder (SourceFixlet -> Target -> Settings; no <Title>; adds <ActionName>)
+# SourcedFixletAction builder — adds <Title> AFTER </Settings> to name the action
 function Build-SourcedFixletActionXml {
     param(
-        [string]$ActionTitle,     # Pilot/Deploy/Force/Conference...
-        [string]$UiBaseTitle,     # Full Fixlet title ("Update: ... Win")
-        [string]$DisplayName,     # Product-friendly name for messages
-        [string]$SiteName,        # Custom site name
-        [string]$FixletId,        # Fixlet ID
-        [string]$GroupRelevance,  # Group filter to AND with fixlet relevance
-        [datetime]$StartLocal,    # Scheduled local start (absolute)
-        [bool]$IsForce = $false   # Force adds end offset (start+24h)
+        [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
+        [string]$UiBaseTitle,       # Full Fixlet title ("Update: ... Win")
+        [string]$DisplayName,       # Product-friendly name for messages
+        [string]$SiteName,          # Custom site name
+        [string]$FixletId,          # Fixlet ID
+        [string]$FixletActionName,  # MUST match an existing action name in the Fixlet (e.g., "Action1")
+        [string]$GroupRelevance,    # Group filter to AND with fixlet relevance
+        [datetime]$StartLocal,      # Scheduled local start (absolute)
+        [bool]$IsForce = $false     # Force adds end offset (start+24h)
     )
 
     $fullTitle = "${UiBaseTitle}: $ActionTitle"
@@ -450,13 +460,12 @@ function Build-SourcedFixletActionXml {
     <SourceFixlet>
       <Sitename>$SiteName</Sitename>
       <FixletID>$FixletId</FixletID>
-      <Action>Action1</Action>
+      <Action>$FixletActionName</Action>
     </SourceFixlet>
     <Target>
       <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
     </Target>
     <Settings>
-      <ActionName>$uiTitle</ActionName>
       <ActionUITitle>$uiTitle</ActionUITitle>
       <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
@@ -488,6 +497,7 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
       <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
       <IsOffer>false</IsOffer>
     </Settings>
+    <Title>$uiTitle</Title>
   </SourcedFixletAction>
 </BES>
 "@
@@ -617,8 +627,8 @@ $btn.Add_Click({
         $cont = Get-FixletContainer -Xml $fixletXml
         LogLine ("Detected BES content type: {0}" -f $cont.Type)
 
-        $titleRaw = [string]$cont.Node.Title                      # Full console title (e.g., "Update: ... Win")
-        $displayName = Parse-FixletTitleToProduct -Title $titleRaw # Product-friendly for messages
+        $titleRaw = [string]$cont.Node.Title
+        $displayName = Parse-FixletTitleToProduct -Title $titleRaw
 
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
         $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
@@ -652,26 +662,28 @@ $btn.Add_Click({
             }
 
             $isForce = ($a -eq "Force")
+            $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
             if ($ActionMode -ieq 'Sourced') {
                 $xmlBody = Build-SourcedFixletActionXml `
-                    -ActionTitle  $a `
-                    -UiBaseTitle  $titleRaw `
-                    -DisplayName  $displayName `
-                    -SiteName     $CustomSiteName `
-                    -FixletId     $fixId `
-                    -GroupRelevance $groupRel `
-                    -StartLocal   $startLocal `
+                    -ActionTitle      $a `
+                    -UiBaseTitle      $titleRaw `
+                    -DisplayName      $displayName `
+                    -SiteName         $CustomSiteName `
+                    -FixletId         $fixId `
+                    -FixletActionName $fixletActionName `
+                    -GroupRelevance   $groupRel `
+                    -StartLocal       $startLocal `
                     -IsForce:$isForce
             } else {
                 $allRel = @(); $allRel += $fixletRelevance; if ($groupRel) { $allRel += $groupRel }
                 $xmlBody = Build-SingleActionXml `
-                    -ActionTitle   $a `
-                    -UiBaseTitle   $titleRaw `
-                    -DisplayName   $displayName `
+                    -ActionTitle     $a `
+                    -UiBaseTitle     $titleRaw `
+                    -DisplayName     $displayName `
                     -RelevanceBlocks $allRel `
-                    -ActionScript  $actionScript `
-                    -StartLocal    $startLocal `
+                    -ActionScript    $actionScript `
+                    -StartLocal      $startLocal `
                     -IsForce:$isForce
             }
 
