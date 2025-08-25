@@ -18,7 +18,7 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12348"
 }
 
-# Map rollout to the existing Fixlet Action name to invoke.
+# Map rollout to the existing Fixlet Action name to invoke (must exist in the Fixlet)
 $FixletActionNameMap = @{
     "Pilot"                     = "Action1"
     "Deploy"                    = "Action1"
@@ -27,7 +27,7 @@ $FixletActionNameMap = @{
 }
 
 # Use SourcedFixletAction (lives under the Fixlet's site).
-$ActionMode = 'Sourced'   # 'Sourced' or 'Single' (Single not used in this build)
+$ActionMode = 'Sourced'   # 'Sourced' or 'Single' (Single path is disabled in this build)
 
 # Behavior toggles
 $IgnoreCertErrors           = $true
@@ -293,7 +293,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML (SourcedFixletAction; schema-safe order; absolute times)
+# ACTION XML (SourcedFixletAction; schema-safe order; absolute times; nullable params)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -305,11 +305,11 @@ function Build-SourcedFixletActionXml {
         [string]$FixletActionName,  # "Action1" or named action in the Fixlet
         [string]$GroupRelevance,    # Group filter
         [datetime]$StartLocal,      # absolute start (local)
-        [datetime]$EndLocal = $null,# optional absolute end (local)
-        [datetime]$DeadlineLocal = $null,  # optional absolute deadline (local) (Force)
+        [Nullable[datetime]]$EndLocal = $null,           # optional absolute end (local)
+        [Nullable[datetime]]$DeadlineLocal = $null,      # optional absolute deadline (local) (Force)
         [bool]$HasTimeRange = $false,
-        [TimeSpan]$TimeRangeStart = $null, # time-of-day from midnight
-        [TimeSpan]$TimeRangeEnd   = $null, # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeStart = $null,     # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeEnd   = $null,     # time-of-day from midnight
         [bool]$ShowPreActionUI = $false,
         [string]$PreActionText = "",
         [bool]$AskToSaveWork = $false
@@ -321,26 +321,26 @@ function Build-SourcedFixletActionXml {
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
     # Exact seconds (:00)
-    if ($StartLocal)   { $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute) }
-    if ($EndLocal)     { $EndLocal     = $EndLocal.Date.AddHours($EndLocal.Hour).AddMinutes($EndLocal.Minute) }
-    if ($DeadlineLocal){ $DeadlineLocal= $DeadlineLocal.Date.AddHours($DeadlineLocal.Hour).AddMinutes($DeadlineLocal.Minute) }
+    if ($StartLocal)               { $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute) }
+    if ($EndLocal.HasValue)        { $EndLocal     = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
+    if ($DeadlineLocal.HasValue)   { $DeadlineLocal= $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
     # Group relevance
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
     # End block
-    $hasEnd = [bool]$EndLocal
-    $endLine = ""
-    if ($hasEnd) {
-        $endLine = "      <EndDateTimeLocal>$($EndLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
+    $hasEnd = $false; $endLine = ""
+    if ($EndLocal.HasValue) {
+        $hasEnd = $true
+        $endLine = "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
     }
 
     # TimeRange: ALWAYS emit HasTimeRange; include TimeRange only when true and values provided
-    $emitTR = $HasTimeRange -and $TimeRangeStart -ne $null -and $TimeRangeEnd -ne $null
+    $emitTR = $HasTimeRange -and $TimeRangeStart.HasValue -and $TimeRangeEnd.HasValue
     if ($emitTR) {
-        $trs = if ($TimeRangeStart.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeStart.Hours, $TimeRangeStart.Minutes } else { "PT{0}H" -f $TimeRangeStart.Hours }
-        $tre = if ($TimeRangeEnd.Minutes   -gt 0) { "PT{0}H{1}M" -f $TimeRangeEnd.Hours,   $TimeRangeEnd.Minutes   } else { "PT{0}H" -f $TimeRangeEnd.Hours }
+        $trs = if ($TimeRangeStart.Value.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes } else { "PT{0}H" -f $TimeRangeStart.Value.Hours }
+        $tre = if ($TimeRangeEnd.Value.Minutes   -gt 0) { "PT{0}H{1}M" -f $TimeRangeEnd.Value.Hours,   $TimeRangeEnd.Value.Minutes   } else { "PT{0}H" -f $TimeRangeEnd.Value.Hours }
         $timeRangeBlock = @"
       <HasTimeRange>true</HasTimeRange>
       <TimeRange>
@@ -357,17 +357,17 @@ function Build-SourcedFixletActionXml {
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
         $deadlineInner = ""
-        if ($DeadlineLocal) {
+        if ($DeadlineLocal.HasValue) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$($DeadlineLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
+        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
 "@
         }
 $preActionBlock = @"
       <PreAction>
         <Text>$preEsc</Text>
-        <AskToSaveWork>$([string]$AskToSaveWork).ToLower()</AskToSaveWork>
+        <AskToSaveWork>$($AskToSaveWork.ToString().ToLower())</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
         <ShowCancelButton>false</ShowCancelButton>
 $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
@@ -556,14 +556,14 @@ $btn.Add_Click({
         LogLine "Console title: ${titleRaw}"
         LogLine "Display name (messages): ${displayName}"
 
-        # Exact absolute schedule :00
+        # Exact absolute schedule (:00)
         $pilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
         $pilotStart = $pilotStart.Date.AddHours($pilotStart.Hour).AddMinutes($pilotStart.Minute)
 
         $deployStart     = $pilotStart.AddDays(1)
         $confStart       = $pilotStart.AddDays(1)
-        $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)
-        $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55)
+        $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)  # next day 6:59 AM
+        $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning 6:55 AM
 
         # Force: next Tuesday 7:00 AM after Pilot, with absolute deadline Wednesday 7:00 AM
         $forceStartDate  = Get-NextWeekday -base $pilotStart -weekday ([DayOfWeek]::Tuesday)
@@ -605,23 +605,29 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            $xmlBody = Build-SourcedFixletActionXml `
-                -ActionTitle      $a `
-                -UiBaseTitle      $titleRaw `
-                -DisplayName      $displayName `
-                -SiteName         $CustomSiteName `
-                -FixletId         $fixId `
-                -FixletActionName $fixletActionName `
-                -GroupRelevance   $groupRel `
-                -StartLocal       $cfg.Start `
-                -EndLocal         $cfg.End `
-                -DeadlineLocal    $cfg.Deadline `
-                -HasTimeRange     $cfg.TR `
-                -TimeRangeStart   $cfg.TRS `
-                -TimeRangeEnd     $cfg.TRE `
-                -ShowPreActionUI  $cfg.UI `
-                -PreActionText    $cfg.Msg `
-                -AskToSaveWork    $cfg.Save
+            # Build params without passing $null into typed params
+            $paramMap = @{
+                ActionTitle      = $a
+                UiBaseTitle      = $titleRaw
+                DisplayName      = $displayName
+                SiteName         = $CustomSiteName
+                FixletId         = $fixId
+                FixletActionName = $fixletActionName
+                GroupRelevance   = $groupRel
+                StartLocal       = $cfg.Start
+                HasTimeRange     = $cfg.TR
+                ShowPreActionUI  = $cfg.UI
+                PreActionText    = $cfg.Msg
+                AskToSaveWork    = $cfg.Save
+            }
+            if ($cfg.End)      { $paramMap['EndLocal']      = $cfg.End }
+            if ($cfg.Deadline) { $paramMap['DeadlineLocal'] = $cfg.Deadline }
+            if ($cfg.TR -and $cfg.TRS -ne $null -and $cfg.TRE -ne $null) {
+                $paramMap['TimeRangeStart'] = $cfg.TRS
+                $paramMap['TimeRangeEnd']   = $cfg.TRE
+            }
+
+            $xmlBody = Build-SourcedFixletActionXml @paramMap
 
             $xmlBodyToSend = Normalize-XmlForPost $xmlBody
             $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
