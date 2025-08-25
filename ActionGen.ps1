@@ -74,50 +74,10 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
 
-# Build “Update: Vendor App Version” for messages (strip trailing " Win", no action suffix)
+# Build “Update: Vendor App Version” for messages (strip trailing " Win")
 function Build-MessageTitle([string]$FixletTitle) {
-    $t = $FixletTitle
-    $t = $t -replace '\s+Win$',''     # drop trailing " Win"
+    $t = $FixletTitle -replace '\s+Win$',''
     return $t.Trim()
-}
-
-# ISO-8601 duration PnDTnHnMnS from an already-rounded TimeSpan
-function To-IsoDuration([TimeSpan]$ts) {
-    if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
-    $days = [int][Math]::Floor($ts.TotalDays)
-    $rem  = $ts - [TimeSpan]::FromDays($days)
-    $h = $rem.Hours; $m = $rem.Minutes; $s = $rem.Seconds
-    $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
-    $hPart = if ($h -gt 0) { "{0}H" -f $h } else { "" }
-    $mPart = if ($m -gt 0) { "{0}M" -f $m } else { "" }
-    $sPart = if ($s -gt 0) { "{0}S" -f $s } else { "" }
-    if ($hPart -eq "" -and $mPart -eq "" -and $sPart -eq "") { $sPart = "0S" }
-    return $dPart + "T" + $hPart + $mPart + $sPart
-}
-
-# Round a target DateTime to an ISO offset (ceil to whole second)
-function Get-OffsetIso([datetime]$target) {
-    $now = Get-Date
-    $deltaSec = [Math]::Ceiling(($target - $now).TotalSeconds)
-    $deltaSec = [Math]::Max(0, $deltaSec)
-    return To-IsoDuration ([TimeSpan]::FromSeconds($deltaSec))
-}
-
-# Time-of-day as ISO 8601 duration from midnight, e.g., 19:00 -> PT19H, 6:59 -> PT6H59M
-function To-IsoTimeOfDay([int]$hour,[int]$minute=0,[int]$second=0) {
-    $parts = @()
-    if ($hour   -gt 0) { $parts += ("{0}H" -f $hour) }
-    if ($minute -gt 0) { $parts += ("{0}M" -f $minute) }
-    if ($second -gt 0 -or $parts.Count -eq 0) { $parts += ("{0}S" -f $second) }
-    return "PT" + ($parts -join "")
-}
-
-# Next specific weekday AFTER the given date (never same day)
-function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
-    $anchor = $base.Date
-    $delta = ([int]$weekday - [int]$anchor.DayOfWeek + 7) % 7
-    if ($delta -le 0) { $delta += 7 }
-    return $anchor.AddDays($delta)
 }
 
 # Normalize leading BOM/whitespace so POST starts with '<'
@@ -140,6 +100,13 @@ function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     $sb = New-Object System.Text.StringBuilder
     for ($i = 0; $i -lt $take; $i++) { [void]$sb.AppendFormat("{0:X2} ", $bytes[$i]) }
     $sb.ToString().TrimEnd()
+}
+# Next specific weekday AFTER the given date (never same day)
+function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
+    $anchor = $base.Date
+    $delta = ([int]$weekday - [int]$anchor.DayOfWeek + 7) % 7
+    if ($delta -le 0) { $delta += 7 }
+    return $anchor.AddDays($delta)
 }
 
 # =========================
@@ -340,7 +307,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML BUILDERS
+# ACTION XML (SourcedFixletAction with ABSOLUTE times)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -351,49 +318,54 @@ function Build-SourcedFixletActionXml {
         [string]$FixletId,          # Fixlet ID
         [string]$FixletActionName,  # "Action1" or a named action that exists in the Fixlet
         [string]$GroupRelevance,    # Group filter to AND with fixlet relevance
-        [datetime]$StartLocal,      # scheduled local start (absolute)
-        [Nullable[datetime]]$EndLocal = $null,   # optional absolute end
-        [Nullable[datetime]]$DeadlineLocal = $null, # optional absolute deadline
+        [datetime]$StartLocal,      # absolute start (local)
+        [Nullable[datetime]]$EndLocal = $null,           # optional absolute end (local)
+        [Nullable[datetime]]$DeadlineLocal = $null,      # optional absolute deadline (local)
         [bool]$HasTimeRange = $false,
-        [Nullable[TimeSpan]]$TimeRangeStart = $null, # time-of-day from midnight
-        [Nullable[TimeSpan]]$TimeRangeEnd = $null,   # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeStart = $null,     # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeEnd = $null,       # time-of-day from midnight
         [bool]$ShowPreActionUI = $false,
-        [string]$PreActionText = "",   # shown only if ShowPreActionUI=true
-        [bool]$AskToSaveWork = $false  # only meaningful when ShowPreActionUI=true
+        [string]$PreActionText = "",
+        [bool]$AskToSaveWork = $false
     )
 
-    $fullTitle = "${UiBaseTitle}: $ActionTitle"              # Console action name
+    # Console action name (keeps suffix)
+    $fullTitle = "${UiBaseTitle}: $ActionTitle"
     $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
     $msgTitle  = [System.Security.SecurityElement]::Escape($MessageTitle)
+
+    # Ensure exact seconds (:00)
+    $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
+    if ($EndLocal.HasValue)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
+    if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
     # Sanitize relevance
     if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { $groupSafe = "" } else { $groupSafe = $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # Rounded offsets from now
-    $startOffset = Get-OffsetIso $StartLocal
-    $hasEnd = $false; $endOffsetLine = ""
+    # End block
+    $hasEnd = $false; $endLine = ""
     if ($EndLocal.HasValue) {
-        $endOffsetLine = "      <EndDateTimeLocalOffset>$((Get-OffsetIso $EndLocal.Value))</EndDateTimeLocalOffset>`n"
         $hasEnd = $true
+        $endLine = "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
     }
 
-    # Deadline (Force)
+    # Deadline (Force) — ABSOLUTE timestamp
     $deadlineBlock = ""
     if ($DeadlineLocal.HasValue) {
-        $deadlineOffset = Get-OffsetIso $DeadlineLocal.Value
         $deadlineBlock = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalOffset>$deadlineOffset</DeadlineLocalOffset>
+        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
 "@
     }
 
     # TimeRange block
     $timeRangeBlock = ""
     if ($HasTimeRange -and $TimeRangeStart.HasValue -and $TimeRangeEnd.HasValue) {
-        $trs = To-IsoTimeOfDay($TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes, $TimeRangeStart.Value.Seconds)
-        $tre = To-IsoTimeOfDay($TimeRangeEnd.Value.Hours,   $TimeRangeEnd.Value.Minutes,   $TimeRangeEnd.Value.Seconds)
+        $trs = "PT{0}H{1}M" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes
+        $tre = if ($TimeRangeEnd.Value.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeEnd.Value.Hours, $TimeRangeEnd.Value.Minutes }
+               else { "PT{0}H" -f $TimeRangeEnd.Value.Hours }
         $timeRangeBlock = @"
       <HasTimeRange>true</HasTimeRange>
       <TimeRange>
@@ -405,7 +377,7 @@ function Build-SourcedFixletActionXml {
         $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     }
 
-    # PreAction (only if requested)
+    # PreAction (only if requested) — uses clean message title
     $preActionBlock = ""
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
@@ -444,9 +416,9 @@ $preActionBlock
       <RunningMessage><Text>Updating to $msgTitle...please wait.</Text></RunningMessage>
 $timeRangeBlock
       <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
+      <StartDateTimeLocal>$($StartLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</StartDateTimeLocal>
       <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
-$endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
+$endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
       <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
@@ -468,6 +440,9 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
 </BES>
 "@
 }
+
+# (SingleAction builder kept if you ever need it again)
+function Build-SingleActionXml { "<!-- SingleAction path intentionally omitted in this build -->" }
 
 # =========================
 # GUI
@@ -518,7 +493,7 @@ $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# Time (8:00 PM – 11:45 PM, 15m) – strictly exact user choice
+# Time (8:00 PM – 11:45 PM, 15m) – exact wall clock
 $lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
 $lblTime.Location = New-Object System.Drawing.Point(10,$y)
@@ -593,9 +568,9 @@ $btn.Add_Click({
         $cont = Get-FixletContainer -Xml $fixletXml
         LogLine ("Detected BES content type: {0}" -f $cont.Type)
 
-        $titleRaw = [string]$cont.Node.Title
-        $messageTitle = Build-MessageTitle $titleRaw
-        $displayName  = Parse-FixletTitleToProduct -Title $titleRaw
+        $titleRaw     = [string]$cont.Node.Title                            # e.g., "Update: Foo 1.2.3 Win"
+        $messageTitle = Build-MessageTitle $titleRaw                        # "Update: Foo 1.2.3"
+        $displayName  = Parse-FixletTitleToProduct -Title $titleRaw         # "Foo 1.2.3"
 
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
         $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
@@ -606,23 +581,24 @@ $btn.Add_Click({
         LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
-        # Absolute schedule (user picks local date/time) – strictly exact seconds=00
+        # Absolute schedule (user picks local date/time) – exact seconds :00
         $pilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
+        $pilotStart = $pilotStart.Date.AddHours($pilotStart.Hour).AddMinutes($pilotStart.Minute)
 
-        # Derived schedules per action
+        # Derived schedules per action — exact seconds :00
         $deployStart     = $pilotStart.AddDays(1)
         $confStart       = $pilotStart.AddDays(1)
         $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59) # next day 6:59 AM
         $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning 6:55 AM
 
-        # Force: next Tuesday 7:00 AM after Pilot
+        # Force: next Tuesday 7:00 AM after Pilot, with absolute deadline Wednesday 7:00 AM
         $forceStartDate  = Get-NextWeekday -base $pilotStart -weekday ([DayOfWeek]::Tuesday)
-        $forceStart      = $forceStartDate.AddHours(7) # 7:00 AM sharp
-        $forceEnforce    = $forceStart.AddHours(24)    # message + deadline exact
+        $forceStart      = $forceStartDate.AddHours(7) # Tue 7:00 AM
+        $forceEnforce    = $forceStart.AddDays(1)      # Wed 7:00 AM
 
         # TimeRange window (7:00 PM–6:59 AM)
-        $trStart = [TimeSpan]::FromHours(19)               # 7:00 PM
-        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))  # 6:59 AM
+        $trStart = [TimeSpan]::FromHours(19)                                   # 7:00 PM
+        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))   # 6:59 AM
 
         $actions = @(
             @{ Name="Pilot"; Start=$pilotStart; End=$pilotEnd; TR=$true;  TRS=$trStart; TRE=$trEnd; UI=$false; Msg="";    Save=$false; Deadline=$null },
@@ -674,9 +650,7 @@ $btn.Add_Click({
                     -PreActionText    $cfg.Msg `
                     -AskToSaveWork    $cfg.Save
             } else {
-                # (SingleAction path not used by default)
-                $allRel = @(); $allRel += $fixletRelevance; if ($groupRel) { $allRel += $groupRel }
-                $xmlBody = "<!-- SingleAction path intentionally omitted in this run -->"
+                $xmlBody = "<!-- SingleAction path intentionally omitted in this build -->"
             }
 
             $xmlBodyToSend = Normalize-XmlForPost $xmlBody
