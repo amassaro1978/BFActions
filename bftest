@@ -1,98 +1,725 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Web
+
+# =========================
+# CONFIG (EDIT THESE)
+# =========================
+$LogFile = Join-Path $env:TEMP "BigFixActionGenerator.log"
+
+# Site that hosts the Fixlet + (ideally) the Computer Groups
+$CustomSiteName = "Test Group Managed (Workstations)"
+
+# Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric)
+$GroupMap = @{
+    "Pilot"                     = "00-12345"
+    "Deploy"                    = "00-12346"
+    "Force"                     = "00-12347"
+    "Conference/Training Rooms" = "00-12348"
+}
+
+# Map rollout to the **existing Fixlet Action name** to invoke.
+# If your Fixlet only has one action (usually "Action1"), leave as "Action1".
+# If you created/renamed actions to "Pilot", "Deploy", etc., put those names here.
+$FixletActionNameMap = @{
+    "Pilot"                     = "Action1"
+    "Deploy"                    = "Action1"
+    "Force"                     = "Action1"
+    "Conference/Training Rooms" = "Action1"
+}
+
+# How to build the XML:
+# 'Sourced'  => action shows under the Fixlet's custom site in Console (RECOMMENDED)
+# 'Single'   => independent SingleAction (owned by operator)
+$ActionMode = 'Sourced'   # 'Sourced' or 'Single'
+
+# Match curl -k if your cert is untrusted
+$IgnoreCertErrors           = $true
+# Dump fetched input XMLs
+$DumpFetchedXmlToTemp       = $true
+# Regex fallback for odd XML shapes
+$AggressiveRegexFallback    = $true
+# Save the exact action XML we POST (normalized, UTF8 no BOM)
+$SaveActionXmlToTemp        = $true
+# Post like curl using Invoke-WebRequest -InFile
+$PostUsingInvokeWebRequest  = $true
+
+# =========================
+# UTIL / LOGGING
+# =========================
+function Encode-SiteName([string]$Name) {
+    $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
+    $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
+    return $enc
+}
+function Get-BaseUrl([string]$ServerInput) {
+    if (-not $ServerInput) { throw "Server is empty." }
+    $s = $ServerInput.Trim()
+    if ($s -notmatch '^(?i)https?://') {
+        if ($s -match ':\d+$') { $s = "https://$s" } else { $s = "https://$s:52311" }
+    }
+    return $s.TrimEnd('/')
+}
+function Join-ApiUrl([string]$BaseUrl,[string]$RelativePath) {
+    $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
+    $BaseUrl.TrimEnd('/') + $rp
+}
+function Get-AuthHeader([string]$User,[string]$Pass) {
+    $pair  = "$User`:$Pass"
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    "Basic " + [Convert]::ToBase64String($bytes)
+}
+function LogLine($txt) {
+    $line = "{0}  {1}" -f (Get-Date -Format 'u'), $txt
+    $LogBox.AppendText($line + "`r`n")
+    Add-Content -Path $LogFile -Value $line
+    $LogBox.SelectionStart = $LogBox.Text.Length
+    $LogBox.ScrollToCaret()
+}
+function Get-NumericGroupId([string]$GroupIdWithPrefix) {
+    if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
+    return ($GroupIdWithPrefix -replace '[^\d]','')
+}
+# ISO-8601 duration PnDTnHnMnS (positive from now)
+function To-IsoDuration([TimeSpan]$ts) {
+    if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
+    $days = [int]$ts.TotalDays
+    $hours = $ts.Hours
+    $mins  = $ts.Minutes
+    $secs  = $ts.Seconds
+    $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
+    $hPart = if ($hours -gt 0) { "{0}H" -f $hours } else { "" }
+    $mPart = if ($mins  -gt 0) { "{0}M" -f $mins  } else { "" }
+    $sPart = if ($secs  -gt 0) { "{0}S" -f $secs  } else { "" }
+    if ($hPart -eq "" -and $mPart -eq "" -and $sPart -eq "") { $sPart = "0S" }
+    return $dPart + "T" + $hPart + $mPart + $sPart
+}
+# Remove BOM/leading whitespace so POST starts with '<'
+function Normalize-XmlForPost([string]$s) {
+    if (-not $s) { return $s }
+    $noBom = $s -replace "^\uFEFF",""
+    $noLeadWs = $noBom -replace '^\s+',''
+    return $noLeadWs
+}
+# UTF8 (no BOM) file write
+function Write-Utf8NoBom([string]$Path,[string]$Content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+# Hex preview (debug)
+function Get-FirstBytesHex([string]$s, [int]$n = 32) {
+    if (-not $s) { return "" }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($s)
+    $take = [Math]::Min($n, $bytes.Length)
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $take; $i++) { [void]$sb.AppendFormat("{0:X2} ", $bytes[$i]) }
+    $sb.ToString().TrimEnd()
+}
+
+# =========================
+# HTTP
+# =========================
+if ($IgnoreCertErrors) { try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch { } }
+[System.Net.ServicePointManager]::Expect100Continue = $false
+
+function HttpGetXml {
+    param([string]$Url,[string]$AuthHeader)
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = "GET"
+    $req.Accept = "application/xml"
+    $req.Headers["Accept-Encoding"] = "gzip, deflate"
+    $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    $req.Headers["Authorization"] = $AuthHeader
+    $req.ProtocolVersion = [Version]"1.1"
+    $req.PreAuthenticate = $true
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 45000
+    try {
+        $resp = $req.GetResponse()
+        try {
+            $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+            $content = $sr.ReadToEnd(); $sr.Close()
+        } finally { $resp.Close() }
+        return $content
+    } catch {
+        throw ($_.Exception.GetBaseException().Message)
+    }
+}
+
+# curl-like POST using a file on disk
+function Post-XmlFile-InFile {
+    param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
+    try {
+        $pair  = "$User`:$Pass"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+        $basic = "Basic " + [Convert]::ToBase64String($bytes)
+        $resp = Invoke-WebRequest -Method Post -Uri $Url `
+            -Headers @{ "Authorization" = $basic } `
+            -ContentType "application/xml" `
+            -InFile $XmlFilePath `
+            -UseBasicParsing
+        if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
+    } catch {
+        if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
+            $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream(), [Text.Encoding]::UTF8)
+            $errBody = $sr.ReadToEnd(); $sr.Close()
+            throw "Invoke-WebRequest POST failed :: $errBody"
+        } else {
+            throw ($_.Exception.Message)
+        }
+    }
+}
+
+# Legacy direct-bytes POST (kept as fallback)
+function HttpPostXml {
+    param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($XmlBody)
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = "POST"
+    $req.Accept = "application/xml"
+    $req.ContentType = "application/xml; charset=utf-8"
+    $req.UserAgent = "BigFixActionGenerator/1.0"
+    $req.KeepAlive = $false
+    $req.Headers["Authorization"] = $AuthHeader
+    $req.ProtocolVersion = [Version]"1.1"
+    $req.PreAuthenticate = $true
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 60000
+    $req.ContentLength = $bytes.Length
+    try {
+        $rs = $req.GetRequestStream(); $rs.Write($bytes,0,$bytes.Length); $rs.Close()
+        $resp = $req.GetResponse()
+        try {
+            $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+            $body = $sr.ReadToEnd(); $sr.Close()
+            if ($body) { LogLine "POST response: $body" }
+        } finally { $resp.Close() }
+    } catch [System.Net.WebException] {
+        $we = $_.Exception
+        if ($we.Response) {
+            try {
+                $sr = New-Object IO.StreamReader($we.Response.GetResponseStream(), [Text.Encoding]::UTF8)
+                $errBody = $sr.ReadToEnd(); $sr.Close()
+                throw "HTTP $($we.Response.StatusCode) :: $($we.Message) :: $errBody"
+            } catch {
+                throw "HTTP error :: $($we.Message)"
+            } finally {
+                $we.Response.Close()
+            }
+        } else {
+            throw ($we.GetBaseException().Message)
+        }
+    } catch {
+        throw ($_.Exception.GetBaseException().Message)
+    }
+}
+
+# =========================
+# FIXLET & GROUP PARSING
+# =========================
+function Get-FixletContainer { param([xml]$Xml)
+    if ($Xml.BES.Fixlet)   { return @{ Type="Fixlet";   Node=$Xml.BES.Fixlet } }
+    if ($Xml.BES.Task)     { return @{ Type="Task";     Node=$Xml.BES.Task } }
+    if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
+    throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
+}
+
+function Get-ActionAndRelevance {
+    param($ContainerNode)
+    $rels = @()
+    $direct = $ContainerNode.SelectNodes("./*[local-name()='Relevance']")
+    if ($direct) { foreach ($n in $direct) { $t = ($n.InnerText).Trim(); if ($t) { $rels += $t } } }
+    if ($rels.Count -eq 0) {
+        $any = $ContainerNode.SelectNodes(".//*[local-name()='Relevance']")
+        if ($any) { foreach ($n in $any) { $t = ($n.InnerText).Trim(); if ($t) { $rels += $t } } }
+    }
+    $act = $null
+    if ($ContainerNode.Action) { $act = $ContainerNode.Action | Select-Object -First 1 }
+    if (-not $act -and $ContainerNode.DefaultAction) { $act = $ContainerNode.DefaultAction }
+    if (-not $act) { throw "No <Action> or <DefaultAction> block found." }
+    $script = $null
+    if ($act.ActionScript) {
+        $script = [string]$act.ActionScript.'#text'
+        if ([string]::IsNullOrWhiteSpace($script)) { $script = $act.ActionScript.InnerText }
+    }
+    if (-not $script) { throw "Action found but no <ActionScript> content present." }
+    LogLine ("Fixlet relevance nodes found: {0}" -f $rels.Count)
+    return @{ Relevance=$rels; ActionScript=$script }
+}
+
+function Parse-FixletTitleToProduct([string]$Title) {
+    ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
+}
+
+# GROUP relevance helpers
+function Extract-AllRelevanceFromXmlString {
+    param([string]$XmlString,[string]$Context = "Unknown")
+    $all = @()
+    try {
+        $x = [xml]$XmlString
+        $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
+        if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
+        if ($all.Count -eq 0) {
+            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
+            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
+        }
+    } catch { LogLine "[$Context] XML parse failed: $($_.Exception.Message)" }
+    if ($AggressiveRegexFallback -and $all.Count -eq 0) {
+        try {
+            $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
+            foreach ($mm in $regex.Matches($XmlString)) { $t = ($mm.Groups[1].Value).Trim(); if ($t) { $all += $t } }
+        } catch { LogLine "[$Context] Regex relevance fallback failed: $($_.Exception.Message)" }
+    }
+    return ,$all
+}
+function Extract-SCRFragments {
+    param([string]$XmlString,[string]$Context="Unknown")
+    $frags = @()
+    try {
+        $x = [xml]$XmlString
+        $scrNodes = $x.SelectNodes("//*[local-name()='SearchComponentRelevance']")
+        if ($scrNodes) {
+            foreach ($n in $scrNodes) {
+                $innerR = $n.SelectNodes(".//*[local-name()='Relevance']")
+                if ($innerR -and $innerR.Count -gt 0) {
+                    foreach ($ir in $innerR) { $t = ($ir.InnerText).Trim(); if ($t) { $frags += $t } }
+                } else {
+                    $t = ($n.InnerText).Trim(); if ($t) { $frags += $t }
+                }
+            }
+        }
+    } catch { LogLine "[$Context] SCR parse failed: $($_.Exception.Message)" }
+    return ,$frags
+}
+function Get-GroupClientRelevance {
+    param([string]$BaseUrl,[string]$AuthHeader,[string]$SiteName,[string]$GroupIdNumeric)
+    $encSite = Encode-SiteName $SiteName
+    $candidates = @(
+        "/api/computergroup/custom/$encSite/$GroupIdNumeric",
+        "/api/computergroup/master/$GroupIdNumeric",
+        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"
+    )
+    foreach ($relPath in $candidates) {
+        $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
+        try {
+            $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
+            if ($DumpFetchedXmlToTemp) {
+                $tmp = Join-Path $env:TEMP ("BES_ComputerGroup_{0}.xml" -f $GroupIdNumeric)
+                Write-Utf8NoBom -Path $tmp -Content $xmlStr
+                LogLine "Saved fetched group XML to: $tmp"
+            }
+            $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
+            if ($rels.Count -gt 0) {
+                $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
+                $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
+                LogLine "Using group relevance from <Relevance> nodes :: ${snippet}..."
+                return $joined
+            }
+            $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
+            if ($frags.Count -gt 0) {
+                $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
+                $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
+                LogLine "Built relevance from SearchComponentRelevance :: ${snippet}..."
+                return $joined
+            }
+            LogLine "No usable relevance at ${url}"
+        } catch {
+            LogLine "Fetch failed at ${url}: $($_.Exception.Message)"
+        }
+    }
+    throw "No relevance found or derivable for group ${GroupIdNumeric} in custom/master/operator."
+}
+
+# =========================
+# ACTION XML BUILDERS
+# =========================
+function Build-SingleActionXml {
+    param(
+        [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
+        [string]$UiBaseTitle,       # Full Fixlet title as shown in Console (e.g., "Update: ... Win")
+        [string]$DisplayName,       # Product-friendly name for messages
+        [string[]]$RelevanceBlocks,
+        [string]$ActionScript,
+        [datetime]$StartLocal,
+        [bool]$IsForce=$false
+    )
+    $fullTitle = "${UiBaseTitle}: $ActionTitle"
+    $titleEsc  = [System.Security.SecurityElement]::Escape($fullTitle)
+    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+
+    $relevanceCombined = ""
+    if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
+        $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { "($_)" }) -join " AND "
+    }
+    $relSafe = $relevanceCombined -replace ']]>', ']]]]><![CDATA[>'
+    $rels = if ([string]::IsNullOrWhiteSpace($relevanceCombined)) { "" } else { "    <Relevance><![CDATA[$relSafe]]></Relevance>" }
+
+    $now = Get-Date
+    $startOffset = To-IsoDuration ($StartLocal - $now)
+    $hasEnd = $false; $endOffsetLine = ""; $deadlineBehaviorBlock = ""
+    if ($IsForce) {
+        $endOffset = To-IsoDuration (($StartLocal.AddHours(24)) - $now)
+        $hasEnd = $true
+        $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
+        $deadlineBehaviorBlock = @"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalOffset>$endOffset</DeadlineLocalOffset>
+"@
+    }
+@"
 <?xml version="1.0" encoding="UTF-8"?>
 <BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
-	<SingleAction>
-		<Title>Update: Igor Pavlov 7-Zip 25.01.00.0 Win: Force</Title>
-		<Relevance><![CDATA[(exists operating system whose ((name of it contains "Win") AND (name of it does not contain "Win2"))) AND ((exists regapp "7ZFM.exe" whose (version of it < "25.1.0.0" as version)))]]></Relevance>
-		<ActionScript MIMEType="application/x-Fixlet-Windows-Shell">prefetch 027a4f609ad3731769c3e2f9f24d7176a746bb90 sha1:027a4f609ad3731769c3e2f9f24d7176a746bb90 size:8273330 http://test.server:52311/Uploads/027a4f609ad3731769c3e2f9f24d7176a746bb90/Files.tmp sha256:047865b312347f319ff00a1c96982623ed1c44dba1dd4ef5f4c468b81f28df2b
-extract 027a4f609ad3731769c3e2f9f24d7176a746bb90
-
-action uses wow64 redirection false
-wait __Download\7-Zip-25.01.00.0.exe -DeployMode Silent</ActionScript>
-		<SuccessCriteria Option="OriginalRelevance"></SuccessCriteria>
-		<Settings>
-			<ActionUITitle>Update: Igor Pavlov 7-Zip 25.01.00.0 Win</ActionUITitle>
-			<PreActionShowUI>true</PreActionShowUI>
-			<PreAction>
-				<Text>7-Zip 25.01 update will be enforced on 8/27/25 at 7:15 am. Please leave your machine on overnight to get the automated update. Otherwise, please close the application and run the update now.</Text>
-				<AskToSaveWork>true</AskToSaveWork>
-				<ShowActionButton>false</ShowActionButton>
-				<ShowCancelButton>false</ShowCancelButton>
-				<DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-				<DeadlineType>Absolute</DeadlineType>
-				<DeadlineLocalOffset>P6DT18H51M18S</DeadlineLocalOffset>
-				<ShowConfirmation>false</ShowConfirmation>
-			</PreAction>
-			<HasRunningMessage>true</HasRunningMessage>
-			<RunningMessage>
-				<Text>Updating to Igor Pavlov 7-Zip 25.01.00.0...please wait.</Text>
-			</RunningMessage>
-			<HasTimeRange>false</HasTimeRange>
-			<HasStartTime>true</HasStartTime>
-			<StartDateTimeLocalOffset>P6DT6H51M18S</StartDateTimeLocalOffset>
-			<HasEndTime>true</HasEndTime>
-			<EndDateTimeLocalOffset>P367D</EndDateTimeLocalOffset>
-			<HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
-			<UseUTCTime>false</UseUTCTime>
-			<ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
-			<ActiveUserType>AllUsers</ActiveUserType>
-			<HasWhose>false</HasWhose>
-			<PreActionCacheDownload>false</PreActionCacheDownload>
-			<Reapply>true</Reapply>
-			<HasReapplyLimit>false</HasReapplyLimit>
-			<HasReapplyInterval>false</HasReapplyInterval>
-			<HasRetry>true</HasRetry>
-			<RetryCount>3</RetryCount>
-			<RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
-			<HasTemporalDistribution>false</HasTemporalDistribution>
-			<ContinueOnErrors>true</ContinueOnErrors>
-			<PostActionBehavior Behavior="Nothing"></PostActionBehavior>
-			<IsOffer>false</IsOffer>
-		</Settings>
-		<SettingsLocks>
-			<ActionUITitle>false</ActionUITitle>
-			<PreActionShowUI>false</PreActionShowUI>
-			<PreAction>
-				<Text>false</Text>
-				<AskToSaveWork>false</AskToSaveWork>
-				<ShowActionButton>false</ShowActionButton>
-				<ShowCancelButton>false</ShowCancelButton>
-				<DeadlineBehavior>false</DeadlineBehavior>
-				<ShowConfirmation>false</ShowConfirmation>
-			</PreAction>
-			<HasRunningMessage>false</HasRunningMessage>
-			<RunningMessage>
-				<Text>false</Text>
-			</RunningMessage>
-			<TimeRange>false</TimeRange>
-			<StartDateTimeOffset>false</StartDateTimeOffset>
-			<EndDateTimeOffset>false</EndDateTimeOffset>
-			<DayOfWeekConstraint>false</DayOfWeekConstraint>
-			<ActiveUserRequirement>false</ActiveUserRequirement>
-			<ActiveUserType>false</ActiveUserType>
-			<Whose>false</Whose>
-			<PreActionCacheDownload>false</PreActionCacheDownload>
-			<Reapply>false</Reapply>
-			<ReapplyLimit>false</ReapplyLimit>
-			<RetryCount>false</RetryCount>
-			<RetryWait>false</RetryWait>
-			<TemporalDistribution>false</TemporalDistribution>
-			<ContinueOnErrors>false</ContinueOnErrors>
-			<PostActionBehavior>
-				<Behavior>false</Behavior>
-				<AllowCancel>false</AllowCancel>
-				<Deadline>false</Deadline>
-				<Title>false</Title>
-				<Text>false</Text>
-			</PostActionBehavior>
-			<IsOffer>false</IsOffer>
-			<AnnounceOffer>false</AnnounceOffer>
-			<OfferCategory>false</OfferCategory>
-			<OfferDescriptionHTML>false</OfferDescriptionHTML>
-		</SettingsLocks>
-		<IsUrgent>false</IsUrgent>
-		<MIMEFieldSingleAction>
-			<Name>action-ui-metadata</Name>
-			<Value>{"icon":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAHgAAAB4CAYAAAA5ZDbSAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsQAAA7EAZUrDhsAAAw7SURBVHhe7Z1nqBVHGIY1auyJPXaNvXcTS9QfikJib9jAioqKsZEoJvmhWP8IsWMLihpFEFE0EQsogoKKChcTUUETEHtviTrhGXYOe/fOuXfnnD1lN/PCi9e7u9/OzrM7ffcWElaRVh7ADx8+FE+ePLEOoWHnVQzwpUuXRL169UTDhg1Fo0aNrENo2MEQlkoxwGxo0aKFaNeunXWIDUNYKknAPNrcAezQvn176xAbhrBUxbUE/PjxY9G4cWMLOAKGISxhagFH0BZwxG0BR9wWcMRtAUfcFnDEbQFH3BZwxG0BR9wWcMRtAUfcFnDEbQFH3BZwxG0BR9wWcMRtAUfcFnDEbQFH3BZwxG0MuGnTpqJKlSqhcOXKlUX9+vVFhw4d8lyHH3P9LDnVxc4Wf/bZZ6JBgwba9GMjwKyxnTJlinjw4IG4detW1vvevXti3bp14vPPP891HX7MtXNzrF27Vty+fVsbPxtM2lauXCnq1q2rfSCNADdr1kzMmDFD7hgW7dy5U9SqVSvXdfhx7dq1xY4dO5wo2a8lS5bI9c/e6zAGPH36dLljWLR9+3ZjwG3bthVt2rQRb9++daJkv/755x9RtmzZPNWRBawxcL/88kvx+vVrJ0r268OHD6JUqVIWsB8D+IsvvhCvXr1yomS/3r9/bwH7dVCA79+/LzZs2CDbLZ06dZKxAYBbt24tpk6dKpYtWyZu3rzpHJG4LGDXdRTkZAFfv35d9O/fX1StWlV2YZo0aSJatWolobpNl5OGUfXq1WV+HzhwwIlgLgvYdR0FORnAdMtq1qwp88qbf/kZ4KRz7NixTiQz/W8B79q1K22AgctTawLWa/rsPXv2dCL61/8W8KJFi+Sb7u7rKMiJAD579qwoV66cNh75iOl+uR3vRmCAZdasWU5kf/pfAj516pSoU6dO3IyM50QAM8rHcd5Y1LMMd5Kf3GjK/B8DE9juY0gv9fIff/zhRC9YgQBu3ry5+Pbbb+WO2a4zZ87I4tKbeX5sCvjy5cuiTJkyuTKXGJx/5MiR4vTp09pBk2vXrolVq1ZJyNwI7jSQ/yZPcSCAySya+wMGDBB9+/ZNufv16yc6duwo61ETkZmffPJJnvT7tSngyZMny9JNHc95qUv//PNPZ4+CNXHiRJnn3jT4VSCAMZBp8qfDNI5GjBghE2YiBt5plXrT7temgEePHi2LaHV8jRo1xP79+52t/sX4t8pz0sDPuk8h6RQY4HQZwFykqbp27ZrraUrEpoDHjBkTA8yN1aVLF2eLmaZNmyarQZUG/n306JGzNX+FCjDnpS959epVmSi/+vnnn427RDqbAh41alQMcMuWLWW9m4iYvaI+VmkAlt/x8FABptVJ98ZEfOyrQoUK2nimNgX8+++/y8UFZC6Ahw4d6mwx08KFC2ONLZ5kkxslNIDJoK+//lomxkSdO3dOqt512xTwu3fvZIlDfmGewhcvXjhb/YsGpSqaWa3x22+/OVsKVmgAly5dWn5n0UQ//fRTIEWzsilgtH79etm4IoMZf/7++++dLf60d+9eufyG47lBJkyY4GzxJ2PADJCnGzBdC+pRE125ckVmjC5eok4EMKLkUcuDTMaVZ86cGTuOUogn2VTGgEuUKCFP5D0gVSZTaf2aChBBFc3KiQJGK1asiNWjzBTRnqCffOTIEXHo0CHpw4cPy0mQcePGyaKdkS31MLH/8ePHxdGjR2P763zw4EH5Lys5UH6ASU8uwE+fPhWFChUSRYsWlTsB2n1Q0CZRNJBycnJkIvxq9erVckhPFzMZmwK+e/euzC817OgePeNnGkz0zRk2VQYkLW9dKcnT7N5XZ3VjPHv2TKYhHmCug7xV3a0Y4MKFC8tEYx5xNWGdClNnmdY5TKbHW0mYrE0BMxhB24FjU5EenUkjTFRjzguYhxIzhApDmCItYMyTwjqloIts7nCKMp4CEzG4QDtBFzNZJwLYOxadascDDFQ4USwXKVIkxq9AwJiL4A7l4nUnTcQ8hcuXL5cn9ysaVhRjqXpaEgHMisZUV2Vuk0a6hm7A8AE6rXk3N1j6AqxMXUMGJHvHkkiGJF++fClP7lfdu3fPNfYbtE0Bs8CefKFupPWcDlOiwkHVwayq/Pjjj+VT7OVlDBgzW0PrNZmnmUSazhQdO3ZM3qG6eEHZFDCzV5s3bxZ79uwRv/76a1q8e/du+a9qRSMdJ5wQYOVq1arFKnRdZsUzNwdFjKk4T9DdIq9NAWeLdHxwUoCVqUuZRfELmsGJffv2yZP61YULF0T58uVT3pixgPMx/Tsq+vxAk4H8ayriqmNTaQu4AH/00UeywQFkXR1NJ506xEQse2HGxhsrFbaAfRrQNIjIMNWHpt9L//Xff/+VJ/SrXr16yRa3DkjQtoATMK1uRsQYteJ9VhOxupC6VwcjFfYCnjdvnhwn5wbF3GjupUT0gytVqiRLLLVPIuacPAicn371/PnznTP4ky7fcVoAu+1u2vvRsGHDYktZ0mEvYFY3MtrG7zGwBw4cKLchXogvWbKkHHhR+/gxpZkarKFnwOANcVQ+ma6Nduex22kFPGTIEHkiv2IIM1VjzvFM5rsBz5kzJ9ewKIsSBg8eLLchk6FK9aTytHMeBiso3dzDisqc10Te45XTCth0nRWvgwBYl1mpcpCA+Z1qbGKKdxqZ7K/LH7dDB5gZF1ORmWQ4gyLqzvfzpCRjL2CKSqbmKEYxA/msDVeiiGb+nCKXY1XRi2l3sADeXfT6telLBroYOG2Av/vuO3kSvzpx4kSu45nXpFWu6kMg0DemYaLgB3EDeAEvWLBAxuzWrZs053QviAMwT+VXX30loTJOzv8ZzAEuQ7KkmzFk1j77MY1KFuGZyJ1XbqcNcCKNK10ct4sXLy4zgyFTMlBNpKvhTIADRN0I6maIZ9WdY1ROAQ6LdPmD0wI4kXFnugq6WCbmOnCxYsXkTAsNmooVK8rSADN4on7GvCFIccuqRgvYwHzKwESsN9LFSZe5CSxgA5uuEx4+fLg2TrrMwEU6v7LDnDitcRbHYX5+/vy5s9WfdNeBUw6YFqipKCZ1sdJlE8BMuvfo0UO2Geg+8TVAU9El4rxUJZifQzPQwdfmTMTb8ro46bQJYJ427/HcoCaNSoZDvTFmz57tbPUn7/HKKQVMnL/++ksG9yt1N2fSJoApUnUxaNTduHHD2St/0YX0Hh+KgQ4mF0zFVKMuVjodBGDlc+fOOXvGV2gB//jjjzKwX1Gf6eKk20ECxosXL3b21iu0gBmNMhHfrNDFSbeDBozzazSFEjCDCG/evJGB/YoXtnSx0u1UAMbx3h0OJWBmYEzF+K0uVrqdKsCYyQhvCzuUgE2b+UgXJxNOFjB94U8//TTP75WZZfr777+dCCEFbPKGOjp//rw2TiacLGAWpfNRUu/vveZbWYgv0nq3ZT1gptFMxDtKujiZcLKAeeMf8bUCZry8293m1RddjKwGzNQdL0SZ6JtvvtHGyoSDAqzEeivvPm7zyQfv77IaMGOzpmKlhC5WJhw0YEQL2rtffs5qwEuXLpUBTaSLkymnAjACmnffeM5qwJs2bZIB/YrP2uviZMqpAoxYF+7dX+esBmy6epIvturiZMqpBIz4eJr3GK+zGjBTaCb64YcftHEy5VQDRhcvXpTrybzHKmctYBZxm7ag586dq42VKZsA1s0H+/3eF5Mr8daeZS1gFqyZir9ToIuVKZsAZjnSoEGDxKRJk6RZUst3rkzEik5vGsaPH+9s9Sfv8cqBA+ZNQFNlUx8YmwAOSnwsjddk+VMEJ0+eNPqkP9JdBw4ccCJ9YNYx62JlypkAnKx014EDB9ynTx8ZzK/4QgzrkXWxMmWqGdOpzkxLdx04cMCmdQdiHbIuViatMiUMunPnjvYacOCAaWiYisUBuliZNB8LDYt69+6tvQYcOGBewuKbUVu2bCnQ27ZtE7/88ouv1ykzYd5t2rhxo9i6das2/Zk0ebdmzRr5Qrou7cqBA7bOLlvAEbcFHHFbwBG3BRxxW8ARtwUccVvAEbcFHHFbwBG3BRxxW8ARtwUccVvAEbcFHHFbwBG3BRxxW8ARtwUccVvAEbcFHHHnAcyfA9ftaB1e5/oT7yiIr61bZ4dhqRQDnJOTYyFHwDCEpVIMsBKPNuW3dfisimW38gC2ipKE+A+WJKSoZQxpBQAAAABJRU5ErkJggg=="}</Value>
-		</MIMEFieldSingleAction>
-	</SingleAction>
+  <SingleAction>
+    <Title>$titleEsc</Title>
+$rels
+    <ActionScript MIMEType="application/x-Fixlet-Windows-Shell"><![CDATA[
+$ActionScript
+]]></ActionScript>
+    <SuccessCriteria Option="RunToCompletion" />
+    <Settings>
+      <ActionUITitle>$titleEsc</ActionUITitle>
+      <PreActionShowUI>true</PreActionShowUI>
+      <PreAction>
+        <Text>$dispEsc update will be enforced on $((Get-Date $StartLocal).ToString('M/d/yy h:mm tt')). Please save your work.</Text>
+        <AskToSaveWork>true</AskToSaveWork>
+        <ShowActionButton>false</ShowActionButton>
+        <ShowCancelButton>false</ShowCancelButton>$deadlineBehaviorBlock        <ShowConfirmation>false</ShowConfirmation>
+      </PreAction>
+      <HasRunningMessage>true</HasRunningMessage>
+      <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
+      <HasTimeRange>false</HasTimeRange>
+      <HasStartTime>true</HasStartTime>
+      <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
+      <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
+$endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
+      <UseUTCTime>false</UseUTCTime>
+      <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
+      <ActiveUserType>AllUsers</ActiveUserType>
+      <HasWhose>false</HasWhose>
+      <PreActionCacheDownload>false</PreActionCacheDownload>
+      <Reapply>true</Reapply>
+      <HasReapplyLimit>false</HasReapplyLimit>
+      <HasReapplyInterval>false</HasReapplyInterval>
+      <HasRetry>true</HasRetry>
+      <RetryCount>3</RetryCount>
+      <RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
+      <HasTemporalDistribution>false</HasTemporalDistribution>
+      <ContinueOnErrors>true</ContinueOnErrors>
+      <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
+      <IsOffer>false</IsOffer>
+    </Settings>
+    <Target><AllComputers>true</AllComputers></Target>
+  </SingleAction>
 </BES>
+"@
+}
+
+# SourcedFixletAction builder — adds <Title> AFTER </Settings> to name the action
+function Build-SourcedFixletActionXml {
+    param(
+        [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
+        [string]$UiBaseTitle,       # Full Fixlet title ("Update: ... Win")
+        [string]$DisplayName,       # Product-friendly name for messages
+        [string]$SiteName,          # Custom site name
+        [string]$FixletId,          # Fixlet ID
+        [string]$FixletActionName,  # MUST match an existing action name in the Fixlet (e.g., "Action1")
+        [string]$GroupRelevance,    # Group filter to AND with fixlet relevance
+        [datetime]$StartLocal,      # Scheduled local start (absolute)
+        [bool]$IsForce = $false     # Force adds end offset (start+24h)
+    )
+
+    $fullTitle = "${UiBaseTitle}: $ActionTitle"
+    $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
+    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+
+    if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { $groupSafe = "" } else { $groupSafe = $GroupRelevance }
+    $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
+
+    $now = Get-Date
+    $startOffset = To-IsoDuration ($StartLocal - $now)
+
+    $hasEnd = $false
+    $endOffsetLine = ""
+    $deadlineBehaviorBlock = ""
+    if ($IsForce) {
+        $endOffset = To-IsoDuration (($StartLocal.AddHours(24)) - $now)
+        $hasEnd = $true
+        $endOffsetLine = "      <EndDateTimeLocalOffset>$endOffset</EndDateTimeLocalOffset>`n"
+        $deadlineBehaviorBlock = @"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalOffset>$endOffset</DeadlineLocalOffset>
+"@
+    }
+
+@"
+<?xml version="1.0" encoding="UTF-8"?>
+<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
+  <SourcedFixletAction>
+    <SourceFixlet>
+      <Sitename>$SiteName</Sitename>
+      <FixletID>$FixletId</FixletID>
+      <Action>$FixletActionName</Action>
+    </SourceFixlet>
+    <Target>
+      <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
+    </Target>
+    <Settings>
+      <ActionUITitle>$uiTitle</ActionUITitle>
+      <PreActionShowUI>true</PreActionShowUI>
+      <PreAction>
+        <Text>$dispEsc update will be enforced on $((Get-Date $StartLocal).ToString('M/d/yy h:mm tt')). Please save your work.</Text>
+        <AskToSaveWork>true</AskToSaveWork>
+        <ShowActionButton>false</ShowActionButton>
+        <ShowCancelButton>false</ShowCancelButton>$deadlineBehaviorBlock        <ShowConfirmation>false</ShowConfirmation>
+      </PreAction>
+      <HasRunningMessage>true</HasRunningMessage>
+      <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
+      <HasTimeRange>false</HasTimeRange>
+      <HasStartTime>true</HasStartTime>
+      <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
+      <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
+$endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
+      <UseUTCTime>false</UseUTCTime>
+      <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
+      <ActiveUserType>AllUsers</ActiveUserType>
+      <HasWhose>false</HasWhose>
+      <PreActionCacheDownload>false</PreActionCacheDownload>
+      <Reapply>true</Reapply>
+      <HasReapplyLimit>false</HasReapplyLimit>
+      <HasReapplyInterval>false</HasReapplyInterval>
+      <HasRetry>true</HasRetry>
+      <RetryCount>3</RetryCount>
+      <RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
+      <HasTemporalDistribution>false</HasTemporalDistribution>
+      <ContinueOnErrors>true</ContinueOnErrors>
+      <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
+      <IsOffer>false</IsOffer>
+    </Settings>
+    <Title>$uiTitle</Title>
+  </SourcedFixletAction>
+</BES>
+"@
+}
+
+# =========================
+# GUI
+# =========================
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "BigFix Action Generator"
+$form.Size = New-Object System.Drawing.Size(640, 780)
+$form.StartPosition = "CenterScreen"
+
+$y = 20
+function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB) {
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Label
+    $lbl.Location = New-Object System.Drawing.Point(10,$script:y)
+    $lbl.Size = New-Object System.Drawing.Size(140,22)
+    $form.Controls.Add($lbl)
+
+    if ($IsPassword) { $tb = New-Object System.Windows.Forms.MaskedTextBox; $tb.PasswordChar = '*' }
+    else { $tb = New-Object System.Windows.Forms.TextBox }
+    $tb.Location = New-Object System.Drawing.Point(160,$script:y)
+    $tb.Size = New-Object System.Drawing.Size(440,22)
+    $form.Controls.Add($tb)
+    $OutTB.Value = $tb
+    $script:y += 34
+}
+
+$tbServer = $null; Add-Field "BigFix Server:" $false ([ref]$tbServer)
+$tbUser   = $null; Add-Field "Username:"      $false ([ref]$tbUser)
+$tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
+$tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
+
+# Date (future Wednesdays)
+$lblDate = New-Object Windows.Forms.Label
+$lblDate.Text = "Schedule Date (Wed):"
+$lblDate.Location = New-Object System.Drawing.Point(10,$y)
+$lblDate.Size = New-Object System.Drawing.Size(140,22)
+$form.Controls.Add($lblDate)
+
+$cbDate = New-Object System.Windows.Forms.ComboBox
+$cbDate.DropDownStyle = 'DropDownList'
+$cbDate.Location = New-Object System.Drawing.Point(160,$y)
+$cbDate.Size = New-Object System.Drawing.Size(160,22)
+$form.Controls.Add($cbDate)
+$y += 34
+# next 20 Wednesdays
+$today = Get-Date
+$daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
+$nextWed = $today.AddDays($daysUntilWed)
+for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
+
+# Time (8:00 PM – 11:45 PM, 15m)
+$lblTime = New-Object System.Windows.Forms.Label
+$lblTime.Text = "Schedule Time:"
+$lblTime.Location = New-Object System.Drawing.Point(10,$y)
+$lblTime.Size = New-Object System.Drawing.Size(140,22)
+$form.Controls.Add($lblTime)
+
+$cbTime = New-Object System.Windows.Forms.ComboBox
+$cbTime.DropDownStyle = 'DropDownList'
+$cbTime.Location = New-Object System.Drawing.Point(160,$y)
+$cbTime.Size = New-Object System.Drawing.Size(160,22)
+$form.Controls.Add($cbTime)
+$y += 42
+$start = Get-Date "20:00"; $end = Get-Date "23:45"
+while ($start -le $end) { [void]$cbTime.Items.Add($start.ToString("h:mm tt")); $start = $start.AddMinutes(15) }
+
+# Button
+$btn = New-Object System.Windows.Forms.Button
+$btn.Text = "Generate & Post 4 Actions (Pilot/Deploy/Force/Conf)"
+$btn.Location = New-Object System.Drawing.Point(160,$y)
+$btn.Size = New-Object System.Drawing.Size(320,32)
+$form.Controls.Add($btn)
+$y += 42
+
+# Log
+$LogBox = New-Object System.Windows.Forms.TextBox
+$LogBox.Multiline = $true
+$LogBox.ScrollBars = "Vertical"
+$LogBox.ReadOnly = $false
+$LogBox.WordWrap = $false
+$LogBox.Location = New-Object System.Drawing.Point(10,$y)
+$LogBox.Size = New-Object System.Drawing.Size(600,520)
+$LogBox.ContextMenu = New-Object System.Windows.Forms.ContextMenu
+$LogBox.ContextMenu.MenuItems.AddRange(@(
+    (New-Object System.Windows.Forms.MenuItem "Copy",      { $LogBox.Copy() }),
+    (New-Object System.Windows.Forms.MenuItem "Select All", { $LogBox.SelectAll() })
+))
+$LogBox.Anchor = "Top,Left,Right,Bottom"
+$form.Controls.Add($LogBox)
+
+# =========================
+# ACTION
+# =========================
+$btn.Add_Click({
+    $LogBox.Clear()
+    $server = $tbServer.Text.Trim()
+    $user   = $tbUser.Text.Trim()
+    $pass   = $tbPass.Text
+    $fixId  = $tbFixlet.Text.Trim()
+    $dStr   = $cbDate.SelectedItem
+    $tStr   = $cbTime.SelectedItem
+
+    if (-not ($server -and $user -and $pass -and $fixId -and $dStr -and $tStr)) {
+        LogLine "❌ Please fill in Server, Username, Password, Fixlet ID, Date, and Time."
+        return
+    }
+
+    try {
+        $base = Get-BaseUrl $server
+        $encodedSite = Encode-SiteName $CustomSiteName
+        $fixletUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/fixlet/custom/$encodedSite/$fixId"
+        LogLine "Encoded Fixlet GET URL: ${fixletUrl}"
+
+        $auth = Get-AuthHeader -User $user -Pass $pass
+        $fixletContent = HttpGetXml -Url $fixletUrl -AuthHeader $auth
+        if ($DumpFetchedXmlToTemp) {
+            $tmpFix = Join-Path $env:TEMP ("BES_Fixlet_{0}.xml" -f $fixId)
+            Write-Utf8NoBom -Path $tmpFix -Content $fixletContent
+            LogLine "Saved fetched fixlet XML to: $tmpFix"
+        }
+
+        $fixletXml = [xml]$fixletContent
+        $cont = Get-FixletContainer -Xml $fixletXml
+        LogLine ("Detected BES content type: {0}" -f $cont.Type)
+
+        $titleRaw = [string]$cont.Node.Title
+        $displayName = Parse-FixletTitleToProduct -Title $titleRaw
+
+        $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
+        $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
+        $actionScript = $parsed.ActionScript
+
+        LogLine "Parsed title (console): ${titleRaw}"
+        LogLine "Display name (messages): ${displayName}"
+        LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
+        LogLine ("Action script length: {0}" -f $actionScript.Length)
+
+        # Absolute schedule (user picks local date/time)
+        $startLocal = Get-Date "$dStr $tStr"
+
+        $actions = @("Pilot","Deploy","Force","Conference/Training Rooms")
+        $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
+        LogLine "POST URL: ${postUrl}"
+
+        foreach ($a in $actions) {
+            $groupIdRaw = "$($GroupMap[$a])"
+            if (-not $groupIdRaw) { LogLine "❌ Missing group id for $($a)"; continue }
+            $groupIdNumeric = Get-NumericGroupId $groupIdRaw
+            if (-not $groupIdNumeric) { LogLine "❌ Could not parse numeric ID from '${groupIdRaw}' for $($a)"; continue }
+
+            # fetch group relevance
+            try {
+                $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
+                LogLine ("Group relevance len ({0}): {1}" -f $a, $groupRel.Length)
+            } catch {
+                LogLine "❌ Could not fetch/build group relevance for $($a): $($_.Exception.Message)"
+                continue
+            }
+
+            $isForce = ($a -eq "Force")
+            $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
+
+            if ($ActionMode -ieq 'Sourced') {
+                $xmlBody = Build-SourcedFixletActionXml `
+                    -ActionTitle      $a `
+                    -UiBaseTitle      $titleRaw `
+                    -DisplayName      $displayName `
+                    -SiteName         $CustomSiteName `
+                    -FixletId         $fixId `
+                    -FixletActionName $fixletActionName `
+                    -GroupRelevance   $groupRel `
+                    -StartLocal       $startLocal `
+                    -IsForce:$isForce
+            } else {
+                $allRel = @(); $allRel += $fixletRelevance; if ($groupRel) { $allRel += $groupRel }
+                $xmlBody = Build-SingleActionXml `
+                    -ActionTitle     $a `
+                    -UiBaseTitle     $titleRaw `
+                    -DisplayName     $displayName `
+                    -RelevanceBlocks $allRel `
+                    -ActionScript    $actionScript `
+                    -StartLocal      $startLocal `
+                    -IsForce:$isForce
+            }
+
+            $xmlBodyToSend = Normalize-XmlForPost $xmlBody
+            $hex = Get-FirstBytesHex $xmlBodyToSend 32
+            LogLine ("First 32 bytes (hex) for {0}: {1}" -f $a, $hex)
+
+            $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
+            $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
+            if ($SaveActionXmlToTemp) {
+                Write-Utf8NoBom -Path $tmpAction -Content $xmlBodyToSend
+                LogLine "Saved action XML for $a to: $tmpAction"
+                LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
+            }
+
+            try {
+                if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
+                    LogLine "Posting via Invoke-WebRequest (curl-like) using file: $tmpAction"
+                    Post-XmlFile-InFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
+                } else {
+                    LogLine "Posting via HttpWebRequest body (direct bytes)"
+                    $authHeader = Get-AuthHeader -User $user -Pass $pass
+                    HttpPostXml -Url $postUrl -AuthHeader $authHeader -XmlBody $xmlBodyToSend
+                }
+                LogLine ("✅ {0} posted successfully." -f $a)
+            } catch {
+                LogLine ("❌ POST failed for {0}: {1}" -f $a, $_.Exception.Message)
+            }
+        }
+
+        LogLine "All actions attempted. Log file: $LogFile"
+    }
+    catch {
+        LogLine ("❌ Fatal error: {0}" -f ($_.Exception.GetBaseException().Message))
+    }
+})
+
+$form.Topmost = $false
+[void]$form.ShowDialog()
