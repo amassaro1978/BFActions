@@ -72,25 +72,16 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-# Build “Update: Vendor App Version” for user messages? You asked to use just display name there,
-# so this helper is retained only if needed elsewhere.
-function Build-MessageTitle([string]$FixletTitle) {
-    $t = $FixletTitle -replace '\s+Win$',''
-    return $t.Trim()
-}
-# UTF8 no-BOM write
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
-# Strip BOM/leading whitespace (safety)
 function Normalize-XmlForPost([string]$s) {
     if (-not $s) { return $s }
     $noBom = $s -replace "^\uFEFF",""
     $noLeadWs = $noBom -replace '^\s+',''
     return $noLeadWs
 }
-# Hex preview (debug)
 function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     if (-not $s) { return "" }
     $bytes = [Text.Encoding]::UTF8.GetBytes($s)
@@ -99,7 +90,6 @@ function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     for ($i = 0; $i -lt $take; $i++) { [void]$sb.AppendFormat("{0:X2} ", $bytes[$i]) }
     $sb.ToString().TrimEnd()
 }
-# Next specific weekday AFTER the given date (never same day)
 function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
     $anchor = $base.Date
     $delta = ([int]$weekday - [int]$anchor.DayOfWeek + 7) % 7
@@ -137,7 +127,6 @@ function HttpGetXml {
     }
 }
 
-# curl-like POST using a file on disk
 function Post-XmlFile-InFile {
     param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
     try {
@@ -161,7 +150,6 @@ function Post-XmlFile-InFile {
     }
 }
 
-# Direct-byte POST (fallback)
 function HttpPostXml {
     param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
     $bytes = [Text.Encoding]::UTF8.GetBytes($XmlBody)
@@ -305,7 +293,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML (SourcedFixletAction with ABSOLUTE times, ordered for TimeRange + Deadline)
+# ACTION XML (SourcedFixletAction with ABSOLUTE times; TimeRange always emitted)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -315,7 +303,7 @@ function Build-SourcedFixletActionXml {
         [string]$SiteName,          # Custom site name
         [string]$FixletId,          # Fixlet ID
         [string]$FixletActionName,  # "Action1" or a named action that exists in the Fixlet
-        [string]$GroupRelevance,    # Group filter to AND with fixlet relevance
+        [string]$GroupRelevance,    # Group filter
         [datetime]$StartLocal,      # absolute start (local)
         [Nullable[datetime]]$EndLocal = $null,           # optional absolute end (local)
         [Nullable[datetime]]$DeadlineLocal = $null,      # optional absolute deadline (local)
@@ -332,13 +320,13 @@ function Build-SourcedFixletActionXml {
     $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
     $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Ensure exact seconds (:00)
+    # Exact seconds (:00)
     $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
     if ($EndLocal.HasValue)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
     if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
-    # Sanitize relevance
-    if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { $groupSafe = "" } else { $groupSafe = $GroupRelevance }
+    # Group relevance
+    $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
     # End block
@@ -348,7 +336,7 @@ function Build-SourcedFixletActionXml {
         $endLine = "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
     }
 
-    # Build TimeRange early in Settings (order matters)
+    # TimeRange: ALWAYS emit HasTimeRange; include TimeRange only when true
     $timeRangeBlock = ""
     if ($HasTimeRange -and $TimeRangeStart.HasValue -and $TimeRangeEnd.HasValue) {
         $trs = if ($TimeRangeStart.Value.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes } else { "PT{0}H" -f $TimeRangeStart.Value.Hours }
@@ -364,31 +352,26 @@ function Build-SourcedFixletActionXml {
         $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     }
 
-    # PreAction (user-facing) — always use DisplayName (not the action-suffixed title)
+    # PreAction (ONLY when needed). Deadline is absolute and lives INSIDE PreAction for SourcedFixletAction.
     $preActionBlock = ""
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
-        $preActionBlock = @"
-      <PreActionShowUI>true</PreActionShowUI>
+        $deadlineInner = ""
+        if ($DeadlineLocal.HasValue) {
+$deadlineInner = @"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
+"@
+        }
+$preActionBlock = @"
       <PreAction>
         <Text>$preEsc</Text>
         <AskToSaveWork>$($AskToSaveWork.ToString().ToLower())</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
         <ShowCancelButton>false</ShowCancelButton>
-        <ShowConfirmation>false</ShowConfirmation>
+$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
       </PreAction>
-"@
-    } else {
-        $preActionBlock = "      <PreActionShowUI>false</PreActionShowUI>"
-    }
-
-    # Deadline (Force) — ABSOLUTE timestamp (directly under Settings, not in PreAction)
-    $deadlineBlock = ""
-    if ($DeadlineLocal.HasValue) {
-        $deadlineBlock = @"
-      <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-      <DeadlineType>Absolute</DeadlineType>
-      <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
 "@
     }
 
@@ -413,7 +396,7 @@ $preActionBlock
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocal>$($StartLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</StartDateTimeLocal>
       <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
-$endLine$deadlineBlock      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
+$endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
       <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
@@ -435,9 +418,6 @@ $endLine$deadlineBlock      <HasDayOfWeekConstraint>false</HasDayOfWeekConstrain
 </BES>
 "@
 }
-
-# (SingleAction builder kept inert)
-function Build-SingleActionXml { "<!-- SingleAction path intentionally omitted in this build -->" }
 
 # =========================
 # GUI
@@ -482,7 +462,6 @@ $cbDate.Location = New-Object System.Drawing.Point(160,$y)
 $cbDate.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbDate)
 $y += 34
-# next 20 Wednesdays
 $today = Get-Date
 $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
@@ -561,8 +540,6 @@ $btn.Add_Click({
 
         $fixletXml = [xml]$fixletContent
         $cont = Get-FixletContainer -Xml $fixletXml
-        LogLine ("Detected BES content type: {0}" -f $cont.Type)
-
         $titleRaw     = [string]$cont.Node.Title
         $displayName  = Parse-FixletTitleToProduct -Title $titleRaw   # e.g., "The GIMP Team GIMP 3.0.4"
 
@@ -570,29 +547,26 @@ $btn.Add_Click({
         $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
         $actionScript = $parsed.ActionScript
 
-        LogLine "Parsed title (console): ${titleRaw}"
+        LogLine ("Detected BES content type: {0}" -f $cont.Type)
+        LogLine "Console title: ${titleRaw}"
         LogLine "Display name (messages): ${displayName}"
-        LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
-        LogLine ("Action script length: {0}" -f $actionScript.Length)
 
-        # Absolute schedule (user picks local date/time) – exact seconds :00
+        # Exact absolute schedule
         $pilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
         $pilotStart = $pilotStart.Date.AddHours($pilotStart.Hour).AddMinutes($pilotStart.Minute)
 
-        # Derived schedules per action — exact seconds :00
         $deployStart     = $pilotStart.AddDays(1)
         $confStart       = $pilotStart.AddDays(1)
-        $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59) # next day 6:59 AM
-        $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning 6:55 AM
+        $pilotEnd        = $pilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)
+        $deployEnd       = $deployStart.Date.AddDays(1).AddHours(6).AddMinutes(55)
 
-        # Force: next Tuesday 7:00 AM after Pilot, with absolute deadline Wednesday 7:00 AM
         $forceStartDate  = Get-NextWeekday -base $pilotStart -weekday ([DayOfWeek]::Tuesday)
-        $forceStart      = $forceStartDate.AddHours(7) # Tue 7:00 AM
-        $forceEnforce    = $forceStart.AddDays(1)      # Wed 7:00 AM
+        $forceStart      = $forceStartDate.AddHours(7)     # Tue 7:00 AM
+        $forceEnforce    = $forceStart.AddDays(1)          # Wed 7:00 AM
 
         # TimeRange window (7:00 PM–6:59 AM)
-        $trStart = [TimeSpan]::FromHours(19)                                   # 7:00 PM
-        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))   # 6:59 AM
+        $trStart = [TimeSpan]::FromHours(19)
+        $trEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))
 
         $actions = @(
             @{ Name="Pilot"; Start=$pilotStart; End=$pilotEnd; TR=$true;  TRS=$trStart; TRE=$trEnd; UI=$false; Msg="";    Save=$false; Deadline=$null },
@@ -625,32 +599,25 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            if ($ActionMode -ieq 'Sourced') {
-                $xmlBody = Build-SourcedFixletActionXml `
-                    -ActionTitle      $a `
-                    -UiBaseTitle      $titleRaw `
-                    -DisplayName      $displayName `
-                    -SiteName         $CustomSiteName `
-                    -FixletId         $fixId `
-                    -FixletActionName $fixletActionName `
-                    -GroupRelevance   $groupRel `
-                    -StartLocal       $cfg.Start `
-                    -EndLocal         $cfg.End `
-                    -DeadlineLocal    $cfg.Deadline `
-                    -HasTimeRange     $cfg.TR `
-                    -TimeRangeStart   $cfg.TRS `
-                    -TimeRangeEnd     $cfg.TRE `
-                    -ShowPreActionUI  $cfg.UI `
-                    -PreActionText    $cfg.Msg `
-                    -AskToSaveWork    $cfg.Save
-            } else {
-                $xmlBody = "<!-- SingleAction path intentionally omitted in this build -->"
-            }
+            $xmlBody = Build-SourcedFixletActionXml `
+                -ActionTitle      $a `
+                -UiBaseTitle      $titleRaw `
+                -DisplayName      $displayName `
+                -SiteName         $CustomSiteName `
+                -FixletId         $fixId `
+                -FixletActionName $fixletActionName `
+                -GroupRelevance   $groupRel `
+                -StartLocal       $cfg.Start `
+                -EndLocal         $cfg.End `
+                -DeadlineLocal    $cfg.Deadline `
+                -HasTimeRange     $cfg.TR `
+                -TimeRangeStart   $cfg.TRS `
+                -TimeRangeEnd     $cfg.TRE `
+                -ShowPreActionUI  $cfg.UI `
+                -PreActionText    $cfg.Msg `
+                -AskToSaveWork    $cfg.Save
 
             $xmlBodyToSend = Normalize-XmlForPost $xmlBody
-            $hex = Get-FirstBytesHex $xmlBodyToSend 32
-            LogLine ("First 32 bytes (hex) for {0}: {1}" -f $a, $hex)
-
             $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
             $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
             if ($SaveActionXmlToTemp) {
