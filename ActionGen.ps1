@@ -406,7 +406,7 @@ $endOffsetLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
 "@
 }
 
-# PS5.1-safe SourcedFixletAction builder (SourceFixlet -> Target -> Settings; no Title; CustomRelevance only)
+# PS5.1-safe SourcedFixletAction builder (SourceFixlet -> Target -> Settings; no <Title>; adds <ActionName>)
 function Build-SourcedFixletActionXml {
     param(
         [string]$ActionTitle,     # Pilot/Deploy/Force/Conference...
@@ -456,6 +456,7 @@ function Build-SourcedFixletActionXml {
       <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
     </Target>
     <Settings>
+      <ActionName>$uiTitle</ActionName>
       <ActionUITitle>$uiTitle</ActionUITitle>
       <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
