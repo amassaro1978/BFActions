@@ -19,7 +19,6 @@ $GroupMap = @{
 }
 
 # Map rollout to the **existing Fixlet Action name** to invoke.
-# Leave as "Action1" if your Fixlet only has one action; otherwise match your named action(s).
 $FixletActionNameMap = @{
     "Pilot"                     = "Action1"
     "Deploy"                    = "Action1"
@@ -27,7 +26,7 @@ $FixletActionNameMap = @{
     "Conference/Training Rooms" = "Action1"
 }
 
-# Always use Sourced (lives under the Fixlet's site). Single kept for completeness.
+# Always use Sourced (lives under the Fixlet's site).
 $ActionMode = 'Sourced'   # 'Sourced' or 'Single'
 
 # Behavior toggles
@@ -73,24 +72,23 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-
-# Build “Update: Vendor App Version” for messages (strip trailing " Win")
+# Build “Update: Vendor App Version” for user messages? You asked to use just display name there,
+# so this helper is retained only if needed elsewhere.
 function Build-MessageTitle([string]$FixletTitle) {
     $t = $FixletTitle -replace '\s+Win$',''
     return $t.Trim()
 }
-
-# Normalize leading BOM/whitespace so POST starts with '<'
+# UTF8 no-BOM write
+function Write-Utf8NoBom([string]$Path,[string]$Content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+# Strip BOM/leading whitespace (safety)
 function Normalize-XmlForPost([string]$s) {
     if (-not $s) { return $s }
     $noBom = $s -replace "^\uFEFF",""
     $noLeadWs = $noBom -replace '^\s+',''
     return $noLeadWs
-}
-# UTF8 (no BOM) file write
-function Write-Utf8NoBom([string]$Path,[string]$Content) {
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
 # Hex preview (debug)
 function Get-FirstBytesHex([string]$s, [int]$n = 32) {
@@ -307,13 +305,13 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML (SourcedFixletAction with ABSOLUTE times)
+# ACTION XML (SourcedFixletAction with ABSOLUTE times, ordered for TimeRange + Deadline)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
         [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
         [string]$UiBaseTitle,       # Full Fixlet title ("Update: ... Win")
-        [string]$MessageTitle,      # Clean message title ("Update: ...")
+        [string]$DisplayName,       # For user messages ("The GIMP Team GIMP 3.0.4")
         [string]$SiteName,          # Custom site name
         [string]$FixletId,          # Fixlet ID
         [string]$FixletActionName,  # "Action1" or a named action that exists in the Fixlet
@@ -329,10 +327,10 @@ function Build-SourcedFixletActionXml {
         [bool]$AskToSaveWork = $false
     )
 
-    # Console action name (keeps suffix)
+    # Console action name (keeps suffix like ": Pilot")
     $fullTitle = "${UiBaseTitle}: $ActionTitle"
     $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
-    $msgTitle  = [System.Security.SecurityElement]::Escape($MessageTitle)
+    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
 
     # Ensure exact seconds (:00)
     $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
@@ -350,22 +348,11 @@ function Build-SourcedFixletActionXml {
         $endLine = "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
     }
 
-    # Deadline (Force) — ABSOLUTE timestamp
-    $deadlineBlock = ""
-    if ($DeadlineLocal.HasValue) {
-        $deadlineBlock = @"
-        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-        <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
-"@
-    }
-
-    # TimeRange block
+    # Build TimeRange early in Settings (order matters)
     $timeRangeBlock = ""
     if ($HasTimeRange -and $TimeRangeStart.HasValue -and $TimeRangeEnd.HasValue) {
-        $trs = "PT{0}H{1}M" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes
-        $tre = if ($TimeRangeEnd.Value.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeEnd.Value.Hours, $TimeRangeEnd.Value.Minutes }
-               else { "PT{0}H" -f $TimeRangeEnd.Value.Hours }
+        $trs = if ($TimeRangeStart.Value.Minutes -gt 0) { "PT{0}H{1}M" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes } else { "PT{0}H" -f $TimeRangeStart.Value.Hours }
+        $tre = if ($TimeRangeEnd.Value.Minutes -gt 0)   { "PT{0}H{1}M" -f $TimeRangeEnd.Value.Hours,   $TimeRangeEnd.Value.Minutes   } else { "PT{0}H" -f $TimeRangeEnd.Value.Hours }
         $timeRangeBlock = @"
       <HasTimeRange>true</HasTimeRange>
       <TimeRange>
@@ -377,7 +364,7 @@ function Build-SourcedFixletActionXml {
         $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     }
 
-    # PreAction (only if requested) — uses clean message title
+    # PreAction (user-facing) — always use DisplayName (not the action-suffixed title)
     $preActionBlock = ""
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
@@ -387,14 +374,22 @@ function Build-SourcedFixletActionXml {
         <Text>$preEsc</Text>
         <AskToSaveWork>$($AskToSaveWork.ToString().ToLower())</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
-        <ShowCancelButton>false</ShowCancelButton>$deadlineBlock        <ShowConfirmation>false</ShowConfirmation>
+        <ShowCancelButton>false</ShowCancelButton>
+        <ShowConfirmation>false</ShowConfirmation>
       </PreAction>
 "@
     } else {
         $preActionBlock = "      <PreActionShowUI>false</PreActionShowUI>"
-        if ($deadlineBlock) {
-            $preActionBlock += "`n      " + $deadlineBlock.Trim()
-        }
+    }
+
+    # Deadline (Force) — ABSOLUTE timestamp (directly under Settings, not in PreAction)
+    $deadlineBlock = ""
+    if ($DeadlineLocal.HasValue) {
+        $deadlineBlock = @"
+      <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+      <DeadlineType>Absolute</DeadlineType>
+      <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
+"@
     }
 
 @"
@@ -411,14 +406,14 @@ function Build-SourcedFixletActionXml {
     </Target>
     <Settings>
       <ActionUITitle>$uiTitle</ActionUITitle>
+$timeRangeBlock
 $preActionBlock
       <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage><Text>Updating to $msgTitle...please wait.</Text></RunningMessage>
-$timeRangeBlock
+      <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocal>$($StartLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</StartDateTimeLocal>
       <HasEndTime>$($hasEnd.ToString().ToLower())</HasEndTime>
-$endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
+$endLine$deadlineBlock      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
       <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
@@ -441,7 +436,7 @@ $endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
 "@
 }
 
-# (SingleAction builder kept if you ever need it again)
+# (SingleAction builder kept inert)
 function Build-SingleActionXml { "<!-- SingleAction path intentionally omitted in this build -->" }
 
 # =========================
@@ -568,16 +563,15 @@ $btn.Add_Click({
         $cont = Get-FixletContainer -Xml $fixletXml
         LogLine ("Detected BES content type: {0}" -f $cont.Type)
 
-        $titleRaw     = [string]$cont.Node.Title                            # e.g., "Update: Foo 1.2.3 Win"
-        $messageTitle = Build-MessageTitle $titleRaw                        # "Update: Foo 1.2.3"
-        $displayName  = Parse-FixletTitleToProduct -Title $titleRaw         # "Foo 1.2.3"
+        $titleRaw     = [string]$cont.Node.Title
+        $displayName  = Parse-FixletTitleToProduct -Title $titleRaw   # e.g., "The GIMP Team GIMP 3.0.4"
 
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
         $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
         $actionScript = $parsed.ActionScript
 
         LogLine "Parsed title (console): ${titleRaw}"
-        LogLine "Message title: ${messageTitle}"
+        LogLine "Display name (messages): ${displayName}"
         LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
@@ -606,7 +600,7 @@ $btn.Add_Click({
             @{ Name="Conference/Training Rooms"; Start=$confStart; End=$null; TR=$true; TRS=$trStart; TRE=$trEnd; UI=$false; Msg=""; Save=$false; Deadline=$null },
             @{ Name="Force"; Start=$forceStart; End=$null; TR=$false; TRS=$null; TRE=$null; UI=$true;
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
-                    $messageTitle, $forceEnforce.ToString("M/d/yyyy h:mm tt"));
+                    $displayName, $forceEnforce.ToString("M/d/yyyy h:mm tt"));
                Save=$true; Deadline=$forceEnforce }
         )
 
@@ -635,7 +629,7 @@ $btn.Add_Click({
                 $xmlBody = Build-SourcedFixletActionXml `
                     -ActionTitle      $a `
                     -UiBaseTitle      $titleRaw `
-                    -MessageTitle     $messageTitle `
+                    -DisplayName      $displayName `
                     -SiteName         $CustomSiteName `
                     -FixletId         $fixId `
                     -FixletActionName $fixletActionName `
