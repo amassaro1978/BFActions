@@ -33,9 +33,6 @@ $AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
 $PostUsingInvokeWebRequest  = $true
 
-# NEW: wait for top of minute before posting each action to kill seconds drift
-$WaitForTopOfMinuteBeforePost = $true
-
 # =========================
 # UTIL / LOGGING
 # =========================
@@ -75,7 +72,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
 }
 # Round a DateTime to exact minute (seconds & ms -> 0)
 function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
-# ISO-8601 duration PnDTnHnMnS from a TimeSpan (no negatives)
+# ISO-8601 duration PnDTnHnMnS (no negatives)
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $days = [int][Math]::Floor($ts.TotalDays)
@@ -281,7 +278,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML BUILDER — offsets + optional PreAction deadline (Force)
+# ACTION XML BUILDER — note: we pass already-computed offsets (per-action)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -535,46 +532,32 @@ $btn.Add_Click({
         LogLine "Parsed title (console): $titleRaw"
         LogLine "Display name (messages): $displayName"
 
-        # ---- Build absolute times (snap seconds to :00) ----
+        # ---- Absolute desired times (seconds = 0) ----
         $PilotStart   = Round-ToMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null))
         $DeployStart  = Round-ToMinute($PilotStart.AddDays(1))
         $ConfStart    = Round-ToMinute($PilotStart.AddDays(1))
         $PilotEnd     = Round-ToMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
         $DeployEnd    = Round-ToMinute($DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55))
-
         $ForceStart   = Round-ToMinute((Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
         $ForceDeadline= Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM
 
-        # NEW: add 1-year end times for actions that previously had none
+        # 1-year end times for the two that previously had none
         $ConfEnd      = Round-ToMinute($ConfStart.AddYears(1))
         $ForceEnd     = Round-ToMinute($ForceStart.AddYears(1))
-
-        # ---- Compute OFFSETS against a rounded "now" (minute) ----
-        $now         = Get-Date
-        $nowRounded  = Round-ToMinute($now)
-
-        $PilotStartOffset   = To-IsoDuration ($PilotStart   - $nowRounded)
-        $PilotEndOffset     = To-IsoDuration ($PilotEnd     - $nowRounded)
-        $DeployStartOffset  = To-IsoDuration ($DeployStart  - $nowRounded)
-        $DeployEndOffset    = To-IsoDuration ($DeployEnd    - $nowRounded)
-        $ConfStartOffset    = To-IsoDuration ($ConfStart    - $nowRounded)
-        $ConfEndOffset      = To-IsoDuration ($ConfEnd      - $nowRounded)
-        $ForceStartOffset   = To-IsoDuration ($ForceStart   - $nowRounded)
-        $ForceEndOffset     = To-IsoDuration ($ForceEnd     - $nowRounded)
-        $ForceDealineOff    = To-IsoDuration ($ForceDeadline - $nowRounded)
 
         # Run between window strings
         $TRStartStr  = "19:00:00"
         $TREndStr    = "06:59:00"
 
+        # Keep the absolute targets; compute OFFSETS *per-action right before posting*
         $actions = @(
-            @{ Name="Pilot"; StartOff=$PilotStartOffset;  EndOff=$PilotEndOffset;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
-            @{ Name="Deploy";StartOff=$DeployStartOffset; EndOff=$DeployEndOffset;  HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
-            @{ Name="Conference/Training Rooms"; StartOff=$ConfStartOffset; EndOff=$ConfEndOffset; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
-            @{ Name="Force"; StartOff=$ForceStartOffset;  EndOff=$ForceEndOffset;   HasEnd="true";  HasTR="false"; TRS=""; TRE=""; ShowUI="true";
+            @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
+            @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
+            @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
+            @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
                     $displayName, $ForceDeadline.ToString("M/d/yyyy h:mm tt"));
-               SaveAsk="true"; DeadlineOff=$ForceDealineOff }
+               SaveAsk="true"; AbsDeadline=$ForceDeadline }
         )
 
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
@@ -602,17 +585,12 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # (Optional) wait until top of minute to eliminate seconds drift
-            if ($WaitForTopOfMinuteBeforePost) {
-                $sec = (Get-Date).Second
-                if ($sec -ne 0) {
-                    $sleep = 60 - $sec
-                    LogLine ("Waiting {0}s for top-of-minute before posting {1}..." -f $sleep, $a)
-                    Start-Sleep -Seconds $sleep
-                }
-            }
+            # >>> Fresh offsets right before POST — eliminates second/minute drift <<<
+            $postNow = Get-Date
+            $startOff   = To-IsoDuration ($cfg.AbsStart - $postNow)
+            $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDuration ($cfg.AbsEnd - $postNow) } else { "" }
+            $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDuration ($cfg.AbsDeadline - $postNow) } else { "" }
 
-            # Build XML with offsets
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
                 -UiBaseTitle          $titleRaw `
@@ -621,16 +599,16 @@ $btn.Add_Click({
                 -FixletId             $fixId `
                 -FixletActionName     $fixletActionName `
                 -GroupRelevance       $groupRel `
-                -StartOffset          $cfg.StartOff `
+                -StartOffset          $startOff `
                 -HasEndText           $cfg.HasEnd `
-                -EndOffset            $cfg.EndOff `
+                -EndOffset            $endOff `
                 -HasTimeRangeText     $cfg.HasTR `
                 -TRStartStr           $cfg.TRS `
                 -TREndStr             $cfg.TRE `
                 -ShowPreActionUIText  $cfg.ShowUI `
                 -PreActionText        $cfg.Msg `
                 -AskToSaveWorkText    $cfg.SaveAsk `
-                -DeadlineOffset       $cfg.DeadlineOff
+                -DeadlineOffset       $deadlineOff
 
             $xmlBodyToSend = $xmlBody
             $hex = Get-FirstBytesHex $xmlBodyToSend 32
@@ -646,7 +624,6 @@ $btn.Add_Click({
 
             try {
                 if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
-                    LogLine "Posting via Invoke-WebRequest (file): $tmpAction"
                     Post-XmlFile-InFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
                 } else {
                     LogLine "⚠️ Direct POST path disabled; enable if needed."
