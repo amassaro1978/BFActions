@@ -311,7 +311,7 @@ function Build-SourcedFixletActionXml {
         [bool]$AskToSaveWork = $false
     )
 
-    # ---- Basic sanitization ----
+    # ---------- sanitize & snap ----------
     if ($null -eq $UiBaseTitle) { $UiBaseTitle = "" }
     if ($null -eq $DisplayName) { $DisplayName = "" }
     if ($null -eq $SiteName)    { $SiteName    = "" }
@@ -319,46 +319,44 @@ function Build-SourcedFixletActionXml {
     if ($null -eq $FixletActionName) { $FixletActionName = "Action1" }
     if ($null -eq $PreActionText) { $PreActionText = "" }
 
-    # Console action name (with suffix)
-    $fullTitle = ("{0}: {1}" -f $UiBaseTitle, $ActionTitle)
-    $uiTitle   = SafeEscape($fullTitle)
+    # snap seconds to :00 where applicable
+    if ($StartLocal)     { $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute) }
+    if ($EndLocal)       { $EndLocal     = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
+    if ($DeadlineLocal)  { $DeadlineLocal= $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
-    # UI message/title (without suffix) -> "Update: $DisplayName"
-    $actionUiTitleRaw = ("Update: {0}" -f $DisplayName)
-    $actionUiTitleEsc = SafeEscape($actionUiTitleRaw)
-    $dispEsc          = SafeEscape($DisplayName)
+    # ---------- precompute all strings (NO $() in here-string) ----------
+    $consoleTitle    = [System.Security.SecurityElement]::Escape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
+    $uiTitleMessage  = [System.Security.SecurityElement]::Escape(("Update: {0}" -f $DisplayName))
+    $dispEsc         = [System.Security.SecurityElement]::Escape($DisplayName)
+    $siteEsc         = [System.Security.SecurityElement]::Escape($SiteName)
+    $fixletIdEsc     = [System.Security.SecurityElement]::Escape($FixletId)
+    $actionNameEsc   = [System.Security.SecurityElement]::Escape($FixletActionName)
 
-    # Snap scheduled times to :00 secs (only when present)
-    if ($null -ne $StartLocal)  { $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute) }
-    if ($null -ne $EndLocal)    { $EndLocal     = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
-    if ($null -ne $DeadlineLocal){ $DeadlineLocal= $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
+    $startLocalStr   = if ($StartLocal)    { $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss') } else { "" }
+    $hasEndBool      = [bool]($EndLocal)
+    $hasEndText      = $hasEndBool.ToString().ToLower()
+    $endLocalStr     = if ($EndLocal)      { $EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss') } else { "" }
+    $deadlineStr     = if ($DeadlineLocal) { $DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss') } else { "" }
 
-    $startAbs = if ($null -ne $StartLocal) { $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss') } else { "" }
-
-    # End block
-    $hasEnd     = ($null -ne $EndLocal)
-    $hasEndText = ([string]$hasEnd).ToLower()
-    $endLine    = if ($hasEnd) { "      <EndDateTimeLocal>$([string](SafeIsoLocal($EndLocal)))</EndDateTimeLocal>`n" } else { "" }
-
-    # Group relevance (safe CDATA)
-    $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
+    # Group relevance CDATA-safe
+    $groupSafe = $GroupRelevance
+    if ([string]::IsNullOrWhiteSpace($groupSafe)) { $groupSafe = "" }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # TimeRange block -> HH:mm:ss
-    $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
+    # TimeRange strings (HH:mm:ss) or disabled
+    $hasTRText = "false"
+    $timeRangeBlock = ""
     if ($HasTimeRange) {
-        # defaults if null
-        $trsSpan = if ($null -eq $TimeRangeStart) { [TimeSpan]::FromHours(19) }
-                   elseif ($TimeRangeStart -is [TimeSpan]) { $TimeRangeStart }
-                   else { [TimeSpan]::Parse($TimeRangeStart.ToString()) }
-        $treSpan = if ($null -eq $TimeRangeEnd) { [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) }
-                   elseif ($TimeRangeEnd -is [TimeSpan]) { $TimeRangeEnd }
-                   else { [TimeSpan]::Parse($TimeRangeEnd.ToString()) }
-
-        $trs = "{0:00}:{1:00}:{2:00}" -f $trsSpan.Hours, $trsSpan.Minutes, $trsSpan.Seconds
-        $tre = "{0:00}:{1:00}:{2:00}" -f $treSpan.Hours, $treSpan.Minutes, $treSpan.Seconds
+        $trsSpan = if ($TimeRangeStart -is [TimeSpan]) { $TimeRangeStart }
+                   elseif ($TimeRangeStart)            { [TimeSpan]::Parse($TimeRangeStart.ToString()) }
+                   else                                { [TimeSpan]::FromHours(19) }
+        $treSpan = if ($TimeRangeEnd -is [TimeSpan])   { $TimeRangeEnd }
+                   elseif ($TimeRangeEnd)              { [TimeSpan]::Parse($TimeRangeEnd.ToString()) }
+                   else                                { [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) }
+        $trs = ("{0:00}:{1:00}:{2:00}" -f $trsSpan.Hours, $trsSpan.Minutes, $trsSpan.Seconds)
+        $tre = ("{0:00}:{1:00}:{2:00}" -f $treSpan.Hours, $treSpan.Minutes, $treSpan.Seconds)
+        $hasTRText = "true"
 $timeRangeBlock = @"
-      <HasTimeRange>true</HasTimeRange>
       <TimeRange>
         <StartTime>$trs</StartTime>
         <EndTime>$tre</EndTime>
@@ -366,40 +364,63 @@ $timeRangeBlock = @"
 "@
     }
 
+    # PreAction block
+    $preAskSaveText = $AskToSaveWork.ToString().ToLower()
+    $preShowText    = $ShowPreActionUI.ToString().ToLower()
+    $preTextEsc     = [System.Security.SecurityElement]::Escape($PreActionText)
+
+    $deadlineInner  = ""
+    if ($ShowPreActionUI -and $deadlineStr) {
+$deadlineInner = @"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalTime>$deadlineStr</DeadlineLocalTime>
+"@
+    }
+
+    $preActionBlock = ""
+    if ($ShowPreActionUI) {
+$preActionBlock = @"
+      <PreActionShowUI>$preShowText</PreActionShowUI>
+      <PreAction>
+        <Text>$preTextEsc</Text>
+        <AskToSaveWork>$preAskSaveText</AskToSaveWork>
+        <ShowActionButton>false</ShowActionButton>
+        <ShowCancelButton>false</ShowCancelButton>
+$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
+      </PreAction>
+"@
+    } else {
+$preActionBlock = @"
+      <PreActionShowUI>$preShowText</PreActionShowUI>
+"@
+    }
+
+    # Optional End line
+    $endLine = ""
+    if ($hasEndBool -and $endLocalStr) {
+        $endLine = "      <EndDateTimeLocal>$endLocalStr</EndDateTimeLocal>`n"
+    }
+
 @"
 <?xml version="1.0" encoding="UTF-8"?>
 <BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
   <SourcedFixletAction>
     <SourceFixlet>
-      <Sitename>$SiteName</Sitename>
-      <FixletID>$FixletId</FixletID>
-      <Action>$FixletActionName</Action>
+      <Sitename>$siteEsc</Sitename>
+      <FixletID>$fixletIdEsc</FixletID>
+      <Action>$actionNameEsc</Action>
     </SourceFixlet>
     <Target>
       <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
     </Target>
     <Settings>
-      <ActionUITitle>$actionUiTitleEsc</ActionUITitle>
-      <PreActionShowUI>$(([string]$ShowPreActionUI).ToLower())</PreActionShowUI>
-$(if($ShowPreActionUI){
-"      <PreAction>
-        <Text>$([string](SafeEscape($PreActionText)))</Text>
-        <AskToSaveWork>$(([string]$AskToSaveWork).ToLower())</AskToSaveWork>
-        <ShowActionButton>false</ShowActionButton>
-        <ShowCancelButton>false</ShowCancelButton>
-$(if($null -ne $DeadlineLocal){
-"        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-        <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$([string](SafeIsoLocal($DeadlineLocal)))</DeadlineLocalTime>"
-})
-        <ShowConfirmation>false</ShowConfirmation>
-      </PreAction>"
-})
-      <HasRunningMessage>true</HasRunningMessage>
+      <ActionUITitle>$uiTitleMessage</ActionUITitle>
+$preActionBlock      <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
-$timeRangeBlock
-      <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocal>$startAbs</StartDateTimeLocal>
+      <HasTimeRange>$hasTRText</HasTimeRange>
+$timeRangeBlock      <HasStartTime>true</HasStartTime>
+      <StartDateTimeLocal>$startLocalStr</StartDateTimeLocal>
       <HasEndTime>$hasEndText</HasEndTime>
 $endLine      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
@@ -417,8 +438,76 @@ $endLine      <UseUTCTime>false</UseUTCTime>
       <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
       <IsOffer>false</IsOffer>
     </Settings>
-    <Title>$uiTitle</Title>
+    <Title>$consoleTitle</Title>
   </SourcedFixletAction>
+</BES>
+"@
+}
+
+# =========================
+# (Optional) SingleAction builder retained for completeness
+# =========================
+function Build-SingleActionXml {
+    param(
+        [string]$ActionTitle,
+        [string]$UiBaseTitle,
+        [string]$DisplayName,
+        [string[]]$RelevanceBlocks,
+        [string]$ActionScript,
+        [datetime]$StartLocal,
+        [bool]$IsForce=$false
+    )
+    $fullTitle = ("{0}: {1}" -f $UiBaseTitle, $ActionTitle)
+    $titleEsc  = [System.Security.SecurityElement]::Escape($fullTitle)
+    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+
+    $relevanceCombined = ""
+    if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
+        $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { "($_)" }) -join " AND "
+    }
+    $relSafe = $relevanceCombined -replace ']]>', ']]]]><![CDATA[>'
+    $rels = if ([string]::IsNullOrWhiteSpace($relevanceCombined)) { "" } else { "    <Relevance><![CDATA[$relSafe]]></Relevance>" }
+
+    $now = Get-Date
+    $startOffset = To-IsoDuration ($StartLocal - $now)
+@"
+<?xml version="1.0" encoding="UTF-8"?>
+<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
+  <SingleAction>
+    <Title>$titleEsc</Title>
+$rels
+    <ActionScript MIMEType="application/x-Fixlet-Windows-Shell"><![CDATA[
+$ActionScript
+]]></ActionScript>
+    <SuccessCriteria Option="RunToCompletion" />
+    <Settings>
+      <ActionUITitle>$titleEsc</ActionUITitle>
+      <PreActionShowUI>false</PreActionShowUI>
+      <HasRunningMessage>true</HasRunningMessage>
+      <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
+      <HasTimeRange>false</HasTimeRange>
+      <HasStartTime>true</HasStartTime>
+      <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
+      <HasEndTime>false</HasEndTime>
+      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
+      <UseUTCTime>false</UseUTCTime>
+      <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
+      <ActiveUserType>AllUsers</ActiveUserType>
+      <HasWhose>false</HasWhose>
+      <PreActionCacheDownload>false</PreActionCacheDownload>
+      <Reapply>true</Reapply>
+      <HasReapplyLimit>false</HasReapplyLimit>
+      <HasReapplyInterval>false</HasReapplyInterval>
+      <HasRetry>true</HasRetry>
+      <RetryCount>3</RetryCount>
+      <RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
+      <HasTemporalDistribution>false</HasTemporalDistribution>
+      <ContinueOnErrors>true</ContinueOnErrors>
+      <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
+      <IsOffer>false</IsOffer>
+    </Settings>
+    <Target><AllComputers>true</AllComputers></Target>
+  </SingleAction>
 </BES>
 "@
 }
@@ -575,10 +664,14 @@ $btn.Add_Click({
         # Derived schedules per action
         $DeployStart     = $PilotStart.AddDays(1)
         $confStart       = $PilotStart.AddDays(1)
-        $PilotEnd        = $PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59) # next day 6:59 AM
-        $DeployEnd       = $DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning 6:55 AM
 
-        # Force: next Tuesday 7:00 AM after Pilot, with deadline Wednesday 7:00 AM
+        # Pilot: end next day 6:59 AM
+        $PilotEnd        = $PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)
+
+        # Deploy: end next morning 6:55 AM (per your earlier spec)
+        $DeployEnd       = $DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55)
+
+        # Force: next Tuesday 7:00 AM after Pilot, with deadline Wednesday 7:00 AM (absolute)
         $forceStartDate  = Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)
         $forceStart      = $forceStartDate.AddHours(7) # Tue 7:00 AM
         $forceEnforce    = $forceStart.AddDays(1)      # Wed 7:00 AM
@@ -622,7 +715,7 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Dump parameters (use Fmt to avoid calling .ToString() on $null)
+            # Dump parameters
             LogLine ("Params for {0}: Start={1} End={2} Deadline={3} TR={4} TRS={5} TRE={6}" -f `
                 $a, (Fmt $cfg.Start), (Fmt $cfg.End), (Fmt $cfg.Deadline), (Fmt $cfg.TR), (Fmt $cfg.TRS), (Fmt $cfg.TRE))
 
