@@ -110,6 +110,14 @@ function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
     if ($delta -le 0) { $delta += 7 }
     return $base.Date.AddDays($delta)
 }
+function SafeEscape([string]$s) {
+    if ($null -eq $s) { return "" }
+    return [System.Security.SecurityElement]::Escape($s)
+}
+function SafeIsoLocal([Nullable[datetime]]$dt) {
+    if ($null -eq $dt) { return "" }
+    return $dt.Value.ToString('yyyy-MM-ddTHH:mm:ss')
+}
 
 # =========================
 # HTTP
@@ -302,26 +310,34 @@ function Build-SourcedFixletActionXml {
         [bool]$AskToSaveWork = $false
     )
 
+    # ---- Basic sanitization ----
+    if ($null -eq $UiBaseTitle) { $UiBaseTitle = "" }
+    if ($null -eq $DisplayName) { $DisplayName = "" }
+    if ($null -eq $SiteName)    { $SiteName    = "" }
+    if ($null -eq $FixletId)    { $FixletId    = "" }
+    if ($null -eq $FixletActionName) { $FixletActionName = "Action1" }
+    if ($null -eq $PreActionText) { $PreActionText = "" }
+
     # Console action name (with suffix)
-    $fullTitle = "${UiBaseTitle}: $ActionTitle"
-    $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
+    $fullTitle = ("{0}: {1}" -f $UiBaseTitle, $ActionTitle)
+    $uiTitle   = SafeEscape($fullTitle)
 
     # UI message/title (without suffix) -> "Update: $DisplayName"
-    $actionUiTitleRaw = "Update: $DisplayName"
-    $actionUiTitleEsc = [System.Security.SecurityElement]::Escape($actionUiTitleRaw)
-    $dispEsc          = [System.Security.SecurityElement]::Escape($DisplayName)
+    $actionUiTitleRaw = ("Update: {0}" -f $DisplayName)
+    $actionUiTitleEsc = SafeEscape($actionUiTitleRaw)
+    $dispEsc          = SafeEscape($DisplayName)
 
-    # Snap scheduled times to :00 secs
-    $StartLocal = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
-    if ($null -ne $EndLocal)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
-    if ($null -ne $DeadlineLocal) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
+    # Snap scheduled times to :00 secs (only when present)
+    if ($null -ne $StartLocal)  { $StartLocal   = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute) }
+    if ($null -ne $EndLocal)    { $EndLocal     = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
+    if ($null -ne $DeadlineLocal){ $DeadlineLocal= $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
-    $startAbs = $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss')
+    $startAbs = if ($null -ne $StartLocal) { $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss') } else { "" }
 
     # End block
     $hasEnd     = ($null -ne $EndLocal)
     $hasEndText = ([string]$hasEnd).ToLower()
-    $endLine    = if ($hasEnd) { "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n" } else { "" }
+    $endLine    = if ($hasEnd) { "      <EndDateTimeLocal>$([string](SafeIsoLocal($EndLocal)))</EndDateTimeLocal>`n" } else { "" }
 
     # Group relevance (safe CDATA)
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
@@ -330,6 +346,7 @@ function Build-SourcedFixletActionXml {
     # TimeRange block -> HH:mm:ss
     $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     if ($HasTimeRange) {
+        # defaults if null
         if ($null -eq $TimeRangeStart) { $trsSpan = [TimeSpan]::FromHours(19) }
         elseif ($TimeRangeStart -is [TimeSpan]) { $trsSpan = $TimeRangeStart }
         else { $trsSpan = [TimeSpan]::Parse($TimeRangeStart.ToString()) }
@@ -352,13 +369,13 @@ $timeRangeBlock = @"
     # PreAction block (Force uses this + absolute DeadlineLocalTime)
     $preActionBlock = ""
     if ($ShowPreActionUI) {
-        $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
+        $preEsc = SafeEscape($PreActionText)
         $deadlineInner = ""
         if ($null -ne $DeadlineLocal) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
+        <DeadlineLocalTime>$([string](SafeIsoLocal($DeadlineLocal)))</DeadlineLocalTime>
 "@
         }
 $preActionBlock = @"
@@ -550,6 +567,7 @@ $btn.Add_Click({
         LogLine ("Detected BES content type: {0}" -f $cont.Type)
 
         $titleRaw = [string]$cont.Node.Title
+        if ($null -eq $titleRaw) { $titleRaw = "" }
         $displayName = Parse-FixletTitleToProduct -Title $titleRaw
 
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
@@ -615,6 +633,10 @@ $btn.Add_Click({
             }
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
+
+            # Dump parameters for this action (helps catch nulls)
+            LogLine ("Params for {0}: Start={1} End={2} Deadline={3} TR={4} TRS={5} TRE={6}" -f `
+                $a, ($cfg.Start), ($cfg.End), ($cfg.Deadline), ($cfg.TR), ($cfg.TRS), ($cfg.TRE))
 
             if ($ActionMode -ieq 'Sourced') {
                 LogLine "Assembling SourcedFixletAction XML for $a"
