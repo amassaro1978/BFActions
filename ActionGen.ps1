@@ -33,6 +33,9 @@ $AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
 $PostUsingInvokeWebRequest  = $true
 
+# NEW: wait for top of minute before posting each action to kill seconds drift
+$WaitForTopOfMinuteBeforePost = $true
+
 # =========================
 # UTIL / LOGGING
 # =========================
@@ -71,10 +74,8 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
 # Round a DateTime to exact minute (seconds & ms -> 0)
-function Round-ToMinute([datetime]$dt) {
-    return $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute)
-}
-# Build an ISO-8601 duration PnDTnHnMnS from a TimeSpan (no negatives)
+function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
+# ISO-8601 duration PnDTnHnMnS from a TimeSpan (no negatives)
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $days = [int][Math]::Floor($ts.TotalDays)
@@ -86,7 +87,7 @@ function To-IsoDuration([TimeSpan]$ts) {
     if ($hours -gt 0) { $tPart += ("{0}H" -f $hours) }
     if ($mins  -gt 0) { $tPart += ("{0}M" -f $mins) }
     if ($secs  -gt 0 -or $tPart.Count -eq 0) { $tPart += ("{0}S" -f $secs) }
-    return $dPart + "T" + ($tPart -join "")
+    $dPart + "T" + ($tPart -join "")
 }
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -104,11 +105,11 @@ function Get-FirstBytesHex([string]$s, [int]$n = 32) {
 function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
     $delta = ([int]$weekday - [int]$base.DayOfWeek + 7) % 7
     if ($delta -le 0) { $delta += 7 }
-    return $base.Date.AddDays($delta)
+    $base.Date.AddDays($delta)
 }
 function SafeEscape([string]$s) {
     if ($null -eq $s) { return "" }
-    return [System.Security.SecurityElement]::Escape($s)
+    [System.Security.SecurityElement]::Escape($s)
 }
 
 # =========================
@@ -535,35 +536,42 @@ $btn.Add_Click({
         LogLine "Display name (messages): $displayName"
 
         # ---- Build absolute times (snap seconds to :00) ----
-        $PilotStart = Round-ToMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null))
-        $DeployStart   = Round-ToMinute($PilotStart.AddDays(1))
-        $ConfStart     = Round-ToMinute($PilotStart.AddDays(1))
-        $PilotEnd      = Round-ToMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
-        $DeployEnd     = Round-ToMinute($DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55))
-        $ForceStart    = Round-ToMinute((Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
-        $ForceDeadline = Round-ToMinute($ForceStart.AddDays(1))  # Wed 7:00 AM
+        $PilotStart   = Round-ToMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null))
+        $DeployStart  = Round-ToMinute($PilotStart.AddDays(1))
+        $ConfStart    = Round-ToMinute($PilotStart.AddDays(1))
+        $PilotEnd     = Round-ToMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
+        $DeployEnd    = Round-ToMinute($DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55))
 
-        # ---- Compute OFFSETS against a rounded "now" to kill seconds drift ----
-        $now = Get-Date
-        $nowRounded = $now.Date.AddHours($now.Hour).AddMinutes($now.Minute)  # seconds & ms = 0
+        $ForceStart   = Round-ToMinute((Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
+        $ForceDeadline= Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM
 
-        $PilotStartOffset  = To-IsoDuration ($PilotStart  - $nowRounded)
-        $PilotEndOffset    = To-IsoDuration ($PilotEnd    - $nowRounded)
-        $DeployStartOffset = To-IsoDuration ($DeployStart - $nowRounded)
-        $DeployEndOffset   = To-IsoDuration ($DeployEnd   - $nowRounded)
-        $ConfStartOffset   = To-IsoDuration ($ConfStart   - $nowRounded)
-        $ForceStartOffset  = To-IsoDuration ($ForceStart  - $nowRounded)
-        $ForceDealineOff   = To-IsoDuration ($ForceDeadline - $nowRounded)
+        # NEW: add 1-year end times for actions that previously had none
+        $ConfEnd      = Round-ToMinute($ConfStart.AddYears(1))
+        $ForceEnd     = Round-ToMinute($ForceStart.AddYears(1))
+
+        # ---- Compute OFFSETS against a rounded "now" (minute) ----
+        $now         = Get-Date
+        $nowRounded  = Round-ToMinute($now)
+
+        $PilotStartOffset   = To-IsoDuration ($PilotStart   - $nowRounded)
+        $PilotEndOffset     = To-IsoDuration ($PilotEnd     - $nowRounded)
+        $DeployStartOffset  = To-IsoDuration ($DeployStart  - $nowRounded)
+        $DeployEndOffset    = To-IsoDuration ($DeployEnd    - $nowRounded)
+        $ConfStartOffset    = To-IsoDuration ($ConfStart    - $nowRounded)
+        $ConfEndOffset      = To-IsoDuration ($ConfEnd      - $nowRounded)
+        $ForceStartOffset   = To-IsoDuration ($ForceStart   - $nowRounded)
+        $ForceEndOffset     = To-IsoDuration ($ForceEnd     - $nowRounded)
+        $ForceDealineOff    = To-IsoDuration ($ForceDeadline - $nowRounded)
 
         # Run between window strings
         $TRStartStr  = "19:00:00"
         $TREndStr    = "06:59:00"
 
         $actions = @(
-            @{ Name="Pilot"; StartOff=$PilotStartOffset; EndOff=$PilotEndOffset;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
-            @{ Name="Deploy";StartOff=$DeployStartOffset;EndOff=$DeployEndOffset;  HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
-            @{ Name="Conference/Training Rooms"; StartOff=$ConfStartOffset; EndOff=""; HasEnd="false"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
-            @{ Name="Force"; StartOff=$ForceStartOffset; EndOff=""; HasEnd="false"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
+            @{ Name="Pilot"; StartOff=$PilotStartOffset;  EndOff=$PilotEndOffset;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
+            @{ Name="Deploy";StartOff=$DeployStartOffset; EndOff=$DeployEndOffset;  HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
+            @{ Name="Conference/Training Rooms"; StartOff=$ConfStartOffset; EndOff=$ConfEndOffset; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
+            @{ Name="Force"; StartOff=$ForceStartOffset;  EndOff=$ForceEndOffset;   HasEnd="true";  HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
                     $displayName, $ForceDeadline.ToString("M/d/yyyy h:mm tt"));
                SaveAsk="true"; DeadlineOff=$ForceDealineOff }
@@ -594,6 +602,16 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
+            # (Optional) wait until top of minute to eliminate seconds drift
+            if ($WaitForTopOfMinuteBeforePost) {
+                $sec = (Get-Date).Second
+                if ($sec -ne 0) {
+                    $sleep = 60 - $sec
+                    LogLine ("Waiting {0}s for top-of-minute before posting {1}..." -f $sleep, $a)
+                    Start-Sleep -Seconds $sleep
+                }
+            }
+
             # Build XML with offsets
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
@@ -614,7 +632,7 @@ $btn.Add_Click({
                 -AskToSaveWorkText    $cfg.SaveAsk `
                 -DeadlineOffset       $cfg.DeadlineOff
 
-            $xmlBodyToSend = $xmlBody  # already clean
+            $xmlBodyToSend = $xmlBody
             $hex = Get-FirstBytesHex $xmlBodyToSend 32
             LogLine ("First 32 bytes (hex) for {0}: {1}" -f $a, $hex)
 
