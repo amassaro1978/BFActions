@@ -72,7 +72,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-# ISO-8601 duration (kept for SingleAction path)
+# ISO-8601 duration (SingleAction fallback)
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $days = [int]$ts.TotalDays
@@ -86,19 +86,16 @@ function To-IsoDuration([TimeSpan]$ts) {
     if ($hPart -eq "" -and $mPart -eq "" -and $sPart -eq "") { $sPart = "0S" }
     return $dPart + "T" + $hPart + $mPart + $sPart
 }
-# Normalize leading BOM/whitespace so POST starts with '<'
 function Normalize-XmlForPost([string]$s) {
     if (-not $s) { return $s }
     $noBom = $s -replace "^\uFEFF",""
     $noLeadWs = $noBom -replace '^\s+',''
     return $noLeadWs
 }
-# UTF8 (no BOM) file write
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
-# Hex preview (debug)
 function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     if (-not $s) { return "" }
     $bytes = [Text.Encoding]::UTF8.GetBytes($s)
@@ -107,7 +104,6 @@ function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     for ($i = 0; $i -lt $take; $i++) { [void]$sb.AppendFormat("{0:X2} ", $bytes[$i]) }
     $sb.ToString().TrimEnd()
 }
-# Next specific weekday AFTER the given date (never same day)
 function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
     $delta = ([int]$weekday - [int]$base.DayOfWeek + 7) % 7
     if ($delta -le 0) { $delta += 7 }
@@ -144,7 +140,6 @@ function HttpGetXml {
     }
 }
 
-# curl-like POST using a file on disk
 function Post-XmlFile-InFile {
     param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
     try {
@@ -168,7 +163,6 @@ function Post-XmlFile-InFile {
     }
 }
 
-# Direct-byte POST (fallback)
 function HttpPostXml {
     param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
     $bytes = [Text.Encoding]::UTF8.GetBytes($XmlBody)
@@ -390,11 +384,11 @@ function Build-SourcedFixletActionXml {
         [string]$FixletActionName,
         [string]$GroupRelevance,
         [datetime]$StartLocal,
-        [Nullable[datetime]]$EndLocal = $null,
-        [Nullable[datetime]]$DeadlineLocal = $null,
+        [datetime]$EndLocal = $null,
+        [datetime]$DeadlineLocal = $null,
         [bool]$HasTimeRange = $false,
-        [Nullable[TimeSpan]]$TimeRangeStart = $null,
-        [Nullable[TimeSpan]]$TimeRangeEnd   = $null,
+        [object]$TimeRangeStart = $null,
+        [object]$TimeRangeEnd   = $null,
         [bool]$ShowPreActionUI = $false,
         [string]$PreActionText = "",
         [bool]$AskToSaveWork = $false
@@ -411,17 +405,15 @@ function Build-SourcedFixletActionXml {
 
     # Snap to :00
     $StartLocal = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
-    if ($EndLocal.HasValue)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
-    if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
+    if ($EndLocal)      { $EndLocal      = $EndLocal.Date.AddHours($EndLocal.Hour).AddMinutes($EndLocal.Minute) }
+    if ($DeadlineLocal) { $DeadlineLocal = $DeadlineLocal.Date.AddHours($DeadlineLocal.Hour).AddMinutes($DeadlineLocal.Minute) }
 
     $startAbs = $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss')
-    $endLine  = ""
-    $hasEnd   = $false
-    if ($EndLocal.HasValue) {
-        $hasEnd = $true
-        $endLine = "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
-    }
+
+    # End block
+    $hasEnd     = ($null -ne $EndLocal)
     $hasEndText = $hasEnd.ToString().ToLower()
+    $endLine    = if ($hasEnd) { "      <EndDateTimeLocal>$($EndLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n" } else { "" }
 
     # Group relevance (safe CDATA)
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
@@ -430,10 +422,17 @@ function Build-SourcedFixletActionXml {
     # TimeRange block -> CLOCK FORMAT HH:mm:ss
     $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     if ($HasTimeRange) {
-        if (-not $TimeRangeStart.HasValue) { $TimeRangeStart = [TimeSpan]::FromHours(19) }                                   # 19:00
-        if (-not $TimeRangeEnd.HasValue)   { $TimeRangeEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) }   # 06:59
-        $trs = "{0:00}:{1:00}:{2:00}" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes, $TimeRangeStart.Value.Seconds
-        $tre = "{0:00}:{1:00}:{2:00}" -f $TimeRangeEnd.Value.Hours,   $TimeRangeEnd.Value.Minutes,   $TimeRangeEnd.Value.Seconds
+        # Coerce TR start/end to TimeSpan reliably
+        if ($null -eq $TimeRangeStart) { $trsSpan = [TimeSpan]::FromHours(19) }
+        elseif ($TimeRangeStart -is [TimeSpan]) { $trsSpan = $TimeRangeStart }
+        else { $trsSpan = [TimeSpan]::Parse($TimeRangeStart.ToString()) }
+
+        if ($null -eq $TimeRangeEnd) { $treSpan = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) }
+        elseif ($TimeRangeEnd -is [TimeSpan]) { $treSpan = $TimeRangeEnd }
+        else { $treSpan = [TimeSpan]::Parse($TimeRangeEnd.ToString()) }
+
+        $trs = "{0:00}:{1:00}:{2:00}" -f $trsSpan.Hours, $trsSpan.Minutes, $trsSpan.Seconds
+        $tre = "{0:00}:{1:00}:{2:00}" -f $treSpan.Hours, $treSpan.Minutes, $treSpan.Seconds
 $timeRangeBlock = @"
       <HasTimeRange>true</HasTimeRange>
       <TimeRange>
@@ -448,11 +447,11 @@ $timeRangeBlock = @"
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
         $deadlineInner = ""
-        if ($DeadlineLocal.HasValue) {
+        if ($DeadlineLocal) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
+        <DeadlineLocalTime>$($DeadlineLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
 "@
         }
 $preActionBlock = @"
