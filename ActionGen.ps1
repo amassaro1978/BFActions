@@ -12,18 +12,18 @@ $CustomSiteName = "Test Group Managed (Workstations)"
 
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric)
 $GroupMap = @{
-    "Pilot"                       = "00-12345"
-    "Deploy"                      = "00-12345"
-    "Force"                       = "00-12345"
-    "Conference/Training Rooms"   = "00-12345"
+    "Pilot"                     = "00-12345"
+    "Deploy"                    = "00-12345"
+    "Force"                     = "00-12345"
+    "Conference/Training Rooms" = "00-12345"
 }
 
 # Fixlet Action name to invoke
 $FixletActionNameMap = @{
-    "Pilot"                       = "Action1"
-    "Deploy"                      = "Action1"
-    "Force"                       = "Action1"
-    "Conference/Training Rooms"   = "Action1"
+    "Pilot"                     = "Action1"
+    "Deploy"                    = "Action1"
+    "Force"                     = "Action1"
+    "Conference/Training Rooms" = "Action1"
 }
 
 # Behavior toggles
@@ -268,7 +268,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML BUILDER (STRINGS ONLY, NO NULLABLES)
+# ACTION XML BUILDER (strings-only)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -291,7 +291,6 @@ function Build-SourcedFixletActionXml {
         [string]$DeadlineLocalStr        # "yyyy-MM-ddTHH:mm:ss" or ""
     )
 
-    # Pre-escape fixed fields
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
     $uiTitleMessage  = SafeEscape(("Update: {0}" -f $DisplayName))
     $dispEsc         = SafeEscape($DisplayName)
@@ -300,11 +299,9 @@ function Build-SourcedFixletActionXml {
     $actionNameEsc   = SafeEscape($FixletActionName)
     $preTextEsc      = SafeEscape($PreActionText)
 
-    # Group relevance CDATA-safe
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # TimeRange block
     $timeRangeBlock = ""
     if ($HasTimeRangeText -ieq "true") {
         $trStartLine = if ($TRStartStr) { "        <StartTime>$TRStartStr</StartTime>" } else { "" }
@@ -317,7 +314,6 @@ $trEndLine
 "@
     }
 
-    # PreAction (and deadline inside it if provided)
     $deadlineInner = ""
     if (($ShowPreActionUIText -ieq "true") -and ($DeadlineLocalStr)) {
 $deadlineInner = @"
@@ -345,7 +341,6 @@ $preActionBlock = @"
 "@
     }
 
-    # Optional End line
     $endLine = ""
     if ($HasEndText -ieq "true" -and $EndLocalStr) {
         $endLine = "      <EndDateTimeLocal>$EndLocalStr</EndDateTimeLocal>`n"
@@ -548,8 +543,8 @@ $btn.Add_Click({
         $ForceDeadline = $ForceStart.AddDays(1)               # Wed 7:00 AM
 
         # Run between window
-        $TRStartSpan = [TimeSpan]::FromHours(19)                              # 19:00:00
-        $TREndSpan   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) # 06:59:00
+        $TRStartSpan = [TimeSpan]::FromHours(19)                                  # 19:00:00
+        $TREndSpan   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))  # 06:59:00
         $TRStartStr  = "{0:00}:{1:00}:{2:00}" -f $TRStartSpan.Hours, $TRStartSpan.Minutes, $TRStartSpan.Seconds
         $TREndStr    = "{0:00}:{1:00}:{2:00}" -f $TREndSpan.Hours,   $TREndSpan.Minutes,   $TREndSpan.Seconds
 
@@ -588,40 +583,45 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Precompute all builder strings (NO nullables)
-            $startStr  = $cfg.Start.ToString("yyyy-MM-ddTHH:mm:ss")
-            $hasEndTxt = if ($cfg.End -is [datetime]) { "true" } else { "false" }
-            $endStr    = if ($cfg.End -is [datetime]) { $cfg.End.ToString("yyyy-MM-ddTHH:mm:ss") } else { "" }
+            # Precompute all builder strings (no nullables)
+            $startStr   = $cfg.Start.ToString("yyyy-MM-ddTHH:mm:ss")
+            $hasEndTxt  = (if ($cfg.End -is [datetime]) { "true" } else { "false" })
+            $endStr     = (if ($cfg.End -is [datetime]) { $cfg.End.ToString("yyyy-MM-ddTHH:mm:ss") } else { "" })
+            $hasTRTxt   = (if ($cfg.HasTR -ieq "true") { "true" } else { "false" })
+            $trStartS   = (if ($cfg.HasTR -ieq "true") { $cfg.TRS } else { "" })
+            $trEndS     = (if ($cfg.HasTR -ieq "true") { $cfg.TRE } else { "" })
+            $showUITxt  = (if ($cfg.ShowUI -ieq "true") { "true" } else { "false" })
+            $askSaveTxt = (if ($cfg.SaveAsk -ieq "true") { "true" } else { "false" })
+            $deadlineS  = (if ($cfg.DeadlineStr) { $cfg.DeadlineStr } else { "" })
 
-            $hasTRTxt  = if ($cfg.HasTR -ieq "true") { "true" } else { "false" }
-            $trStartS  = if ($cfg.HasTR -ieq "true") { $cfg.TRS } else { "" }
-            $trEndS    = if ($cfg.HasTR -ieq "true") { $cfg.TRE } else { "" }
-
-            $showUITxt = if ($cfg.ShowUI -ieq "true") { "true" } else { "false" }
-            $askSaveTxt= if ($cfg.SaveAsk -ieq "true") { "true" } else { "false" }
-            $deadlineS = if ($cfg.DeadlineStr) { $cfg.DeadlineStr } else { "" }
+            # ---- Clean logging (NO inline if) ----
+            $endStrLog      = (if ($endStr)     { $endStr }     else { "<none>" })
+            $trStartStrLog  = (if ($trStartS)   { $trStartS }   else { "<none>" })
+            $trEndStrLog    = (if ($trEndS)     { $trEndS }     else { "<none>" })
+            $deadlineStrLog = (if ($deadlineS)  { $deadlineS }  else { "<none>" })
 
             LogLine ("Params for {0}: Start={1} End={2} HasEnd={3} TR={4} TRS={5} TRE={6} ShowUI={7} Deadline={8}" -f `
-                $a, $startStr, (if($endStr){$endStr}else{"<none>"}), $hasEndTxt, $hasTRTxt, (if($trStartS){$trStartS}else{"<none>"}), (if($trEndS){$trEndS}else{"<none>"}), $showUITxt, (if($deadlineS){$deadlineS}else{"<none>"}))
+                $a, $startStr, $endStrLog, $hasEndTxt, $hasTRTxt, $trStartStrLog, $trEndStrLog, $showUITxt, $deadlineStrLog)
 
+            # Build XML
             $xmlBody = Build-SourcedFixletActionXml `
-                -ActionTitle         $a `
-                -UiBaseTitle         $titleRaw `
-                -DisplayName         $displayName `
-                -SiteName            $CustomSiteName `
-                -FixletId            $fixId `
-                -FixletActionName    $fixletActionName `
-                -GroupRelevance      $groupRel `
-                -StartLocalStr       $startStr `
-                -HasEndText          $hasEndTxt `
-                -EndLocalStr         $endStr `
-                -HasTimeRangeText    $hasTRTxt `
-                -TRStartStr          $trStartS `
-                -TREndStr            $trEndS `
+                -ActionTitle          $a `
+                -UiBaseTitle          $titleRaw `
+                -DisplayName          $displayName `
+                -SiteName             $CustomSiteName `
+                -FixletId             $fixId `
+                -FixletActionName     $fixletActionName `
+                -GroupRelevance       $groupRel `
+                -StartLocalStr        $startStr `
+                -HasEndText           $hasEndTxt `
+                -EndLocalStr          $endStr `
+                -HasTimeRangeText     $hasTRTxt `
+                -TRStartStr           $trStartS `
+                -TREndStr             $trEndS `
                 -ShowPreActionUIText  $showUITxt `
-                -PreActionText       $cfg.Msg `
-                -AskToSaveWorkText   $askSaveTxt `
-                -DeadlineLocalStr    $deadlineS
+                -PreActionText        $cfg.Msg `
+                -AskToSaveWorkText    $askSaveTxt `
+                -DeadlineLocalStr     $deadlineS
 
             $xmlBodyToSend = Normalize-XmlForPost $xmlBody
             $hex = Get-FirstBytesHex $xmlBodyToSend 32
