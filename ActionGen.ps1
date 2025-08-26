@@ -268,7 +268,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML BUILDER (strings-only)
+# ACTION XML BUILDER (strings-only, deadline under <Settings>)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -302,6 +302,7 @@ function Build-SourcedFixletActionXml {
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
+    # TimeRange block
     $timeRangeBlock = ""
     if ($HasTimeRangeText -ieq "true") {
         $trStartLine = ""
@@ -316,33 +317,36 @@ $trEndLine
 "@
     }
 
-    $deadlineInner = ""
-    if (($ShowPreActionUIText -ieq "true") -and ($DeadlineLocalStr)) {
-$deadlineInner = @"
-        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-        <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$DeadlineLocalStr</DeadlineLocalTime>
+    # Deadline block — must be under <Settings>, not inside <PreAction>
+    $deadlineSettingsBlock = ""
+    if ($DeadlineLocalStr) {
+$deadlineSettingsBlock = @"
+      <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+      <DeadlineType>Absolute</DeadlineType>
+      <DeadlineLocalTime>$DeadlineLocalStr</DeadlineLocalTime>
 "@
     }
 
+    # PreAction block (no deadline lines inside)
     $preActionBlock = ""
     if ($ShowPreActionUIText -ieq "true") {
 $preActionBlock = @"
-      <PreActionShowUI>$ShowPreActionUIText</PreActionShowUI>
+      <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
         <Text>$preTextEsc</Text>
         <AskToSaveWork>$AskToSaveWorkText</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
         <ShowCancelButton>false</ShowCancelButton>
-$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
+        <ShowConfirmation>false</ShowConfirmation>
       </PreAction>
 "@
     } else {
 $preActionBlock = @"
-      <PreActionShowUI>$ShowPreActionUIText</PreActionShowUI>
+      <PreActionShowUI>false</PreActionShowUI>
 "@
     }
 
+    # End date line
     $endLine = ""
     if ($HasEndText -ieq "true" -and $EndLocalStr) {
         $endLine = "      <EndDateTimeLocal>$EndLocalStr</EndDateTimeLocal>`n"
@@ -362,7 +366,7 @@ $preActionBlock = @"
     </Target>
     <Settings>
       <ActionUITitle>$uiTitleMessage</ActionUITitle>
-$preActionBlock      <HasRunningMessage>true</HasRunningMessage>
+$preActionBlock$deadlineSettingsBlock      <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
       <HasTimeRange>$HasTimeRangeText</HasTimeRange>
 $timeRangeBlock      <HasStartTime>true</HasStartTime>
@@ -585,7 +589,7 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Precompute all builder strings (replace inline-if with statements)
+            # Precompute all builder strings
             $startStr = $cfg.Start.ToString("yyyy-MM-ddTHH:mm:ss")
 
             $hasEndTxt = "false"
