@@ -70,6 +70,10 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
+# Round a DateTime to exact minute (seconds & ms -> 0)
+function Round-ToMinute([datetime]$dt) {
+    return $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute)
+}
 # Build an ISO-8601 duration PnDTnHnMnS from a TimeSpan (no negatives)
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
@@ -276,7 +280,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML BUILDER — offsets + deadline in PreAction (Force)
+# ACTION XML BUILDER — offsets + optional PreAction deadline (Force)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -287,19 +291,16 @@ function Build-SourcedFixletActionXml {
         [string]$FixletId,
         [string]$FixletActionName,
         [string]$GroupRelevance,
-        # Offsets (from now)
-        [string]$StartOffset,            # e.g., PT19H or P1DT3H…
+        [string]$StartOffset,            # PT…
         [string]$HasEndText,             # "true"/"false"
-        [string]$EndOffset,              # e.g., PT10H or P…T…
+        [string]$EndOffset,              # PT… or empty
         [string]$HasTimeRangeText,       # "true"/"false"
         [string]$TRStartStr,             # "HH:mm:ss" or ""
         [string]$TREndStr,               # "HH:mm:ss" or ""
-        # PreAction UI
         [string]$ShowPreActionUIText,    # "true"/"false"
         [string]$PreActionText,
         [string]$AskToSaveWorkText,      # "true"/"false"
-        # Force-only deadline (offset string or "")
-        [string]$DeadlineOffset
+        [string]$DeadlineOffset          # PT… or empty (Force only)
     )
 
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
@@ -313,13 +314,10 @@ function Build-SourcedFixletActionXml {
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # TimeRange block
     $timeRangeBlock = ""
     if ($HasTimeRangeText -ieq "true") {
-        $trStartLine = ""
-        if ($TRStartStr) { $trStartLine = "        <StartTime>$TRStartStr</StartTime>" }
-        $trEndLine = ""
-        if ($TREndStr)   { $trEndLine   = "        <EndTime>$TREndStr</EndTime>" }
+        $trStartLine = if ($TRStartStr) { "        <StartTime>$TRStartStr</StartTime>" } else { "" }
+        $trEndLine   = if ($TREndStr)   { "        <EndTime>$TREndStr</EndTime>" }     else { "" }
 $timeRangeBlock = @"
       <TimeRange>
 $trStartLine
@@ -328,17 +326,17 @@ $trEndLine
 "@
     }
 
-    # PreAction (with optional DeadlineLocalOffset)
-    $preActionBlock = ""
-    if ($ShowPreActionUIText -ieq "true") {
-        $deadlineInner = ""
-        if ($DeadlineOffset) {
+    $deadlineInner = ""
+    if ($DeadlineOffset) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
         <DeadlineLocalOffset>$DeadlineOffset</DeadlineLocalOffset>
 "@
-        }
+    }
+
+    $preActionBlock = ""
+    if ($ShowPreActionUIText -ieq "true") {
 $preActionBlock = @"
       <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
@@ -355,7 +353,6 @@ $preActionBlock = @"
 "@
     }
 
-    # End offset line
     $endLine = ""
     if ($HasEndText -ieq "true" -and $EndOffset) {
         $endLine = "      <EndDateTimeLocalOffset>$EndOffset</EndDateTimeLocalOffset>`n"
@@ -534,36 +531,29 @@ $btn.Add_Click({
         $titleRaw = [string]$cont.Node.Title
         if ($null -eq $titleRaw) { $titleRaw = "" }
         $displayName = Parse-FixletTitleToProduct -Title $titleRaw
-
-        # parse (still needed for SingleAction path if ever used)
-        $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
-        $actionScript = $parsed.ActionScript
-
         LogLine "Parsed title (console): $titleRaw"
         LogLine "Display name (messages): $displayName"
 
         # ---- Build absolute times (snap seconds to :00) ----
-        $PilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
-        $PilotStart = $PilotStart.Date.AddHours($PilotStart.Hour).AddMinutes($PilotStart.Minute)
+        $PilotStart = Round-ToMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null))
+        $DeployStart   = Round-ToMinute($PilotStart.AddDays(1))
+        $ConfStart     = Round-ToMinute($PilotStart.AddDays(1))
+        $PilotEnd      = Round-ToMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
+        $DeployEnd     = Round-ToMinute($DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55))
+        $ForceStart    = Round-ToMinute((Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
+        $ForceDeadline = Round-ToMinute($ForceStart.AddDays(1))  # Wed 7:00 AM
 
-        $DeployStart   = $PilotStart.AddDays(1)
-        $ConfStart     = $PilotStart.AddDays(1)
-        $PilotEnd      = $PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)
-        $DeployEnd     = $DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55)
-
-        $ForceStartDate= Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)
-        $ForceStart    = $ForceStartDate.AddHours(7)          # Tue 7:00 AM
-        $ForceDeadline = $ForceStart.AddDays(1)               # Wed 7:00 AM
-
-        # Offsets from now (server expects PT… form)
+        # ---- Compute OFFSETS against a rounded "now" to kill seconds drift ----
         $now = Get-Date
-        $PilotStartOffset  = To-IsoDuration ($PilotStart  - $now)
-        $PilotEndOffset    = To-IsoDuration ($PilotEnd    - $now)
-        $DeployStartOffset = To-IsoDuration ($DeployStart - $now)
-        $DeployEndOffset   = To-IsoDuration ($DeployEnd   - $now)
-        $ConfStartOffset   = To-IsoDuration ($ConfStart   - $now)
-        $ForceStartOffset  = To-IsoDuration ($ForceStart  - $now)
-        $ForceDealineOff   = To-IsoDuration ($ForceDeadline - $now)
+        $nowRounded = $now.Date.AddHours($now.Hour).AddMinutes($now.Minute)  # seconds & ms = 0
+
+        $PilotStartOffset  = To-IsoDuration ($PilotStart  - $nowRounded)
+        $PilotEndOffset    = To-IsoDuration ($PilotEnd    - $nowRounded)
+        $DeployStartOffset = To-IsoDuration ($DeployStart - $nowRounded)
+        $DeployEndOffset   = To-IsoDuration ($DeployEnd   - $nowRounded)
+        $ConfStartOffset   = To-IsoDuration ($ConfStart   - $nowRounded)
+        $ForceStartOffset  = To-IsoDuration ($ForceStart  - $nowRounded)
+        $ForceDealineOff   = To-IsoDuration ($ForceDeadline - $nowRounded)
 
         # Run between window strings
         $TRStartStr  = "19:00:00"
