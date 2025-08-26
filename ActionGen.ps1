@@ -94,7 +94,8 @@ function Normalize-XmlForPost([string]$s) {
 }
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, ($Content ?? ""), $utf8NoBom)
+    if ($null -eq $Content) { $Content = "" }
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
 function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     if (-not $s) { return "" }
@@ -513,10 +514,10 @@ $btn.Add_Click({
     $LogBox.Clear()
 
     LogLine "== Begin click handler =="
-    $server = ($tbServer.Text ?? "").Trim()
-    $user   = ($tbUser.Text ?? "").Trim()
+    $server = if ($tbServer.Text) { $tbServer.Text.Trim() } else { "" }
+    $user   = if ($tbUser.Text)   { $tbUser.Text.Trim()   } else { "" }
     $pass   = $tbPass.Text
-    $fixId  = ($tbFixlet.Text ?? "").Trim()
+    $fixId  = if ($tbFixlet.Text) { $tbFixlet.Text.Trim() } else { "" }
     $dStr   = $cbDate.SelectedItem
     $tStr   = $cbTime.SelectedItem
 
@@ -606,7 +607,8 @@ $btn.Add_Click({
             try {
                 LogLine "Fetching group relevance for $a (group $groupIdNumeric)"
                 $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
-                LogLine ("Group relevance len ({0}): {1}" -f $a, ($groupRel ?? "").Length)
+                $grLen = if ($null -eq $groupRel) { 0 } else { $groupRel.Length }
+                LogLine ("Group relevance len ({0}): {1}" -f $a, $grLen)
             } catch {
                 LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
                 continue
