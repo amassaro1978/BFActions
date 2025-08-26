@@ -18,8 +18,7 @@ $GroupMap = @{
     "Conference/Training Rooms"   = "00-12345"
 }
 
-# Map rollout to the **existing Fixlet Action name** to invoke.
-# Leave as "Action1" if your Fixlet only has one action; otherwise match your named action(s).
+# Map rollout to the existing Fixlet Action name to invoke
 $FixletActionNameMap = @{
     "Pilot"                       = "Action1"
     "Deploy"                      = "Action1"
@@ -73,7 +72,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-# ISO-8601 duration PnDTnHnMnS (kept for SingleAction path)
+# ISO-8601 duration (kept for SingleAction path)
 function To-IsoDuration([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $days = [int]$ts.TotalDays
@@ -86,14 +85,6 @@ function To-IsoDuration([TimeSpan]$ts) {
     $sPart = if ($secs  -gt 0) { "{0}S" -f $secs  } else { "" }
     if ($hPart -eq "" -and $mPart -eq "" -and $sPart -eq "") { $sPart = "0S" }
     return $dPart + "T" + $hPart + $mPart + $sPart
-}
-# Time-of-day as ISO 8601 duration from midnight, e.g., 19:00 -> PT19H, 6:59 -> PT6H59M
-function To-IsoTimeOfDay([int]$hour,[int]$minute=0,[int]$second=0) {
-    $parts = @()
-    if ($hour   -gt 0) { $parts += ("{0}H" -f $hour) }
-    if ($minute -gt 0) { $parts += ("{0}M" -f $minute) }
-    if ($second -gt 0 -or $parts.Count -eq 0) { $parts += ("{0}S" -f $second) }
-    return "PT" + ($parts -join "")
 }
 # Normalize leading BOM/whitespace so POST starts with '<'
 function Normalize-XmlForPost([string]$s) {
@@ -388,31 +379,35 @@ $ActionScript
 "@
 }
 
-# SourcedFixletAction builder — **absolute** times + optional run-between + optional PreAction+Deadline
+# SourcedFixletAction builder — ABSOLUTE times + run-between (HH:mm:ss) + optional PreAction+Deadline
 function Build-SourcedFixletActionXml {
     param(
-        [string]$ActionTitle,       # Pilot/Deploy/Force/Conference...
-        [string]$UiBaseTitle,       # Full Fixlet title ("Update: ... Win")
-        [string]$DisplayName,       # Product-friendly name for messages
-        [string]$SiteName,          # Custom site name
-        [string]$FixletId,          # Fixlet ID
-        [string]$FixletActionName,  # "Action1" or a named action that exists in the Fixlet
-        [string]$GroupRelevance,    # Group filter to AND with fixlet relevance
-        [datetime]$StartLocal,      # scheduled local start (absolute)
-        [Nullable[datetime]]$EndLocal = $null,          # optional absolute end
-        [Nullable[datetime]]$DeadlineLocal = $null,     # optional absolute deadline
+        [string]$ActionTitle,
+        [string]$UiBaseTitle,
+        [string]$DisplayName,
+        [string]$SiteName,
+        [string]$FixletId,
+        [string]$FixletActionName,
+        [string]$GroupRelevance,
+        [datetime]$StartLocal,
+        [Nullable[datetime]]$EndLocal = $null,
+        [Nullable[datetime]]$DeadlineLocal = $null,
         [bool]$HasTimeRange = $false,
-        [Nullable[TimeSpan]]$TimeRangeStart = $null,    # time-of-day from midnight
-        [Nullable[TimeSpan]]$TimeRangeEnd   = $null,    # time-of-day from midnight
+        [Nullable[TimeSpan]]$TimeRangeStart = $null,
+        [Nullable[TimeSpan]]$TimeRangeEnd   = $null,
         [bool]$ShowPreActionUI = $false,
-        [string]$PreActionText = "",   # shown only if ShowPreActionUI=true
-        [bool]$AskToSaveWork = $false  # only meaningful when ShowPreActionUI=true
+        [string]$PreActionText = "",
+        [bool]$AskToSaveWork = $false
     )
 
-    # Console action name
+    # Console action name (with suffix)
     $fullTitle = "${UiBaseTitle}: $ActionTitle"
     $uiTitle   = [System.Security.SecurityElement]::Escape($fullTitle)
-    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
+
+    # UI message/title (without suffix) -> "Update: $DisplayName"
+    $actionUiTitleRaw = "Update: $DisplayName"
+    $actionUiTitleEsc = [System.Security.SecurityElement]::Escape($actionUiTitleRaw)
+    $dispEsc          = [System.Security.SecurityElement]::Escape($DisplayName)
 
     # Snap to :00
     $StartLocal = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
@@ -420,19 +415,25 @@ function Build-SourcedFixletActionXml {
     if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
     $startAbs = $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss')
-    $endLine  = if ($EndLocal.HasValue) { "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n" } else { "" }
+    $endLine  = ""
+    $hasEnd   = $false
+    if ($EndLocal.HasValue) {
+        $hasEnd = $true
+        $endLine = "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n"
+    }
+    $hasEndText = $hasEnd.ToString().ToLower()
 
     # Group relevance (safe CDATA)
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # TimeRange block
+    # TimeRange block -> CLOCK FORMAT HH:mm:ss
     $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     if ($HasTimeRange) {
-        if (-not $TimeRangeStart.HasValue) { $TimeRangeStart = [TimeSpan]::FromHours(19) }                              # 19:00
-        if (-not $TimeRangeEnd.HasValue)   { $TimeRangeEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) } # 06:59
-        $trs = To-IsoTimeOfDay $TimeRangeStart.Value.Hours $TimeRangeStart.Value.Minutes $TimeRangeStart.Value.Seconds
-        $tre = To-IsoTimeOfDay $TimeRangeEnd.Value.Hours   $TimeRangeEnd.Value.Minutes   $TimeRangeEnd.Value.Seconds
+        if (-not $TimeRangeStart.HasValue) { $TimeRangeStart = [TimeSpan]::FromHours(19) }                                   # 19:00
+        if (-not $TimeRangeEnd.HasValue)   { $TimeRangeEnd   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) }   # 06:59
+        $trs = "{0:00}:{1:00}:{2:00}" -f $TimeRangeStart.Value.Hours, $TimeRangeStart.Value.Minutes, $TimeRangeStart.Value.Seconds
+        $tre = "{0:00}:{1:00}:{2:00}" -f $TimeRangeEnd.Value.Hours,   $TimeRangeEnd.Value.Minutes,   $TimeRangeEnd.Value.Seconds
 $timeRangeBlock = @"
       <HasTimeRange>true</HasTimeRange>
       <TimeRange>
@@ -458,7 +459,7 @@ $preActionBlock = @"
       <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
         <Text>$preEsc</Text>
-        <AskToSaveWork>$([string]$AskToSaveWork).ToLower()</AskToSaveWork>
+        <AskToSaveWork>$(([string]$AskToSaveWork).ToLower())</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
         <ShowCancelButton>false</ShowCancelButton>
 $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
@@ -481,14 +482,14 @@ $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
       <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
     </Target>
     <Settings>
-      <ActionUITitle>$uiTitle</ActionUITitle>
+      <ActionUITitle>$actionUiTitleEsc</ActionUITitle>
 $preActionBlock
       <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
 $timeRangeBlock
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocal>$startAbs</StartDateTimeLocal>
-      <HasEndTime>$([string]$EndLocal.HasValue).ToLower()</HasEndTime>
+      <HasEndTime>$hasEndText</HasEndTime>
 $endLine      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
@@ -716,7 +717,6 @@ $btn.Add_Click({
                     -PreActionText    $cfg.Msg `
                     -AskToSaveWork    $cfg.Save
             } else {
-                # (SingleAction path retained but not used by default)
                 $allRel = @(); $allRel += $fixletRelevance; if ($groupRel) { $allRel += $groupRel }
                 $xmlBody = Build-SingleActionXml `
                     -ActionTitle     $a `
