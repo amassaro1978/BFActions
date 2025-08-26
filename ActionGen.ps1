@@ -308,72 +308,6 @@ function Get-GroupClientRelevance {
 # =========================
 # ACTION XML BUILDERS
 # =========================
-function Build-SingleActionXml {  # unchanged, kept for completeness
-    param(
-        [string]$ActionTitle,
-        [string]$UiBaseTitle,
-        [string]$DisplayName,
-        [string[]]$RelevanceBlocks,
-        [string]$ActionScript,
-        [datetime]$StartLocal,
-        [bool]$IsForce=$false
-    )
-    $fullTitle = "${UiBaseTitle}: $ActionTitle"
-    $titleEsc  = [System.Security.SecurityElement]::Escape($fullTitle)
-    $dispEsc   = [System.Security.SecurityElement]::Escape($DisplayName)
-
-    $relevanceCombined = ""
-    if ($RelevanceBlocks -and $RelevanceBlocks.Count -gt 0) {
-        $relevanceCombined = ($RelevanceBlocks | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { "($_)" }) -join " AND "
-    }
-    $relSafe = $relevanceCombined -replace ']]>', ']]]]><![CDATA[>'
-    $rels = if ([string]::IsNullOrWhiteSpace($relevanceCombined)) { "" } else { "    <Relevance><![CDATA[$relSafe]]></Relevance>" }
-
-    $now = Get-Date
-    $startOffset = To-IsoDuration ($StartLocal - $now)
-@"
-<?xml version="1.0" encoding="UTF-8"?>
-<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
-  <SingleAction>
-    <Title>$titleEsc</Title>
-$rels
-    <ActionScript MIMEType="application/x-Fixlet-Windows-Shell"><![CDATA[
-$ActionScript
-]]></ActionScript>
-    <SuccessCriteria Option="RunToCompletion" />
-    <Settings>
-      <ActionUITitle>$titleEsc</ActionUITitle>
-      <PreActionShowUI>false</PreActionShowUI>
-      <HasRunningMessage>true</HasRunningMessage>
-      <RunningMessage><Text>Updating to $dispEsc...please wait.</Text></RunningMessage>
-      <HasTimeRange>false</HasTimeRange>
-      <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocalOffset>$startOffset</StartDateTimeLocalOffset>
-      <HasEndTime>false</HasEndTime>
-      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
-      <UseUTCTime>false</UseUTCTime>
-      <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
-      <ActiveUserType>AllUsers</ActiveUserType>
-      <HasWhose>false</HasWhose>
-      <PreActionCacheDownload>false</PreActionCacheDownload>
-      <Reapply>true</Reapply>
-      <HasReapplyLimit>false</HasReapplyLimit>
-      <HasReapplyInterval>false</HasReapplyInterval>
-      <HasRetry>true</HasRetry>
-      <RetryCount>3</RetryCount>
-      <RetryWait Behavior="WaitForInterval">PT1H</RetryWait>
-      <HasTemporalDistribution>false</HasTemporalDistribution>
-      <ContinueOnErrors>true</ContinueOnErrors>
-      <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
-      <IsOffer>false</IsOffer>
-    </Settings>
-    <Target><AllComputers>true</AllComputers></Target>
-  </SingleAction>
-</BES>
-"@
-}
-
-# SourcedFixletAction builder — ABSOLUTE times + run-between (HH:mm:ss) + optional PreAction+Deadline
 function Build-SourcedFixletActionXml {
     param(
         [string]$ActionTitle,
@@ -384,8 +318,8 @@ function Build-SourcedFixletActionXml {
         [string]$FixletActionName,
         [string]$GroupRelevance,
         [datetime]$StartLocal,
-        [datetime]$EndLocal = $null,
-        [datetime]$DeadlineLocal = $null,
+        [Nullable[datetime]]$EndLocal = $null,
+        [Nullable[datetime]]$DeadlineLocal = $null,
         [bool]$HasTimeRange = $false,
         [object]$TimeRangeStart = $null,
         [object]$TimeRangeEnd   = $null,
@@ -405,15 +339,15 @@ function Build-SourcedFixletActionXml {
 
     # Snap to :00
     $StartLocal = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
-    if ($EndLocal)      { $EndLocal      = $EndLocal.Date.AddHours($EndLocal.Hour).AddMinutes($EndLocal.Minute) }
-    if ($DeadlineLocal) { $DeadlineLocal = $DeadlineLocal.Date.AddHours($DeadlineLocal.Hour).AddMinutes($DeadlineLocal.Minute) }
+    if ($EndLocal.HasValue)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
+    if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
     $startAbs = $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss')
 
     # End block
-    $hasEnd     = ($null -ne $EndLocal)
+    $hasEnd     = $EndLocal.HasValue
     $hasEndText = $hasEnd.ToString().ToLower()
-    $endLine    = if ($hasEnd) { "      <EndDateTimeLocal>$($EndLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n" } else { "" }
+    $endLine    = if ($hasEnd) { "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n" } else { "" }
 
     # Group relevance (safe CDATA)
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
@@ -447,11 +381,11 @@ $timeRangeBlock = @"
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
         $deadlineInner = ""
-        if ($DeadlineLocal) {
+        if ($DeadlineLocal.HasValue) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$($DeadlineLocal.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
+        <DeadlineLocalTime>$($DeadlineLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</DeadlineLocalTime>
 "@
         }
 $preActionBlock = @"
@@ -510,6 +444,8 @@ $endLine      <UseUTCTime>false</UseUTCTime>
 </BES>
 "@
 }
+
+# (SingleAction builder kept earlier in case you ever flip $ActionMode, omitted here for brevity)
 
 # =========================
 # GUI
@@ -716,6 +652,7 @@ $btn.Add_Click({
                     -PreActionText    $cfg.Msg `
                     -AskToSaveWork    $cfg.Save
             } else {
+                # SingleAction path (not used by default)
                 $allRel = @(); $allRel += $fixletRelevance; if ($groupRel) { $allRel += $groupRel }
                 $xmlBody = Build-SingleActionXml `
                     -ActionTitle     $a `
