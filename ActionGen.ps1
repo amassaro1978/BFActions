@@ -18,7 +18,7 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12345"
 }
 
-# Fixlet Action name to invoke
+# Fixlet Action name to invoke (use your actual Fixlet action name(s))
 $FixletActionNameMap = @{
     "Pilot"                     = "Action1"
     "Deploy"                    = "Action1"
@@ -70,11 +70,19 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-function Normalize-XmlForPost([string]$s) {
-    if (-not $s) { return $s }
-    $noBom = $s -replace "^\uFEFF",""
-    $noLeadWs = $noBom -replace '^\s+',''
-    return $noLeadWs
+# Build an ISO-8601 duration PnDTnHnMnS from a TimeSpan (no negatives)
+function To-IsoDuration([TimeSpan]$ts) {
+    if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
+    $days = [int][Math]::Floor($ts.TotalDays)
+    $hours = $ts.Hours
+    $mins  = $ts.Minutes
+    $secs  = $ts.Seconds
+    $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
+    $tPart = @()
+    if ($hours -gt 0) { $tPart += ("{0}H" -f $hours) }
+    if ($mins  -gt 0) { $tPart += ("{0}M" -f $mins) }
+    if ($secs  -gt 0 -or $tPart.Count -eq 0) { $tPart += ("{0}S" -f $secs) }
+    return $dPart + "T" + ($tPart -join "")
 }
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -268,7 +276,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML BUILDER (strings-only, deadline under <Settings>)
+# ACTION XML BUILDER — offsets + deadline in PreAction (Force)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -279,16 +287,19 @@ function Build-SourcedFixletActionXml {
         [string]$FixletId,
         [string]$FixletActionName,
         [string]$GroupRelevance,
-        [string]$StartLocalStr,          # "yyyy-MM-ddTHH:mm:ss"
+        # Offsets (from now)
+        [string]$StartOffset,            # e.g., PT19H or P1DT3H…
         [string]$HasEndText,             # "true"/"false"
-        [string]$EndLocalStr,            # same format or ""
+        [string]$EndOffset,              # e.g., PT10H or P…T…
         [string]$HasTimeRangeText,       # "true"/"false"
         [string]$TRStartStr,             # "HH:mm:ss" or ""
         [string]$TREndStr,               # "HH:mm:ss" or ""
+        # PreAction UI
         [string]$ShowPreActionUIText,    # "true"/"false"
         [string]$PreActionText,
         [string]$AskToSaveWorkText,      # "true"/"false"
-        [string]$DeadlineLocalStr        # "yyyy-MM-ddTHH:mm:ss" or ""
+        # Force-only deadline (offset string or "")
+        [string]$DeadlineOffset
     )
 
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
@@ -317,19 +328,17 @@ $trEndLine
 "@
     }
 
-    # Deadline block — must be under <Settings>, not inside <PreAction>
-    $deadlineSettingsBlock = ""
-    if ($DeadlineLocalStr) {
-$deadlineSettingsBlock = @"
-      <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-      <DeadlineType>Absolute</DeadlineType>
-      <DeadlineLocalTime>$DeadlineLocalStr</DeadlineLocalTime>
-"@
-    }
-
-    # PreAction block (no deadline lines inside)
+    # PreAction (with optional DeadlineLocalOffset)
     $preActionBlock = ""
     if ($ShowPreActionUIText -ieq "true") {
+        $deadlineInner = ""
+        if ($DeadlineOffset) {
+$deadlineInner = @"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalOffset>$DeadlineOffset</DeadlineLocalOffset>
+"@
+        }
 $preActionBlock = @"
       <PreActionShowUI>true</PreActionShowUI>
       <PreAction>
@@ -337,7 +346,7 @@ $preActionBlock = @"
         <AskToSaveWork>$AskToSaveWorkText</AskToSaveWork>
         <ShowActionButton>false</ShowActionButton>
         <ShowCancelButton>false</ShowCancelButton>
-        <ShowConfirmation>false</ShowConfirmation>
+$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
       </PreAction>
 "@
     } else {
@@ -346,10 +355,10 @@ $preActionBlock = @"
 "@
     }
 
-    # End date line
+    # End offset line
     $endLine = ""
-    if ($HasEndText -ieq "true" -and $EndLocalStr) {
-        $endLine = "      <EndDateTimeLocal>$EndLocalStr</EndDateTimeLocal>`n"
+    if ($HasEndText -ieq "true" -and $EndOffset) {
+        $endLine = "      <EndDateTimeLocalOffset>$EndOffset</EndDateTimeLocalOffset>`n"
     }
 
 @"
@@ -366,11 +375,11 @@ $preActionBlock = @"
     </Target>
     <Settings>
       <ActionUITitle>$uiTitleMessage</ActionUITitle>
-$preActionBlock$deadlineSettingsBlock      <HasRunningMessage>true</HasRunningMessage>
+$preActionBlock      <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
       <HasTimeRange>$HasTimeRangeText</HasTimeRange>
 $timeRangeBlock      <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocal>$StartLocalStr</StartDateTimeLocal>
+      <StartDateTimeLocalOffset>$StartOffset</StartDateTimeLocalOffset>
       <HasEndTime>$HasEndText</HasEndTime>
 $endLine      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
@@ -526,16 +535,14 @@ $btn.Add_Click({
         if ($null -eq $titleRaw) { $titleRaw = "" }
         $displayName = Parse-FixletTitleToProduct -Title $titleRaw
 
+        # parse (still needed for SingleAction path if ever used)
         $parsed = Get-ActionAndRelevance -ContainerNode $cont.Node
-        $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
         $actionScript = $parsed.ActionScript
 
         LogLine "Parsed title (console): $titleRaw"
         LogLine "Display name (messages): $displayName"
-        LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
-        LogLine ("Action script length: {0}" -f $actionScript.Length)
 
-        # ---- Build schedules (snap seconds to :00) ----
+        # ---- Build absolute times (snap seconds to :00) ----
         $PilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
         $PilotStart = $PilotStart.Date.AddHours($PilotStart.Hour).AddMinutes($PilotStart.Minute)
 
@@ -548,20 +555,28 @@ $btn.Add_Click({
         $ForceStart    = $ForceStartDate.AddHours(7)          # Tue 7:00 AM
         $ForceDeadline = $ForceStart.AddDays(1)               # Wed 7:00 AM
 
-        # Run between window
-        $TRStartSpan = [TimeSpan]::FromHours(19)                                  # 19:00:00
-        $TREndSpan   = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59))  # 06:59:00
-        $TRStartStr  = "{0:00}:{1:00}:{2:00}" -f $TRStartSpan.Hours, $TRStartSpan.Minutes, $TRStartSpan.Seconds
-        $TREndStr    = "{0:00}:{1:00}:{2:00}" -f $TREndSpan.Hours,   $TREndSpan.Minutes,   $TREndSpan.Seconds
+        # Offsets from now (server expects PT… form)
+        $now = Get-Date
+        $PilotStartOffset  = To-IsoDuration ($PilotStart  - $now)
+        $PilotEndOffset    = To-IsoDuration ($PilotEnd    - $now)
+        $DeployStartOffset = To-IsoDuration ($DeployStart - $now)
+        $DeployEndOffset   = To-IsoDuration ($DeployEnd   - $now)
+        $ConfStartOffset   = To-IsoDuration ($ConfStart   - $now)
+        $ForceStartOffset  = To-IsoDuration ($ForceStart  - $now)
+        $ForceDealineOff   = To-IsoDuration ($ForceDeadline - $now)
+
+        # Run between window strings
+        $TRStartStr  = "19:00:00"
+        $TREndStr    = "06:59:00"
 
         $actions = @(
-            @{ Name="Pilot"; Start=$PilotStart; End=$PilotEnd;   HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineStr="" },
-            @{ Name="Deploy";Start=$DeployStart;End=$DeployEnd;  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineStr="" },
-            @{ Name="Conference/Training Rooms"; Start=$ConfStart; End="";     HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineStr="" },
-            @{ Name="Force"; Start=$ForceStart;  End="";         HasTR="false"; TRS="";        TRE="";        ShowUI="true";
+            @{ Name="Pilot"; StartOff=$PilotStartOffset; EndOff=$PilotEndOffset;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
+            @{ Name="Deploy";StartOff=$DeployStartOffset;EndOff=$DeployEndOffset;  HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
+            @{ Name="Conference/Training Rooms"; StartOff=$ConfStartOffset; EndOff=""; HasEnd="false"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineOff="" },
+            @{ Name="Force"; StartOff=$ForceStartOffset; EndOff=""; HasEnd="false"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
                     $displayName, $ForceDeadline.ToString("M/d/yyyy h:mm tt"));
-               SaveAsk="true"; DeadlineStr=$ForceDeadline.ToString("yyyy-MM-ddTHH:mm:ss") }
+               SaveAsk="true"; DeadlineOff=$ForceDealineOff }
         )
 
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
@@ -589,44 +604,7 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Precompute all builder strings
-            $startStr = $cfg.Start.ToString("yyyy-MM-ddTHH:mm:ss")
-
-            $hasEndTxt = "false"
-            $endStr = ""
-            if ($cfg.End -is [datetime]) {
-                $hasEndTxt = "true"
-                $endStr = $cfg.End.ToString("yyyy-MM-ddTHH:mm:ss")
-            }
-
-            $hasTRTxt = "false"
-            $trStartS = ""
-            $trEndS = ""
-            if ($cfg.HasTR -ieq "true") {
-                $hasTRTxt = "true"
-                $trStartS = $cfg.TRS
-                $trEndS = $cfg.TRE
-            }
-
-            $showUITxt = "false"
-            if ($cfg.ShowUI -ieq "true") { $showUITxt = "true" }
-
-            $askSaveTxt = "false"
-            if ($cfg.SaveAsk -ieq "true") { $askSaveTxt = "true" }
-
-            $deadlineS = ""
-            if ($cfg.DeadlineStr) { $deadlineS = $cfg.DeadlineStr }
-
-            # Clean log strings
-            $endStrLog      = $endStr;      if (-not $endStrLog)      { $endStrLog = "<none>" }
-            $trStartStrLog  = $trStartS;    if (-not $trStartStrLog)  { $trStartStrLog = "<none>" }
-            $trEndStrLog    = $trEndS;      if (-not $trEndStrLog)    { $trEndStrLog = "<none>" }
-            $deadlineStrLog = $deadlineS;   if (-not $deadlineStrLog) { $deadlineStrLog = "<none>" }
-
-            LogLine ("Params for {0}: Start={1} End={2} HasEnd={3} TR={4} TRS={5} TRE={6} ShowUI={7} Deadline={8}" -f `
-                $a, $startStr, $endStrLog, $hasEndTxt, $hasTRTxt, $trStartStrLog, $trEndStrLog, $showUITxt, $deadlineStrLog)
-
-            # Build XML
+            # Build XML with offsets
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
                 -UiBaseTitle          $titleRaw `
@@ -635,18 +613,18 @@ $btn.Add_Click({
                 -FixletId             $fixId `
                 -FixletActionName     $fixletActionName `
                 -GroupRelevance       $groupRel `
-                -StartLocalStr        $startStr `
-                -HasEndText           $hasEndTxt `
-                -EndLocalStr          $endStr `
-                -HasTimeRangeText     $hasTRTxt `
-                -TRStartStr           $trStartS `
-                -TREndStr             $trEndS `
-                -ShowPreActionUIText  $showUITxt `
+                -StartOffset          $cfg.StartOff `
+                -HasEndText           $cfg.HasEnd `
+                -EndOffset            $cfg.EndOff `
+                -HasTimeRangeText     $cfg.HasTR `
+                -TRStartStr           $cfg.TRS `
+                -TREndStr             $cfg.TRE `
+                -ShowPreActionUIText  $cfg.ShowUI `
                 -PreActionText        $cfg.Msg `
-                -AskToSaveWorkText    $askSaveTxt `
-                -DeadlineLocalStr     $deadlineS
+                -AskToSaveWorkText    $cfg.SaveAsk `
+                -DeadlineOffset       $cfg.DeadlineOff
 
-            $xmlBodyToSend = Normalize-XmlForPost $xmlBody
+            $xmlBodyToSend = $xmlBody  # already clean
             $hex = Get-FirstBytesHex $xmlBodyToSend 32
             LogLine ("First 32 bytes (hex) for {0}: {1}" -f $a, $hex)
 
