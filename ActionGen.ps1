@@ -62,11 +62,11 @@ function Get-AuthHeader([string]$User,[string]$Pass) {
     "Basic " + [Convert]::ToBase64String($bytes)
 }
 function LogLine($txt) {
-    $line = "{0}  {1}" -f (Get-Date -Format 'u'), $txt
-    $LogBox.AppendText($line + "`r`n")
-    Add-Content -Path $LogFile -Value $line
-    $LogBox.SelectionStart = $LogBox.Text.Length
-    $LogBox.ScrollToCaret()
+    try {
+        $line = "{0}  {1}" -f (Get-Date -Format 'u'), $txt
+        if ($LogBox) { $LogBox.AppendText($line + "`r`n"); $LogBox.SelectionStart = $LogBox.Text.Length; $LogBox.ScrollToCaret() }
+        Add-Content -Path $LogFile -Value $line
+    } catch {}
 }
 function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
@@ -94,7 +94,7 @@ function Normalize-XmlForPost([string]$s) {
 }
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+    [System.IO.File]::WriteAllText($Path, ($Content ?? ""), $utf8NoBom)
 }
 function Get-FirstBytesHex([string]$s, [int]$n = 32) {
     if (-not $s) { return "" }
@@ -123,7 +123,7 @@ function HttpGetXml {
     $req.Accept = "application/xml"
     $req.Headers["Accept-Encoding"] = "gzip, deflate"
     $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
-    $req.Headers["Authorization"] = $AuthHeader
+    if ($AuthHeader) { $req.Headers["Authorization"] = $AuthHeader }
     $req.ProtocolVersion = [Version]"1.1"
     $req.PreAuthenticate = $true
     $req.AllowAutoRedirect = $false
@@ -154,43 +154,13 @@ function Post-XmlFile-InFile {
         if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
     } catch {
         $respErr = $_.Exception.Response
-        if ($respErr) {
+        if ($respErr -and $respErr.GetResponseStream) {
             $rs = $respErr.GetResponseStream()
-            if ($rs) {
-                $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
-                $errBody = $sr.ReadToEnd(); $sr.Close()
-                throw "Invoke-WebRequest POST failed :: $errBody"
-            }
+            $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
+            $errBody = $sr.ReadToEnd(); $sr.Close()
+            throw "Invoke-WebRequest POST failed :: $errBody"
         }
         throw ($_.Exception.Message)
-    }
-}
-
-function HttpPostXml {
-    param([string]$Url,[string]$AuthHeader,[string]$XmlBody)
-    $bytes = [Text.Encoding]::UTF8.GetBytes($XmlBody)
-    $req = [System.Net.HttpWebRequest]::Create($Url)
-    $req.Method = "POST"
-    $req.Accept = "application/xml"
-    $req.ContentType = "application/xml; charset=utf-8"
-    $req.UserAgent = "BigFixActionGenerator/1.0"
-    $req.KeepAlive = $false
-    $req.Headers["Authorization"] = $AuthHeader
-    $req.ProtocolVersion = [Version]"1.1"
-    $req.PreAuthenticate = $true
-    $req.AllowAutoRedirect = $false
-    $req.Timeout = 60000
-    $req.ContentLength = $bytes.Length
-    try {
-        $rs = $req.GetRequestStream(); $rs.Write($bytes,0,$bytes.Length); $rs.Close()
-        $resp = $req.GetResponse()
-        try {
-            $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
-            $body = $sr.ReadToEnd(); $sr.Close()
-            if ($body) { LogLine "POST response: $body" }
-        } finally { $resp.Close() }
-    } catch {
-        throw ($_.Exception.GetBaseException().Message)
     }
 }
 
@@ -302,14 +272,14 @@ function Get-GroupClientRelevance {
             }
             LogLine "No usable relevance at ${url}"
         } catch {
-            LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $GroupIdNumeric, $_.Exception.Message)
+            LogLine ("❌ Group relevance fetch failed ({0}): {1}" -f $GroupIdNumeric, $_.Exception.Message)
         }
     }
     throw "No relevance found or derivable for group ${GroupIdNumeric} in custom/master/operator."
 }
 
 # =========================
-# ACTION XML BUILDERS
+# ACTION XML BUILDER (Sourced)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -410,7 +380,7 @@ $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
   <SourcedFixletAction>
     <SourceFixlet>
       <Sitename>$SiteName</Sitename>
-        <FixletID>$FixletId</FixletID>
+      <FixletID>$FixletId</FixletID>
       <Action>$FixletActionName</Action>
     </SourceFixlet>
     <Target>
@@ -425,8 +395,7 @@ $timeRangeBlock
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocal>$startAbs</StartDateTimeLocal>
       <HasEndTime>$hasEndText</HasEndTime>
-$endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
-      <UseUTCTime>false</UseUTCTime>
+$endLine      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
       <HasWhose>false</HasWhose>
@@ -447,8 +416,6 @@ $endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
 </BES>
 "@
 }
-
-# (SingleAction builder kept earlier if you ever flip $ActionMode)
 
 # =========================
 # GUI
@@ -544,12 +511,16 @@ $form.Controls.Add($LogBox)
 # =========================
 $btn.Add_Click({
     $LogBox.Clear()
-    $server = $tbServer.Text.Trim()
-    $user   = $tbUser.Text.Trim()
+
+    LogLine "== Begin click handler =="
+    $server = ($tbServer.Text ?? "").Trim()
+    $user   = ($tbUser.Text ?? "").Trim()
     $pass   = $tbPass.Text
-    $fixId  = $tbFixlet.Text.Trim()
+    $fixId  = ($tbFixlet.Text ?? "").Trim()
     $dStr   = $cbDate.SelectedItem
     $tStr   = $cbTime.SelectedItem
+
+    LogLine "Fields: server='$server' user='$user' fixId='$fixId' date='$dStr' time='$tStr'"
 
     if (-not ($server -and $user -and $pass -and $fixId -and $dStr -and $tStr)) {
         LogLine "❌ Please fill in Server, Username, Password, Fixlet ID, Date, and Time."
@@ -557,11 +528,13 @@ $btn.Add_Click({
     }
 
     try {
+        LogLine "Phase: Build base URLs"
         $base = Get-BaseUrl $server
         $encodedSite = Encode-SiteName $CustomSiteName
         $fixletUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/fixlet/custom/$encodedSite/$fixId"
         LogLine "Encoded Fixlet GET URL: ${fixletUrl}"
 
+        LogLine "Phase: Auth + GET fixlet"
         $auth = Get-AuthHeader -User $user -Pass $pass
         $fixletContent = HttpGetXml -Url $fixletUrl -AuthHeader $auth
         if ($DumpFetchedXmlToTemp) {
@@ -570,6 +543,7 @@ $btn.Add_Click({
             LogLine "Saved fetched fixlet XML to: $tmpFix"
         }
 
+        LogLine "Phase: Parse fixlet XML"
         $fixletXml = [xml]$fixletContent
         $cont = Get-FixletContainer -Xml $fixletXml
         LogLine ("Detected BES content type: {0}" -f $cont.Type)
@@ -586,6 +560,7 @@ $btn.Add_Click({
         LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
+        LogLine "Phase: Build schedules"
         # Absolute schedule (user picks local date/time) — snap to :00 seconds
         $PilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
         $PilotStart = $PilotStart.Date.AddHours($PilotStart.Hour).AddMinutes($PilotStart.Minute)
@@ -620,6 +595,8 @@ $btn.Add_Click({
 
         foreach ($cfg in $actions) {
             $a = $cfg.Name
+            LogLine "---- Building: $a ----"
+
             $groupIdRaw = "$($GroupMap[$a])"
             if (-not $groupIdRaw) { LogLine "❌ Missing group id for $a"; continue }
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
@@ -627,8 +604,9 @@ $btn.Add_Click({
 
             # fetch group relevance
             try {
+                LogLine "Fetching group relevance for $a (group $groupIdNumeric)"
                 $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
-                LogLine ("Group relevance len ({0}): {1}" -f $a, $groupRel.Length)
+                LogLine ("Group relevance len ({0}): {1}" -f $a, ($groupRel ?? "").Length)
             } catch {
                 LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
                 continue
@@ -637,6 +615,7 @@ $btn.Add_Click({
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
             if ($ActionMode -ieq 'Sourced') {
+                LogLine "Assembling SourcedFixletAction XML for $a"
                 $xmlBody = Build-SourcedFixletActionXml `
                     -ActionTitle      $a `
                     -UiBaseTitle      $titleRaw `
@@ -681,12 +660,10 @@ $btn.Add_Click({
 
             try {
                 if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
-                    LogLine "Posting via Invoke-WebRequest (curl-like) using file: $tmpAction"
+                    LogLine "Posting via Invoke-WebRequest (file): $tmpAction"
                     Post-XmlFile-InFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
                 } else {
-                    LogLine "Posting via HttpWebRequest body (direct bytes)"
-                    $authHeader = Get-AuthHeader -User $user -Pass $pass
-                    HttpPostXml -Url $postUrl -AuthHeader $authHeader -XmlBody $xmlBodyToSend
+                    LogLine "⚠️ Direct POST path disabled; enable if needed."
                 }
                 LogLine ("✅ {0} posted successfully." -f $a)
             } catch {
