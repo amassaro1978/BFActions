@@ -304,8 +304,10 @@ function Build-SourcedFixletActionXml {
 
     $timeRangeBlock = ""
     if ($HasTimeRangeText -ieq "true") {
-        $trStartLine = if ($TRStartStr) { "        <StartTime>$TRStartStr</StartTime>" } else { "" }
-        $trEndLine   = if ($TREndStr)   { "        <EndTime>$TREndStr</EndTime>" }     else { "" }
+        $trStartLine = ""
+        if ($TRStartStr) { $trStartLine = "        <StartTime>$TRStartStr</StartTime>" }
+        $trEndLine = ""
+        if ($TREndStr)   { $trEndLine   = "        <EndTime>$TREndStr</EndTime>" }
 $timeRangeBlock = @"
       <TimeRange>
 $trStartLine
@@ -574,7 +576,7 @@ $btn.Add_Click({
             try {
                 LogLine "Fetching group relevance for $a (group $groupIdNumeric)"
                 $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
-                $grLen = if ($null -eq $groupRel) { 0 } else { $groupRel.Length }
+                $grLen = 0; if ($groupRel) { $grLen = $groupRel.Length }
                 LogLine ("Group relevance len ({0}): {1}" -f $a, $grLen)
             } catch {
                 LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
@@ -583,22 +585,39 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Precompute all builder strings (no nullables)
-            $startStr   = $cfg.Start.ToString("yyyy-MM-ddTHH:mm:ss")
-            $hasEndTxt  = (if ($cfg.End -is [datetime]) { "true" } else { "false" })
-            $endStr     = (if ($cfg.End -is [datetime]) { $cfg.End.ToString("yyyy-MM-ddTHH:mm:ss") } else { "" })
-            $hasTRTxt   = (if ($cfg.HasTR -ieq "true") { "true" } else { "false" })
-            $trStartS   = (if ($cfg.HasTR -ieq "true") { $cfg.TRS } else { "" })
-            $trEndS     = (if ($cfg.HasTR -ieq "true") { $cfg.TRE } else { "" })
-            $showUITxt  = (if ($cfg.ShowUI -ieq "true") { "true" } else { "false" })
-            $askSaveTxt = (if ($cfg.SaveAsk -ieq "true") { "true" } else { "false" })
-            $deadlineS  = (if ($cfg.DeadlineStr) { $cfg.DeadlineStr } else { "" })
+            # Precompute all builder strings (replace inline-if with statements)
+            $startStr = $cfg.Start.ToString("yyyy-MM-ddTHH:mm:ss")
 
-            # ---- Clean logging (NO inline if) ----
-            $endStrLog      = (if ($endStr)     { $endStr }     else { "<none>" })
-            $trStartStrLog  = (if ($trStartS)   { $trStartS }   else { "<none>" })
-            $trEndStrLog    = (if ($trEndS)     { $trEndS }     else { "<none>" })
-            $deadlineStrLog = (if ($deadlineS)  { $deadlineS }  else { "<none>" })
+            $hasEndTxt = "false"
+            $endStr = ""
+            if ($cfg.End -is [datetime]) {
+                $hasEndTxt = "true"
+                $endStr = $cfg.End.ToString("yyyy-MM-ddTHH:mm:ss")
+            }
+
+            $hasTRTxt = "false"
+            $trStartS = ""
+            $trEndS = ""
+            if ($cfg.HasTR -ieq "true") {
+                $hasTRTxt = "true"
+                $trStartS = $cfg.TRS
+                $trEndS = $cfg.TRE
+            }
+
+            $showUITxt = "false"
+            if ($cfg.ShowUI -ieq "true") { $showUITxt = "true" }
+
+            $askSaveTxt = "false"
+            if ($cfg.SaveAsk -ieq "true") { $askSaveTxt = "true" }
+
+            $deadlineS = ""
+            if ($cfg.DeadlineStr) { $deadlineS = $cfg.DeadlineStr }
+
+            # Clean log strings
+            $endStrLog      = $endStr;      if (-not $endStrLog)      { $endStrLog = "<none>" }
+            $trStartStrLog  = $trStartS;    if (-not $trStartStrLog)  { $trStartStrLog = "<none>" }
+            $trEndStrLog    = $trEndS;      if (-not $trEndStrLog)    { $trEndStrLog = "<none>" }
+            $deadlineStrLog = $deadlineS;   if (-not $deadlineStrLog) { $deadlineStrLog = "<none>" }
 
             LogLine ("Params for {0}: Start={1} End={2} HasEnd={3} TR={4} TRS={5} TRE={6} ShowUI={7} Deadline={8}" -f `
                 $a, $startStr, $endStrLog, $hasEndTxt, $hasTRTxt, $trStartStrLog, $trEndStrLog, $showUITxt, $deadlineStrLog)
