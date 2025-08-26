@@ -33,6 +33,9 @@ $AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
 $PostUsingInvokeWebRequest  = $true
 
+# NEW: align exactly once to the top of a minute before posting (avoids minute bump)
+$AlignOnceToTopOfMinute     = $true
+
 # =========================
 # UTIL / LOGGING
 # =========================
@@ -278,7 +281,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML BUILDER — note: we pass already-computed offsets (per-action)
+# ACTION XML BUILDER
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -549,7 +552,16 @@ $btn.Add_Click({
         $TRStartStr  = "19:00:00"
         $TREndStr    = "06:59:00"
 
-        # Keep the absolute targets; compute OFFSETS *per-action right before posting*
+        # One-time align to top-of-minute (max 59s), then compute offsets per action just-in-time
+        if ($AlignOnceToTopOfMinute) {
+            $sec = (Get-Date).Second
+            if ($sec -ne 0) {
+                $sleep = 60 - $sec
+                LogLine ("One-time wait {0}s to align to :00…" -f $sleep)
+                Start-Sleep -Seconds $sleep
+            }
+        }
+
         $actions = @(
             @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
             @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
@@ -585,7 +597,7 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # >>> Fresh offsets right before POST — eliminates second/minute drift <<<
+            # Fresh offsets right before POST
             $postNow = Get-Date
             $startOff   = To-IsoDuration ($cfg.AbsStart - $postNow)
             $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDuration ($cfg.AbsEnd - $postNow) } else { "" }
