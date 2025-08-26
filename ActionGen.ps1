@@ -153,13 +153,16 @@ function Post-XmlFile-InFile {
             -UseBasicParsing
         if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
     } catch {
-        if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
-            $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream(), [Text.Encoding]::UTF8)
-            $errBody = $sr.ReadToEnd(); $sr.Close()
-            throw "Invoke-WebRequest POST failed :: $errBody"
-        } else {
-            throw ($_.Exception.Message)
+        $respErr = $_.Exception.Response
+        if ($respErr) {
+            $rs = $respErr.GetResponseStream()
+            if ($rs) {
+                $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
+                $errBody = $sr.ReadToEnd(); $sr.Close()
+                throw "Invoke-WebRequest POST failed :: $errBody"
+            }
         }
+        throw ($_.Exception.Message)
     }
 }
 
@@ -299,7 +302,7 @@ function Get-GroupClientRelevance {
             }
             LogLine "No usable relevance at ${url}"
         } catch {
-            LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
+            LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $GroupIdNumeric, $_.Exception.Message)
         }
     }
     throw "No relevance found or derivable for group ${GroupIdNumeric} in custom/master/operator."
@@ -337,26 +340,25 @@ function Build-SourcedFixletActionXml {
     $actionUiTitleEsc = [System.Security.SecurityElement]::Escape($actionUiTitleRaw)
     $dispEsc          = [System.Security.SecurityElement]::Escape($DisplayName)
 
-    # Snap to :00
+    # Snap scheduled times to :00 secs
     $StartLocal = $StartLocal.Date.AddHours($StartLocal.Hour).AddMinutes($StartLocal.Minute)
-    if ($EndLocal.HasValue)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
-    if ($DeadlineLocal.HasValue) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
+    if ($null -ne $EndLocal)      { $EndLocal      = $EndLocal.Value.Date.AddHours($EndLocal.Value.Hour).AddMinutes($EndLocal.Value.Minute) }
+    if ($null -ne $DeadlineLocal) { $DeadlineLocal = $DeadlineLocal.Value.Date.AddHours($DeadlineLocal.Value.Hour).AddMinutes($DeadlineLocal.Value.Minute) }
 
     $startAbs = $StartLocal.ToString('yyyy-MM-ddTHH:mm:ss')
 
     # End block
-    $hasEnd     = $EndLocal.HasValue
-    $hasEndText = $hasEnd.ToString().ToLower()
+    $hasEnd     = ($null -ne $EndLocal)
+    $hasEndText = ([string]$hasEnd).ToLower()
     $endLine    = if ($hasEnd) { "      <EndDateTimeLocal>$($EndLocal.Value.ToString('yyyy-MM-ddTHH:mm:ss'))</EndDateTimeLocal>`n" } else { "" }
 
     # Group relevance (safe CDATA)
     $groupSafe = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # TimeRange block -> CLOCK FORMAT HH:mm:ss
+    # TimeRange block -> HH:mm:ss
     $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     if ($HasTimeRange) {
-        # Coerce TR start/end to TimeSpan reliably
         if ($null -eq $TimeRangeStart) { $trsSpan = [TimeSpan]::FromHours(19) }
         elseif ($TimeRangeStart -is [TimeSpan]) { $trsSpan = $TimeRangeStart }
         else { $trsSpan = [TimeSpan]::Parse($TimeRangeStart.ToString()) }
@@ -376,12 +378,12 @@ $timeRangeBlock = @"
 "@
     }
 
-    # PreAction block (Force uses this + absolute Deadline)
+    # PreAction block (Force uses this + absolute DeadlineLocalTime)
     $preActionBlock = ""
     if ($ShowPreActionUI) {
         $preEsc = [System.Security.SecurityElement]::Escape($PreActionText)
         $deadlineInner = ""
-        if ($DeadlineLocal.HasValue) {
+        if ($null -ne $DeadlineLocal) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
@@ -408,7 +410,7 @@ $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
   <SourcedFixletAction>
     <SourceFixlet>
       <Sitename>$SiteName</Sitename>
-      <FixletID>$FixletId</FixletID>
+        <FixletID>$FixletId</FixletID>
       <Action>$FixletActionName</Action>
     </SourceFixlet>
     <Target>
@@ -423,7 +425,8 @@ $timeRangeBlock
       <HasStartTime>true</HasStartTime>
       <StartDateTimeLocal>$startAbs</StartDateTimeLocal>
       <HasEndTime>$hasEndText</HasEndTime>
-$endLine      <UseUTCTime>false</UseUTCTime>
+$endLine      <HasDayOfWeekConstraint>false</HasDayOfWeekConstraint>
+      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
       <HasWhose>false</HasWhose>
@@ -445,7 +448,7 @@ $endLine      <UseUTCTime>false</UseUTCTime>
 "@
 }
 
-# (SingleAction builder kept earlier in case you ever flip $ActionMode, omitted here for brevity)
+# (SingleAction builder kept earlier if you ever flip $ActionMode)
 
 # =========================
 # GUI
