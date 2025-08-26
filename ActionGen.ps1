@@ -33,9 +33,6 @@ $AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
 $PostUsingInvokeWebRequest  = $true
 
-# NEW: align exactly once to the top of a minute before posting (avoids minute bump)
-$AlignOnceToTopOfMinute     = $true
-
 # =========================
 # UTIL / LOGGING
 # =========================
@@ -75,20 +72,27 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
 }
 # Round a DateTime to exact minute (seconds & ms -> 0)
 function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
-# ISO-8601 duration PnDTnHnMnS (no negatives)
-function To-IsoDuration([TimeSpan]$ts) {
+
+# Build ISO-8601 duration but **rounded to nearest second** (no truncation drift)
+function To-IsoDurationRounded([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
-    $days = [int][Math]::Floor($ts.TotalDays)
-    $hours = $ts.Hours
-    $mins  = $ts.Minutes
-    $secs  = $ts.Seconds
+    $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
+    if ($totalSec -lt 0) { $totalSec = 0 }
+    $days  = [int]([Math]::Floor($totalSec / 86400))
+    $rem   = $totalSec - ($days * 86400)
+    $hours = [int]([Math]::Floor($rem / 3600))
+    $rem   = $rem - ($hours * 3600)
+    $mins  = [int]([Math]::Floor($rem / 60))
+    $secs  = [int]($rem - ($mins * 60))
+
     $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
-    $tPart = @()
-    if ($hours -gt 0) { $tPart += ("{0}H" -f $hours) }
-    if ($mins  -gt 0) { $tPart += ("{0}M" -f $mins) }
-    if ($secs  -gt 0 -or $tPart.Count -eq 0) { $tPart += ("{0}S" -f $secs) }
-    $dPart + "T" + ($tPart -join "")
+    $tParts = @()
+    if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
+    if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
+    if ($secs  -gt 0 -or $tParts.Count -eq 0) { $tParts += ("{0}S" -f $secs) }
+    return $dPart + "T" + ($tParts -join "")
 }
+
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     if ($null -eq $Content) { $Content = "" }
@@ -552,16 +556,6 @@ $btn.Add_Click({
         $TRStartStr  = "19:00:00"
         $TREndStr    = "06:59:00"
 
-        # One-time align to top-of-minute (max 59s), then compute offsets per action just-in-time
-        if ($AlignOnceToTopOfMinute) {
-            $sec = (Get-Date).Second
-            if ($sec -ne 0) {
-                $sleep = 60 - $sec
-                LogLine ("One-time wait {0}s to align to :00…" -f $sleep)
-                Start-Sleep -Seconds $sleep
-            }
-        }
-
         $actions = @(
             @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
             @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
@@ -597,11 +591,11 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Fresh offsets right before POST
+            # Fresh offsets right before POST — with proper rounding to whole seconds
             $postNow = Get-Date
-            $startOff   = To-IsoDuration ($cfg.AbsStart - $postNow)
-            $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDuration ($cfg.AbsEnd - $postNow) } else { "" }
-            $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDuration ($cfg.AbsDeadline - $postNow) } else { "" }
+            $startOff   = To-IsoDurationRounded ($cfg.AbsStart - $postNow)
+            $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationRounded ($cfg.AbsEnd - $postNow) } else { "" }
+            $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDurationRounded ($cfg.AbsDeadline - $postNow) } else { "" }
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
