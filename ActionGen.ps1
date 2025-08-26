@@ -68,6 +68,7 @@ function LogLine($txt) {
         Add-Content -Path $LogFile -Value $line
     } catch {}
 }
+function Fmt($v) { if ($null -eq $v) { return "<null>" } else { return $v } }
 function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
@@ -347,13 +348,12 @@ function Build-SourcedFixletActionXml {
     $timeRangeBlock = "      <HasTimeRange>false</HasTimeRange>"
     if ($HasTimeRange) {
         # defaults if null
-        if ($null -eq $TimeRangeStart) { $trsSpan = [TimeSpan]::FromHours(19) }
-        elseif ($TimeRangeStart -is [TimeSpan]) { $trsSpan = $TimeRangeStart }
-        else { $trsSpan = [TimeSpan]::Parse($TimeRangeStart.ToString()) }
-
-        if ($null -eq $TimeRangeEnd) { $treSpan = [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) }
-        elseif ($TimeRangeEnd -is [TimeSpan]) { $treSpan = $TimeRangeEnd }
-        else { $treSpan = [TimeSpan]::Parse($TimeRangeEnd.ToString()) }
+        $trsSpan = if ($null -eq $TimeRangeStart) { [TimeSpan]::FromHours(19) }
+                   elseif ($TimeRangeStart -is [TimeSpan]) { $TimeRangeStart }
+                   else { [TimeSpan]::Parse($TimeRangeStart.ToString()) }
+        $treSpan = if ($null -eq $TimeRangeEnd) { [TimeSpan]::FromHours(6).Add([TimeSpan]::FromMinutes(59)) }
+                   elseif ($TimeRangeEnd -is [TimeSpan]) { $TimeRangeEnd }
+                   else { [TimeSpan]::Parse($TimeRangeEnd.ToString()) }
 
         $trs = "{0:00}:{1:00}:{2:00}" -f $trsSpan.Hours, $trsSpan.Minutes, $trsSpan.Seconds
         $tre = "{0:00}:{1:00}:{2:00}" -f $treSpan.Hours, $treSpan.Minutes, $treSpan.Seconds
@@ -364,32 +364,6 @@ $timeRangeBlock = @"
         <EndTime>$tre</EndTime>
       </TimeRange>
 "@
-    }
-
-    # PreAction block (Force uses this + absolute DeadlineLocalTime)
-    $preActionBlock = ""
-    if ($ShowPreActionUI) {
-        $preEsc = SafeEscape($PreActionText)
-        $deadlineInner = ""
-        if ($null -ne $DeadlineLocal) {
-$deadlineInner = @"
-        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-        <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalTime>$([string](SafeIsoLocal($DeadlineLocal)))</DeadlineLocalTime>
-"@
-        }
-$preActionBlock = @"
-      <PreActionShowUI>true</PreActionShowUI>
-      <PreAction>
-        <Text>$preEsc</Text>
-        <AskToSaveWork>$(([string]$AskToSaveWork).ToLower())</AskToSaveWork>
-        <ShowActionButton>false</ShowActionButton>
-        <ShowCancelButton>false</ShowCancelButton>
-$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
-      </PreAction>
-"@
-    } else {
-        $preActionBlock = "      <PreActionShowUI>false</PreActionShowUI>"
     }
 
 @"
@@ -406,7 +380,21 @@ $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
     </Target>
     <Settings>
       <ActionUITitle>$actionUiTitleEsc</ActionUITitle>
-$preActionBlock
+      <PreActionShowUI>$(([string]$ShowPreActionUI).ToLower())</PreActionShowUI>
+$(if($ShowPreActionUI){
+"      <PreAction>
+        <Text>$([string](SafeEscape($PreActionText)))</Text>
+        <AskToSaveWork>$(([string]$AskToSaveWork).ToLower())</AskToSaveWork>
+        <ShowActionButton>false</ShowActionButton>
+        <ShowCancelButton>false</ShowCancelButton>
+$(if($null -ne $DeadlineLocal){
+"        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalTime>$([string](SafeIsoLocal($DeadlineLocal)))</DeadlineLocalTime>"
+})
+        <ShowConfirmation>false</ShowConfirmation>
+      </PreAction>"
+})
       <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
 $timeRangeBlock
@@ -538,7 +526,7 @@ $btn.Add_Click({
     $dStr   = $cbDate.SelectedItem
     $tStr   = $cbTime.SelectedItem
 
-    LogLine "Fields: server='$server' user='$user' fixId='$fixId' date='$dStr' time='$tStr'"
+    LogLine ("Fields: server='{0}' user='{1}' fixId='{2}' date='{3}' time='{4}'" -f (Fmt $server),(Fmt $user),(Fmt $fixId),(Fmt $dStr),(Fmt $tStr))
 
     if (-not ($server -and $user -and $pass -and $fixId -and $dStr -and $tStr)) {
         LogLine "❌ Please fill in Server, Username, Password, Fixlet ID, Date, and Time."
@@ -574,8 +562,8 @@ $btn.Add_Click({
         $fixletRelevance = @(); if ($parsed.Relevance) { $fixletRelevance = $parsed.Relevance }
         $actionScript = $parsed.ActionScript
 
-        LogLine "Parsed title (console): ${titleRaw}"
-        LogLine "Display name (messages): ${displayName}"
+        LogLine "Parsed title (console): $titleRaw"
+        LogLine "Display name (messages): $displayName"
         LogLine ("Fixlet relevance count: {0}" -f $fixletRelevance.Count)
         LogLine ("Action script length: {0}" -f $actionScript.Length)
 
@@ -634,9 +622,9 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Dump parameters for this action (helps catch nulls)
+            # Dump parameters (use Fmt to avoid calling .ToString() on $null)
             LogLine ("Params for {0}: Start={1} End={2} Deadline={3} TR={4} TRS={5} TRE={6}" -f `
-                $a, ($cfg.Start), ($cfg.End), ($cfg.Deadline), ($cfg.TR), ($cfg.TRS), ($cfg.TRE))
+                $a, (Fmt $cfg.Start), (Fmt $cfg.End), (Fmt $cfg.Deadline), (Fmt $cfg.TR), (Fmt $cfg.TRS), (Fmt $cfg.TRE))
 
             if ($ActionMode -ieq 'Sourced') {
                 LogLine "Assembling SourcedFixletAction XML for $a"
