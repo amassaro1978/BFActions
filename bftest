@@ -75,9 +75,9 @@ $textSite.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $textSite.Items.Add("test site 1")
 $textSite.Items.Add("test 2 (Workstations)")
 $textSite.SelectedIndex = 0
-$form.Controls.Add($textSite)
+$Form.Controls.Add($textsite)
 
-# --- NEW: Icon picker field ---
+# Icon file picker
 $labelIcon = New-Object System.Windows.Forms.Label -Property @{Text="Icon File:"; Location=New-Object System.Drawing.Point(10,180)}
 $textIcon  = New-TextBox 120 180 400
 $btnBrowseIcon = New-Object System.Windows.Forms.Button -Property @{
@@ -92,10 +92,7 @@ $btnBrowseIcon.Add_Click({
         $textIcon.Text = $ofd.FileName
     }
 })
-$form.Controls.AddRange(@($labelIcon,$textIcon,$btnBrowseIcon))
-# --- END Icon picker ---
-
-$form.Controls.AddRange(@($labelVendor, $textVendor, $labelApp, $textApp, $labelVer, $textVer, $labelSite))
+$form.Controls.AddRange(@($labelVendor, $textVendor, $labelapp, $textApp, $labelver, $textVer, $labelSite, $textSite, $labelIcon,$textIcon,$btnBrowseIcon))
 
 # Function to create the fixlet blocks
 function Add-FixletBlock {
@@ -130,9 +127,9 @@ $textServer.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $textServer.Items.Add("https://dev.server:52311")
 $textServer.Items.Add("https://prod.server:52311")
 $textServer.SelectedIndex = 0
-$form.Controls.Add($textServer)
+$Form.Controls.Add($textserver)
 
-# Create the username and password fields
+#Create the username and password fields
 $labelUser = New-Object System.Windows.Forms.Label -Property @{Text="Username:"; Location=New-Object System.Drawing.Point(10,730); Size=New-Object System.Drawing.Size(140,20)}
 $textUser = New-TextBox 150 730 200
 
@@ -153,33 +150,46 @@ function Post-Fixlet {
     $category = $map[$type]
     $source = $map[$type]
 
-    # Encode relevance lines
+    # Encode relevance
     $relevanceXML = ($rel -split "`r?`n" | Where-Object { $_.Trim() -ne "" } | ForEach-Object { "<Relevance><![CDATA[$_]]></Relevance>" }) -join "`n"
 
-    # --- NEW: Icon encoding block ---
+    # Encode icon
     $iconBlock = ""
     if ($textIcon.Text -and (Test-Path $textIcon.Text)) {
         try {
             $bytes = [System.IO.File]::ReadAllBytes($textIcon.Text)
             $b64   = [Convert]::ToBase64String($bytes)
-            $iconBlock = "<Icon>$b64</Icon>"
+
+            switch ([System.IO.Path]::GetExtension($textIcon.Text).ToLower()) {
+                ".png" { $mime = "image/png" }
+                ".ico" { $mime = "image/x-icon" }
+                ".gif" { $mime = "image/gif" }
+                default { $mime = "application/octet-stream" }
+            }
+
+            $dataUri = "data:$mime;base64,$b64"
+            $iconBlock = @"
+    <MIMEField>
+      <Name>action-ui-metadata</Name>
+      <Value>{"icon":"$dataUri"}</Value>
+    </MIMEField>
+"@
         } catch {
-            Add-Content -Path $logPath -Value "$timestamp - Failed to read/encode icon file: $($_.Exception.Message)"
+            Add-Content -Path $logPath -Value "$timestamp - Failed to encode icon: $($_.Exception.Message)"
         }
     }
-    # --- END Icon encoding ---
 
     $xml =@"
 <?xml version="1.0" encoding="UTF-8"?>
 <BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
   <Fixlet>
     <Title>$title</Title>
-    $iconBlock
     <Description>$description</Description>
     $relevancexml
     <Category>$Category</Category>
     <Source>$Source</Source>
     <SourceReleaseDate>$releaseDate</SourceReleaseDate>
+    $iconBlock
     <DefaultAction ID="Action1">
       <ActionScript MIMEType="application/x-Fixlet-Windows-Shell"><![CDATA[$act]]></ActionScript>
     </DefaultAction>
@@ -332,7 +342,6 @@ $btnsend.Add_Click({
     [System.Windows.Forms.MessageBox]::Show("Result: `n$cleanLine")
 })
 
-# Add the "Generate and POST Fixlets" button
 $form.Controls.Add($btnSend)
 
 $form.TopMost = $true
