@@ -1,22 +1,5 @@
-# Path to qna.exe
 $qnaPath = "C:\Program Files (x86)\BigFix Enterprise\BES Client\qna.exe"
-
-# Relevance to ask the BES Client
-# Try the full Offer-aware version first:
-$relevance = '(id of it, name of it) of relevant fixlets of sites whose (exists action of it whose (offer for action = true))'
-
-# If your client build doesn’t support 'offer for action', fall back to this:
-#$relevance = '(id of it, name of it) of relevant fixlets whose (exists action of it) of sites'
-
-# Run qna.exe with the relevance
+$relevance = '(id of it, name of it) of relevant fixlets of sites'
 $output = echo $relevance | & $qnaPath
-
-# Parse only the "A:" lines (answers)
 $offers = $output | Where-Object { $_ -like "A:*" } | ForEach-Object { $_.Substring(3).Trim() }
-
-if ($offers.Count -eq 0) {
-    Write-Host "⚠️ No offers found or relevance not supported."
-} else {
-    Write-Host "✅ Offers available on this endpoint (mirrors SSA):"
-    $offers | ForEach-Object { Write-Host $_ }
-}
+$offers
