@@ -1,3 +1,2 @@
 $relevance = '(id of it, name of it, site name of it) of relevant fixlets whose (category of it = "Update") of sites'
-$output = echo $relevance | & "C:\Program Files (x86)\BigFix Enterprise\BES Console\qna.exe"
-$output
+echo $relevance | & "C:\Program Files (x86)\BigFix Enterprise\BES Client\qna.exe"
