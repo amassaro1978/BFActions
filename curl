@@ -1,1 +1,1 @@
-curl -k -u user:pass "https://<bigfixserver>:52311/api/query?relevance=(id%20of%20it)%20of%20bes%20computers%20whose%20(name%20of%20it%20=%20%22%COMPUTERNAME%%22)"
+curl -k -u user:pass "https://<bigfixserver>:52311/api/query?relevance=(id%20of%20it,%20name%20of%20it,%20site%20name%20of%20it)%20of%20bes%20fixlets%20whose%20(category%20of%20it%20=%20%22Update%22%20and%20exists%20action%20of%20it%20whose%20(offer%20flag%20of%20it%20=%20true)%20and%20applicable%20computer%20ids%20of%20it%20contains%20123456)"
