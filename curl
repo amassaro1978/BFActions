@@ -1,1 +1,1 @@
-curl -k -u "user:pass" "https://<bigfixserver>:52311/api/query?relevance=(id of it, name of it, site name of it) of fixlets whose (category of it = %22Update%22 and exists action of it whose (offer flag of it = true)) of bes sites whose (exists relevant fixlets whose (id of it = id of fixlet of it) of it) of bes computer whose (name of it = %22$(hostname)%22)"
+curl -k -u user:pass "https://<bigfixserver>:52311/api/query?relevance=(id%20of%20it)%20of%20bes%20computers%20whose%20(name%20of%20it%20=%20%22%COMPUTERNAME%%22)"
