@@ -1,0 +1,1 @@
+curl -k -u "your-username:your-password" "https://<bigfixserver>:52311/api/query?relevance=(id%20of%20it,%20name%20of%20it,%20site%20name%20of%20it)%20of%20relevant%20fixlets%20whose%20(category%20of%20it%20=%20%22Update%22%20and%20exists%20action%20of%20it%20whose%20(offer%20flag%20of%20it%20=%20true))"
