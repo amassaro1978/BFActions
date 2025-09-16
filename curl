@@ -1,2 +1,3 @@
-$bes = New-Object -ComObject "BES.ClientAPI"
-$bes.EvaluateRelevance("(id of it, name of it, site name of it) of relevant fixlets whose (category of it = ""Update"") of sites")
+$relevance = '(id of it, name of it, site name of it) of relevant fixlets whose (category of it = "Update") of sites'
+$output = echo $relevance | & "C:\Program Files (x86)\BigFix Enterprise\BES Console\qna.exe"
+$output
