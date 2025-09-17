@@ -1,5 +1,36 @@
-$qnaPath = "C:\Program Files (x86)\BigFix Enterprise\BES Client\qna.exe"
-$relevance = '(id of it, name of it) of relevant fixlets of sites'
-$output = echo $relevance | & $qnaPath
-$offers = $output | Where-Object { $_ -like "A:*" } | ForEach-Object { $_.Substring(3).Trim() }
-$offers
+# Create COM objects
+$session  = New-Object -ComObject "BESClientComplianceMod.Session"
+$progress = New-Object -ComObject "BESClientComplianceMod.Progress"
+$response = New-Object -ComObject "BESClientComplianceMod.Response"
+
+# Example values (these must be customized)
+$url  = "http://<bigfixserver>:52311/cgi-bin/bfgather.exe/actionsite"
+$doc  = "ComplianceDoc.xml"   # compliance rules XML must exist in __Compliance folder
+$flags = 0
+
+# Start session
+$result = $session.Open($url, $doc, $flags)
+if ($result -ne 0) {
+    Write-Host "Error opening session: $result"
+} else {
+    do {
+        $state = $progress.SessionProgress()
+        Start-Sleep -Milliseconds 200
+    } while ($state -eq 3) # 3 = COMPLIANCE_PROGRESS_BUSY
+
+    if ($state -eq 1) { # COMPLIANCE_PROGRESS_COMPLETE
+        $count = $response.ResultCount()
+        for ($i=0; $i -lt $count; $i++) {
+            $designator = $response.GetDesignator($i)
+            $value      = $response.GetRelevanceResult($i)
+            $desc       = $response.GetDescription($i)
+            $comment    = $response.GetComment($i)
+            Write-Host "$designator = $value ($desc / $comment)"
+        }
+    } else {
+        $err = $progress.GetError()
+        Write-Host "Error: $err"
+    }
+
+    $session.Close() | Out-Null
+}
