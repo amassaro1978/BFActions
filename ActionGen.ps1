@@ -201,10 +201,9 @@ function Extract-AllRelevanceFromXmlString {
         $x = [xml]$XmlString
         $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
         if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        if ($all.Count -eq 0) {
-            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
-            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        }
+        if ($all.Count -gt 0) { return ,$all }
+        $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
+        if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
     } catch { LogLine "[$Context] XML parse failed: $($_.Exception.Message)" }
     if ($AggressiveRegexFallback -and $all.Count -eq 0) {
         try {
@@ -254,7 +253,7 @@ function Get-GroupClientRelevance {
             if ($rels.Count -gt 0) {
                 $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
                 $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
-                LogLine "Using group relevance from <Relevance> nodes :: ${snippet}..."
+                LogLine "Built relevance :: ${snippet}..."
                 return $joined
             }
             $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
@@ -432,6 +431,7 @@ $lblDate = New-Object Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
 $lblDate.Location = New-Object System.Drawing.Point(10,$y)
 $lblDate.Size = New-Object System.Drawing.Size(140,22)
+$lblDate.AutoSize = $false
 $form.Controls.Add($lblDate)
 
 $cbDate = New-Object System.Windows.Forms.ComboBox
@@ -577,8 +577,7 @@ $btn.Add_Click({
         $DeployStart = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu
         $ConfStart   = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu
 
-        # Window end handling: if start is before 7:00 AM, end is same-day 06:59/06:55
-        # otherwise end is next-day 06:59/06:55.
+        # Pilot window end: same-day if start < 7am; otherwise next-day
         if ($PilotStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
             $PilotEndCalc = $PilotStart.Date.AddHours(6).AddMinutes(59)   # same morning
         } else {
@@ -586,14 +585,11 @@ $btn.Add_Click({
         }
         $PilotEnd = Round-ToMinute($PilotEndCalc)
 
-        if ($DeployStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
-            $DeployEndCalc = $DeployStart.Date.AddHours(6).AddMinutes(55)  # same morning
-        } else {
-            $DeployEndCalc = $DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning
-        }
-        $DeployEnd = Round-ToMinute($DeployEndCalc)
+        # Deploy window end: following Tuesday 06:55 AM (relative to anchor Wednesday)
+        $NextTue   = Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)
+        $DeployEnd = Round-ToMinute($NextTue.Date.AddHours(6).AddMinutes(55))
 
-        # Force: base on Wed anchor → next Tuesday 7:00 AM (stable vs midnight shift)
+        # Force: base on Wed anchor → next Tuesday 7:00 AM
         $ForceStart    = Round-ToMinute((Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
         $ForceDeadline = Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM
 
