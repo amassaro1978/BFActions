@@ -447,7 +447,7 @@ $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# Time (8:00 PM – 11:45 PM, 15m)
+# Time (CHANGED: fixed list 11:00 PM → 12:45 AM, 8 slots)
 $lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
 $lblTime.Location = New-Object System.Drawing.Point(10,$y)
@@ -460,14 +460,27 @@ $cbTime.Location = New-Object System.Drawing.Point(160,$y)
 $cbTime.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbTime)
 $y += 42
-$start = Get-Date "20:00"; $end = Get-Date "23:45"
-while ($start -le $end) { [void]$cbTime.Items.Add($start.ToString("h:mm tt")); $start = $start.AddMinutes(15) }
+
+# CHANGED: explicit 8-slot list (added 11:45 PM to meet “8 slots”)
+$cbTime.Items.AddRange(@(
+    "11:00 PM","11:15 PM","11:30 PM","11:45 PM",
+    "12:00 AM","12:15 AM","12:30 AM","12:45 AM"
+))
+
+# NEW: red warning label (shown only for 12:00 AM and later)
+$lblWarn = New-Object System.Windows.Forms.Label
+$lblWarn.ForeColor = [System.Drawing.Color]::Red
+$lblWarn.Location = New-Object System.Drawing.Point(160,$y)
+$lblWarn.Size = New-Object System.Drawing.Size(440,34)
+$lblWarn.Visible = $false
+$form.Controls.Add($lblWarn)
+$y += 34
 
 # Button
 $btn = New-Object System.Windows.Forms.Button
 $btn.Text = "Generate & Post 4 Actions (Pilot/Deploy/Force/Conf)"
 $btn.Location = New-Object System.Drawing.Point(160,$y)
-$btn.Size = New-Object System.Drawing.Size(320,32)
+$btn.Size = New-Object System.Drawing.Size(320,32)  # unchanged baseline
 $form.Controls.Add($btn)
 $y += 42
 
@@ -486,6 +499,23 @@ $LogBox.ContextMenu.MenuItems.AddRange(@(
 ))
 $LogBox.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($LogBox)
+
+# --- helper for warning text ---
+function Update-WarnLabel {
+    param([string]$slot,[string]$dateStr)
+    if ($slot -and $slot -like '12:* AM') {
+        try {
+            $wed = [datetime]::ParseExact($dateStr,'yyyy-MM-dd',$null)
+            $thu = $wed.AddDays(1)
+            $lblWarn.Text = "⚠️ Please note: Since you selected $slot, this deployment will technically start on Thursday, " + $thu.ToString('yyyy-MM-dd')
+            $lblWarn.Visible = $true
+        } catch { $lblWarn.Visible = $false }
+    } else {
+        $lblWarn.Visible = $false
+    }
+}
+$cbTime.add_SelectedIndexChanged({ Update-WarnLabel $cbTime.SelectedItem $cbDate.SelectedItem })
+$cbDate.add_SelectedIndexChanged({ Update-WarnLabel $cbTime.SelectedItem $cbDate.SelectedItem })
 
 # =========================
 # ACTION
@@ -533,7 +563,11 @@ $btn.Add_Click({
         LogLine "Display name (messages): $displayName"
 
         # ---- Absolute desired times (seconds = 0) ----
-        $PilotStart   = Round-ToMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null))
+        # CHANGED: roll to Thursday if timeslot is 12:00 AM or later
+        $PilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
+        if ($tStr -like '12:* AM') { $PilotStart = $PilotStart.AddDays(1) }
+        $PilotStart   = Round-ToMinute($PilotStart)
+
         $DeployStart  = Round-ToMinute($PilotStart.AddDays(1))
         $ConfStart    = Round-ToMinute($PilotStart.AddDays(1))
         $PilotEnd     = Round-ToMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
