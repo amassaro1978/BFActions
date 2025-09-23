@@ -574,25 +574,24 @@ $btn.Add_Click({
         }
 
         # Deploy/Conf: always based on Wed anchor + 1 day (Thu), not Pilot+1
-        $DeployStart = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu (not Fri)
+        $DeployStart = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu
         $ConfStart   = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu
 
         # Window end handling: if start is before 7:00 AM, end is same-day 06:59/06:55
         # otherwise end is next-day 06:59/06:55.
-        $PilotEnd = Round-ToMinute(
-            if ($PilotStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
-                $PilotStart.Date.AddHours(6).AddMinutes(59)   # same morning
-            } else {
-                $PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)  # next morning
-            }
-        )
-        $DeployEnd = Round-ToMinute(
-            if ($DeployStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
-                $DeployStart.Date.AddHours(6).AddMinutes(55)  # same morning
-            } else {
-                $DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning
-            }
-        )
+        if ($PilotStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
+            $PilotEndCalc = $PilotStart.Date.AddHours(6).AddMinutes(59)   # same morning
+        } else {
+            $PilotEndCalc = $PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)  # next morning
+        }
+        $PilotEnd = Round-ToMinute($PilotEndCalc)
+
+        if ($DeployStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
+            $DeployEndCalc = $DeployStart.Date.AddHours(6).AddMinutes(55)  # same morning
+        } else {
+            $DeployEndCalc = $DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning
+        }
+        $DeployEnd = Round-ToMinute($DeployEndCalc)
 
         # Force: base on Wed anchor → next Tuesday 7:00 AM (stable vs midnight shift)
         $ForceStart    = Round-ToMinute((Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
