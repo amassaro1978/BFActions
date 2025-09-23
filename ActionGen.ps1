@@ -194,7 +194,6 @@ function Get-ActionAndRelevance {
 function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
-# GROUP relevance helpers
 function Extract-AllRelevanceFromXmlString {
     param([string]$XmlString,[string]$Context = "Unknown")
     $all = @()
@@ -447,7 +446,7 @@ $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# Time (CHANGED: fixed list 11:00 PM → 12:45 AM, 8 slots)
+# Time (fixed list 11:00 PM – 12:45 AM, 15m)
 $lblTime = New-Object System.Windows.Forms.Label
 $lblTime.Text = "Schedule Time:"
 $lblTime.Location = New-Object System.Drawing.Point(10,$y)
@@ -461,13 +460,12 @@ $cbTime.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbTime)
 $y += 42
 
-# CHANGED: explicit 8-slot list (added 11:45 PM to meet “8 slots”)
 $cbTime.Items.AddRange(@(
     "11:00 PM","11:15 PM","11:30 PM","11:45 PM",
     "12:00 AM","12:15 AM","12:30 AM","12:45 AM"
 ))
 
-# NEW: red warning label (shown only for 12:00 AM and later)
+# Red warning label (shown only for 12:00 AM and later)
 $lblWarn = New-Object System.Windows.Forms.Label
 $lblWarn.ForeColor = [System.Drawing.Color]::Red
 $lblWarn.Location = New-Object System.Drawing.Point(160,$y)
@@ -480,7 +478,7 @@ $y += 34
 $btn = New-Object System.Windows.Forms.Button
 $btn.Text = "Generate & Post 4 Actions (Pilot/Deploy/Force/Conf)"
 $btn.Location = New-Object System.Drawing.Point(160,$y)
-$btn.Size = New-Object System.Drawing.Size(320,32)  # unchanged baseline
+$btn.Size = New-Object System.Drawing.Size(320,32)
 $form.Controls.Add($btn)
 $y += 42
 
@@ -563,21 +561,46 @@ $btn.Add_Click({
         LogLine "Display name (messages): $displayName"
 
         # ---- Absolute desired times (seconds = 0) ----
-        # CHANGED: roll to Thursday if timeslot is 12:00 AM or later
-        $PilotStart = [datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null)
-        if ($tStr -like '12:* AM') { $PilotStart = $PilotStart.AddDays(1) }
-        $PilotStart   = Round-ToMinute($PilotStart)
+        # Anchor on the selected Wednesday date; roll Pilot only if midnight slot
+        $AnchorWed = [datetime]::ParseExact($dStr,'yyyy-MM-dd',$null)
+        $slotTOD   = ([datetime]::ParseExact($tStr,'h:mm tt',$null)).TimeOfDay
+        $isMidnightSlot = ($tStr -like '12:* AM')
 
-        $DeployStart  = Round-ToMinute($PilotStart.AddDays(1))
-        $ConfStart    = Round-ToMinute($PilotStart.AddDays(1))
-        $PilotEnd     = Round-ToMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
-        $DeployEnd    = Round-ToMinute($DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55))
-        $ForceStart   = Round-ToMinute((Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
-        $ForceDeadline= Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM
+        # Pilot: Wed + time, or (if midnight) Thu + time
+        if ($isMidnightSlot) {
+            $PilotStart = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))  # Thu 00:xx
+        } else {
+            $PilotStart = Round-ToMinute($AnchorWed.Add($slotTOD))             # Wed 23:xx
+        }
+
+        # Deploy/Conf: always based on Wed anchor + 1 day (Thu), not Pilot+1
+        $DeployStart = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu (not Fri)
+        $ConfStart   = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu
+
+        # Window end handling: if start is before 7:00 AM, end is same-day 06:59/06:55
+        # otherwise end is next-day 06:59/06:55.
+        $PilotEnd = Round-ToMinute(
+            if ($PilotStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
+                $PilotStart.Date.AddHours(6).AddMinutes(59)   # same morning
+            } else {
+                $PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)  # next morning
+            }
+        )
+        $DeployEnd = Round-ToMinute(
+            if ($DeployStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
+                $DeployStart.Date.AddHours(6).AddMinutes(55)  # same morning
+            } else {
+                $DeployStart.Date.AddDays(1).AddHours(6).AddMinutes(55) # next morning
+            }
+        )
+
+        # Force: base on Wed anchor → next Tuesday 7:00 AM (stable vs midnight shift)
+        $ForceStart    = Round-ToMinute((Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
+        $ForceDeadline = Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM
 
         # 1-year end times for Conference & Force
-        $ConfEnd      = Round-ToMinute($ConfStart.AddYears(1))
-        $ForceEnd     = Round-ToMinute($ForceStart.AddYears(1))
+        $ConfEnd  = Round-ToMinute($ConfStart.AddYears(1))
+        $ForceEnd = Round-ToMinute($ForceStart.AddYears(1))
 
         # Run between window strings
         $TRStartStr  = "19:00:00"
