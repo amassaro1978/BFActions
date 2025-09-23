@@ -31,7 +31,7 @@ $IgnoreCertErrors           = $true
 $DumpFetchedXmlToTemp       = $true
 $AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
-$PostUsingInvokeWebRequest  = $true   # keep true; we'll post with -Body to avoid file delay
+$PostUsingInvokeWebRequest  = $true   # baseline path uses -InFile
 
 # =========================
 # UTIL / LOGGING
@@ -73,17 +73,11 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
 # Round a DateTime to exact minute (seconds & ms -> 0)
 function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
 
-# Whole-second "now" (zero out milliseconds) to cut drift
-function Now-WholeSecond {
-    $n = Get-Date
-    $n = $n.AddMilliseconds(-$n.Millisecond)
-    return $n
-}
-
-# Build ISO-8601 duration with CEILING to the next whole second (never short)
-function To-IsoDurationCeiling([TimeSpan]$ts) {
+# Build ISO-8601 duration but **rounded to nearest second** (baseline)
+function To-IsoDurationRounded([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
-    $totalSec = [Math]::Ceiling($ts.TotalSeconds)   # avoid undershooting target
+    $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
+    if ($totalSec -lt 0) { $totalSec = 0 }
     $days  = [int]([Math]::Floor($totalSec / 86400))
     $rem   = $totalSec - ($days * 86400)
     $hours = [int]([Math]::Floor($rem / 3600))
@@ -91,11 +85,11 @@ function To-IsoDurationCeiling([TimeSpan]$ts) {
     $mins  = [int]([Math]::Floor($rem / 60))
     $secs  = [int]($rem - ($mins * 60))
     $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
-    $t = @()
-    if ($hours -gt 0) { $t += ("{0}H" -f $hours) }
-    if ($mins  -gt 0) { $t += ("{0}M" -f $mins) }
-    if ($secs  -gt 0 -or $t.Count -eq 0) { $t += ("{0}S" -f $secs) }
-    return $dPart + "T" + ($t -join "")
+    $tParts = @()
+    if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
+    if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
+    if ($secs  -gt 0 -or $tParts.Count -eq 0) { $tParts += ("{0}S" -f $secs) }
+    return $dPart + "T" + ($tParts -join "")
 }
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -142,9 +136,8 @@ function HttpGetXml {
     }
 }
 
-# Direct string POST (avoids -InFile latency)
-function Post-XmlString {
-    param([string]$Url,[string]$User,[string]$Pass,[string]$Xml)
+function Post-XmlFile-InFile {
+    param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
     try {
         $pair  = "$User`:$Pass"
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
@@ -152,7 +145,7 @@ function Post-XmlString {
         $resp = Invoke-WebRequest -Method Post -Uri $Url `
             -Headers @{ "Authorization" = $basic } `
             -ContentType "application/xml" `
-            -Body $Xml `
+            -InFile $XmlFilePath `
             -UseBasicParsing
         if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
     } catch {
@@ -433,7 +426,7 @@ $tbUser   = $null; Add-Field "Username:"      $false ([ref]$tbUser)
 $tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
 $tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
-# Date (future Wednesdays)
+# Date (future Wednesdays only)
 $lblDate = New-Object Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
 $lblDate.Location = New-Object System.Drawing.Point(10,$y)
@@ -642,11 +635,11 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # ==== JIT OFFSETS @ WHOLE-SECOND ====
-            $postNow = Now-WholeSecond
-            $startOff   = To-IsoDurationCeiling ($cfg.AbsStart   - $postNow)
-            $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationCeiling ($cfg.AbsEnd - $postNow) } else { "" }
-            $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDurationCeiling ($cfg.AbsDeadline - $postNow) } else { "" }
+            # ==== JIT OFFSETS (baseline rounded) ====
+            $postNow    = Get-Date
+            $startOff   = To-IsoDurationRounded ($cfg.AbsStart   - $postNow)
+            $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationRounded ($cfg.AbsEnd - $postNow) } else { "" }
+            $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDurationRounded ($cfg.AbsDeadline - $postNow) } else { "" }
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
@@ -667,18 +660,21 @@ $btn.Add_Click({
                 -AskToSaveWorkText    $cfg.SaveAsk `
                 -DeadlineOffset       $deadlineOff
 
+            $xmlBodyToSend = $xmlBody
+
+            $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
+            $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
             if ($SaveActionXmlToTemp) {
-                $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
-                $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
-                Write-Utf8NoBom -Path $tmpAction -Content $xmlBody
+                Write-Utf8NoBom -Path $tmpAction -Content $xmlBodyToSend
                 LogLine "Saved action XML for $a to: $tmpAction"
+                LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
             }
 
             try {
-                if ($PostUsingInvokeWebRequest) {
-                    Post-XmlString -Url $postUrl -User $user -Pass $pass -Xml $xmlBody
+                if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
+                    Post-XmlFile-InFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
                 } else {
-                    LogLine "⚠️ POST disabled by flag."
+                    LogLine "⚠️ Direct POST path disabled; enable if needed."
                 }
                 LogLine ("✅ {0} posted successfully." -f $a)
             } catch {
