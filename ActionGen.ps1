@@ -31,7 +31,7 @@ $IgnoreCertErrors           = $true
 $DumpFetchedXmlToTemp       = $true
 $AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
-$PostUsingInvokeWebRequest  = $true
+$PostUsingInvokeWebRequest  = $true   # keep true; we'll post with -Body to avoid file delay
 
 # =========================
 # UTIL / LOGGING
@@ -73,11 +73,17 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
 # Round a DateTime to exact minute (seconds & ms -> 0)
 function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
 
-# Build ISO-8601 duration but **rounded to nearest second** (no truncation drift)
-function To-IsoDurationRounded([TimeSpan]$ts) {
+# Whole-second "now" (zero out milliseconds) to cut drift
+function Now-WholeSecond {
+    $n = Get-Date
+    $n = $n.AddMilliseconds(-$n.Millisecond)
+    return $n
+}
+
+# Build ISO-8601 duration with CEILING to the next whole second (never short)
+function To-IsoDurationCeiling([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
-    $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
-    if ($totalSec -lt 0) { $totalSec = 0 }
+    $totalSec = [Math]::Ceiling($ts.TotalSeconds)   # avoid undershooting target
     $days  = [int]([Math]::Floor($totalSec / 86400))
     $rem   = $totalSec - ($days * 86400)
     $hours = [int]([Math]::Floor($rem / 3600))
@@ -85,11 +91,11 @@ function To-IsoDurationRounded([TimeSpan]$ts) {
     $mins  = [int]([Math]::Floor($rem / 60))
     $secs  = [int]($rem - ($mins * 60))
     $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
-    $tParts = @()
-    if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
-    if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
-    if ($secs  -gt 0 -or $tParts.Count -eq 0) { $tParts += ("{0}S" -f $secs) }
-    return $dPart + "T" + ($tParts -join "")
+    $t = @()
+    if ($hours -gt 0) { $t += ("{0}H" -f $hours) }
+    if ($mins  -gt 0) { $t += ("{0}M" -f $mins) }
+    if ($secs  -gt 0 -or $t.Count -eq 0) { $t += ("{0}S" -f $secs) }
+    return $dPart + "T" + ($t -join "")
 }
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -136,8 +142,9 @@ function HttpGetXml {
     }
 }
 
-function Post-XmlFile-InFile {
-    param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
+# Direct string POST (avoids -InFile latency)
+function Post-XmlString {
+    param([string]$Url,[string]$User,[string]$Pass,[string]$Xml)
     try {
         $pair  = "$User`:$Pass"
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
@@ -145,7 +152,7 @@ function Post-XmlFile-InFile {
         $resp = Invoke-WebRequest -Method Post -Uri $Url `
             -Headers @{ "Authorization" = $basic } `
             -ContentType "application/xml" `
-            -InFile $XmlFilePath `
+            -Body $Xml `
             -UseBasicParsing
         if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
     } catch {
@@ -431,7 +438,6 @@ $lblDate = New-Object Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
 $lblDate.Location = New-Object System.Drawing.Point(10,$y)
 $lblDate.Size = New-Object System.Drawing.Size(140,22)
-$lblDate.AutoSize = $false
 $form.Controls.Add($lblDate)
 
 $cbDate = New-Object System.Windows.Forms.ComboBox
@@ -589,7 +595,7 @@ $btn.Add_Click({
         $NextTue   = Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)
         $DeployEnd = Round-ToMinute($NextTue.Date.AddHours(6).AddMinutes(55))
 
-        # Force: base on Wed anchor → next Tuesday 7:00 AM
+        # Force: base on Wed anchor → next Tuesday 7:00 AM (and deadline Wed 7:00 AM)
         $ForceStart    = Round-ToMinute((Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
         $ForceDeadline = Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM
 
@@ -636,11 +642,11 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Fresh offsets right before POST — with proper rounding to whole seconds
-            $postNow = Get-Date
-            $startOff   = To-IsoDurationRounded ($cfg.AbsStart - $postNow)
-            $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationRounded ($cfg.AbsEnd - $postNow) } else { "" }
-            $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDurationRounded ($cfg.AbsDeadline - $postNow) } else { "" }
+            # ==== JIT OFFSETS @ WHOLE-SECOND ====
+            $postNow = Now-WholeSecond
+            $startOff   = To-IsoDurationCeiling ($cfg.AbsStart   - $postNow)
+            $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationCeiling ($cfg.AbsEnd - $postNow) } else { "" }
+            $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDurationCeiling ($cfg.AbsDeadline - $postNow) } else { "" }
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
@@ -661,21 +667,18 @@ $btn.Add_Click({
                 -AskToSaveWorkText    $cfg.SaveAsk `
                 -DeadlineOffset       $deadlineOff
 
-            $xmlBodyToSend = $xmlBody
-
-            $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
-            $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
             if ($SaveActionXmlToTemp) {
-                Write-Utf8NoBom -Path $tmpAction -Content $xmlBodyToSend
+                $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
+                $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
+                Write-Utf8NoBom -Path $tmpAction -Content $xmlBody
                 LogLine "Saved action XML for $a to: $tmpAction"
-                LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
             }
 
             try {
-                if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
-                    Post-XmlFile-InFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
+                if ($PostUsingInvokeWebRequest) {
+                    Post-XmlString -Url $postUrl -User $user -Pass $pass -Xml $xmlBody
                 } else {
-                    LogLine "⚠️ Direct POST path disabled; enable if needed."
+                    LogLine "⚠️ POST disabled by flag."
                 }
                 LogLine ("✅ {0} posted successfully." -f $a)
             } catch {
