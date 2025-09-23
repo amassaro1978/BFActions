@@ -572,9 +572,10 @@ $btn.Add_Click({
             $PilotStart = Round-ToMinute($AnchorWed.Add($slotTOD))             # Wed 23:xx
         }
 
-        # Deploy/Conf: always based on Wed anchor + 1 day (Thu), not Pilot+1
-        $DeployStart = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu
-        $ConfStart   = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))     # Thu
+        # >>> START FIX: Deploy/Conf start = Pilot + 1 day <<<
+        $DeployStart = Round-ToMinute($PilotStart.AddDays(1))
+        $ConfStart   = Round-ToMinute($PilotStart.AddDays(1))
+        # <<< END FIX >>>
 
         # Pilot window end: same-day if start < 7am; otherwise next-day
         if ($PilotStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
@@ -584,7 +585,7 @@ $btn.Add_Click({
         }
         $PilotEnd = Round-ToMinute($PilotEndCalc)
 
-        # Deploy window end: following Tuesday 06:55 AM (relative to anchor Wednesday)
+        # Deploy window end: following Tuesday 06:55 AM (relative to Wednesday anchor)
         $NextTue   = Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)
         $DeployEnd = Round-ToMinute($NextTue.Date.AddHours(6).AddMinutes(55))
 
