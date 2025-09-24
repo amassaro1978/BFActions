@@ -31,7 +31,7 @@ $IgnoreCertErrors           = $true
 $DumpFetchedXmlToTemp       = $true
 $AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
-$PostUsingInvokeWebRequest  = $true   # baseline path uses -InFile
+$PostUsingInvokeWebRequest  = $true   # file-based POST (-InFile), per baseline
 
 # =========================
 # UTIL / LOGGING
@@ -73,7 +73,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
 # Round a DateTime to exact minute (seconds & ms -> 0)
 function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
 
-# Build ISO-8601 duration but **rounded to nearest second** (baseline)
+# Build ISO-8601 duration but **rounded to nearest second** (baseline helper; still used for deadline offset)
 function To-IsoDurationRounded([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
@@ -272,8 +272,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# ACTION XML BUILDER
-# (supports absolute local start/end when provided)
+# ACTION XML BUILDER (supports absolute local start/end)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -284,18 +283,18 @@ function Build-SourcedFixletActionXml {
         [string]$FixletId,
         [string]$FixletActionName,
         [string]$GroupRelevance,
-        [string]$StartOffset,            # PT…
+        [string]$StartOffset,            # PT… (ignored if StartLocalStr provided)
         [string]$HasEndText,             # "true"/"false"
-        [string]$EndOffset,              # PT… or empty
+        [string]$EndOffset,              # PT… or empty (ignored if EndLocalStr provided)
         [string]$HasTimeRangeText,       # "true"/"false"
         [string]$TRStartStr,             # "HH:mm:ss" or ""
         [string]$TREndStr,               # "HH:mm:ss" or ""
         [string]$ShowPreActionUIText,    # "true"/"false"
         [string]$PreActionText,
         [string]$AskToSaveWorkText,      # "true"/"false"
-        [string]$DeadlineOffset,         # PT… or empty (Force only)
-        [string]$StartLocalStr = "",     # NEW: "yyyy-MM-ddTHH:mm:ss" local absolute
-        [string]$EndLocalStr   = ""      # NEW: "yyyy-MM-ddTHH:mm:ss" local absolute
+        [string]$DeadlineOffset,         # PT… or empty (kept as offset)
+        [string]$StartLocalStr = "",     # "yyyy-MM-ddTHH:mm:ss" local absolute
+        [string]$EndLocalStr   = ""      # "yyyy-MM-ddTHH:mm:ss" local absolute
     )
 
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
@@ -613,16 +612,20 @@ $btn.Add_Click({
         $TRStartStr  = "19:00:00"
         $TREndStr    = "06:59:00"
 
-        # Precompute absolute strings for the two actions we want lasered on :00
+        # Absolute strings for ALL actions (rock solid :00)
         $PilotStartLocalStr = $PilotStart.ToString("yyyy-MM-ddTHH:mm:ss")
         $PilotEndLocalStr   = $PilotEnd.ToString("yyyy-MM-ddTHH:mm:ss")
+        $DeployStartLocalStr= $DeployStart.ToString("yyyy-MM-ddTHH:mm:ss")
+        $DeployEndLocalStr  = $DeployEnd.ToString("yyyy-MM-ddTHH:mm:ss")
+        $ConfStartLocalStr  = $ConfStart.ToString("yyyy-MM-ddTHH:mm:ss")
+        $ConfEndLocalStr    = $ConfEnd.ToString("yyyy-MM-ddTHH:mm:ss")
         $ForceStartLocalStr = $ForceStart.ToString("yyyy-MM-ddTHH:mm:ss")
         $ForceEndLocalStr   = $ForceEnd.ToString("yyyy-MM-ddTHH:mm:ss")
 
         $actions = @(
-            @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=$PilotStartLocalStr; EndLocal=$PilotEndLocalStr },
-            @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=""; EndLocal="" },
-            @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=""; EndLocal="" },
+            @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=$PilotStartLocalStr;  EndLocal=$PilotEndLocalStr  },
+            @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=$DeployStartLocalStr; EndLocal=$DeployEndLocalStr },
+            @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=$ConfStartLocalStr; EndLocal=$ConfEndLocalStr },
             @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
                     $displayName, $ForceDeadline.ToString("M/d/yyyy h:mm tt"));
@@ -654,13 +657,12 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # ==== JIT OFFSETS (baseline rounded) ====
+            # Offsets still computed (not used when StartLocal/EndLocal are present)
             $postNow    = Get-Date
             $startOff   = To-IsoDurationRounded ($cfg.AbsStart   - $postNow)
             $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationRounded ($cfg.AbsEnd - $postNow) } else { "" }
             $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDurationRounded ($cfg.AbsDeadline - $postNow) } else { "" }
 
-            # Use absolute locals for Pilot/Force (exact :00), offsets for others (baseline)
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
                 -UiBaseTitle          $titleRaw `
