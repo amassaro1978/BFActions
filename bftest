@@ -1,9 +1,15 @@
-# Force: cascade start/deadline with selected slot (15-min steps from 7:00 AM Tue)
-# 11:00 PM => 7:00 AM; 11:15 PM => 7:15 AM; ... ; 12:45 AM => 8:45 AM
-$slotIndex  = $cbTime.SelectedIndex
-if ($slotIndex -lt 0) { $slotIndex = 0 }  # safety
-$slotOffset = [TimeSpan]::FromMinutes(15 * $slotIndex)
-
-$ForceStartBase = (Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)).Date.AddHours(7) # Tue 7:00 AM
-$ForceStart     = Round-ToMinute($ForceStartBase.Add($slotOffset))  # Tue 7:00 + offset
-$ForceDeadline  = Round-ToMinute($ForceStart.AddDays(1))            # Wed (same offset)
+# --- Confirmation dialog before creating actions ---
+$fixletFullName = if ($titleRaw) { $titleRaw } else { "(unknown fixlet title)" }
+$confirmMsg = "Fixlet: $fixletFullName`r`n`r`nAre you sure you want to create these 4 actions on this fixlet?`r`n`r`nClick Yes to Proceed or No to cancel."
+$dlg = [System.Windows.Forms.MessageBox]::Show(
+    $form,
+    $confirmMsg,
+    "Confirm: Create 4 Actions",
+    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+    [System.Windows.Forms.MessageBoxIcon]::Question,
+    [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+)
+if ($dlg -ne [System.Windows.Forms.DialogResult]::Yes) {
+    LogLine "🚫 User canceled at confirmation dialog."
+    return
+}
