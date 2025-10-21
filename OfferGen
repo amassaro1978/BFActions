@@ -1,11 +1,10 @@
 # =========================================================
 # BigFix Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v9
-# - Fixed layout (inputs → buttons → log)
-# - OfferDescriptionHTML with HTML-encoding (in CDATA)
-# - Clean product name handling (no Install/Update/Remove prefixes)
-# - Lowercase XML booleans
-# - LLM integration to auto-draft Application Description
+# Baseline: Offers-2025-09-24-v10
+# - Uses LiteLLM via env var key (LITELLM_KEY)
+# - No LLM URL/Key/Model fields in UI
+# - "Draft Description with LLM" button remains
+# - OfferDescriptionHTML (HTML-encoded inside CDATA)
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -36,6 +35,14 @@ $OfferDefaults = @{
     ContinueOnErr   = $true
     ActiveUserReq   = "NoRequirement"
     ActiveUserType  = "AllUsers"
+}
+
+# ===== LLM CONFIG (uses env var for key) =====
+$LLMConfig = @{
+    EnableAuto = $true
+    ApiUrl     = "https://redacted/v1/chat/completions"  # <- your LiteLLM base + /v1/chat/completions
+    ApiKeyEnv  = "LITELLM_KEY"                           # <- environment variable name
+    Model      = "gpt-40"                                # <- exact model alias your LiteLLM exposes
 }
 
 # Behavior toggles
@@ -114,12 +121,20 @@ Avoid marketing fluff, versions in every sentence, and avoid system/IT jargon. N
 "@
 }
 
-# Call an internal LLM (supports OpenAI-style chat OR simple {prompt,model})
+# Get API key from env (Process→User→Machine)
+function Get-LLMApiKey([string]$EnvVarName) {
+    $k = [Environment]::GetEnvironmentVariable($EnvVarName, "Process")
+    if (-not $k) { $k = [Environment]::GetEnvironmentVariable($EnvVarName, "User") }
+    if (-not $k) { $k = [Environment]::GetEnvironmentVariable($EnvVarName, "Machine") }
+    return $k
+}
+
+# Call an internal LLM (OpenAI-compatible OR simple {prompt,model})
 function Invoke-LLMDescription {
     param(
         [Parameter(Mandatory=$true)][string]$ApiUrl,
         [Parameter(Mandatory=$false)][string]$ApiKey,
-        [Parameter(Mandatory=$false)][string]$Model = "gpt-internal-8k",
+        [Parameter(Mandatory=$false)][string]$Model = "gpt-40",
         [Parameter(Mandatory=$true)][string]$DisplayName,
         [int]$TimeoutMs = 20000
     )
@@ -129,7 +144,6 @@ function Invoke-LLMDescription {
         if ($ApiKey) { $headers["Authorization"] = "Bearer $ApiKey" }
         $headers["Content-Type"] = "application/json"
 
-        # Decide payload shape
         $isOpenAI = $ApiUrl -match '/v1/(chat/)?completions'
         if ($isOpenAI) {
             $body = @{
@@ -142,7 +156,6 @@ function Invoke-LLMDescription {
                 max_tokens  = 200
             }
         } else {
-            # Generic schema used by many internal LLM gateways
             $body = @{
                 model  = $Model
                 prompt = $prompt
@@ -153,11 +166,9 @@ function Invoke-LLMDescription {
 
         $json = $body | ConvertTo-Json -Depth 6
         $resp = Invoke-RestMethod -Method Post -Uri $ApiUrl -Headers $headers -Body $json -TimeoutSec ([math]::Ceiling($TimeoutMs/1000))
-        
-        # Try multiple response shapes
+
         $candidates = @()
         if ($resp -and $resp.choices -and $resp.choices.Count -gt 0) {
-            # OpenAI-style
             if ($resp.choices[0].message.content) { $candidates += [string]$resp.choices[0].message.content }
             elseif ($resp.choices[0].text)        { $candidates += [string]$resp.choices[0].text }
         }
@@ -167,12 +178,9 @@ function Invoke-LLMDescription {
         if ($resp.message)     { $candidates += [string]$resp.message }
 
         $txt = $null
-        foreach ($c in $candidates) {
-            if (-not [string]::IsNullOrWhiteSpace($c)) { $txt = $c; break }
-        }
+        foreach ($c in $candidates) { if (-not [string]::IsNullOrWhiteSpace($c)) { $txt = $c; break } }
 
         if (-not $txt) { return $null }
-        # Clean up whitespace; ensure single paragraph
         $txt = $txt -replace '\s+',' ' | ForEach-Object { $_.Trim() }
         return (Truncate $txt 600)
     }
@@ -480,19 +488,6 @@ $tbPass = New-Object System.Windows.Forms.MaskedTextBox
 $tbPass.PasswordChar = '*'
 Add-Row "Password:" $tbPass
 
-# LLM API fields
-$tbApiUrl  = New-Object System.Windows.Forms.TextBox
-$tbApiUrl.Text = "https://llm.yourdomain/v1/chat/completions"   # change to your gateway
-Add-Row "LLM API URL:" $tbApiUrl
-
-$tbApiKey  = New-Object System.Windows.Forms.MaskedTextBox
-$tbApiKey.PasswordChar = '*'
-Add-Row "LLM API Key:" $tbApiKey
-
-$tbModel   = New-Object System.Windows.Forms.TextBox
-$tbModel.Text = "gpt-internal-8k"
-Add-Row "LLM Model:" $tbModel
-
 # Fixlet IDs
 $tbFixletInstall = New-Object System.Windows.Forms.TextBox
 Add-Row "Fixlet ID (Install):" $tbFixletInstall
@@ -742,7 +737,7 @@ $btnDeploy.Add_Click({
         -OfferDescriptionFromUi $tbAppDesc.Text
 })
 
-# LLM draft button
+# LLM draft button (uses env var key)
 $btnLLM.Add_Click({
     try {
         if ([string]::IsNullOrWhiteSpace($tbServer.Text) -or
@@ -757,6 +752,14 @@ $btnLLM.Add_Click({
             [System.Windows.Forms.MessageBox]::Show($form, "Enter the Install Fixlet ID first so I can derive the product name from its title.", "Need Install Fixlet ID", "OK", "Information") | Out-Null
             return
         }
+
+        $apiKey = Get-LLMApiKey -EnvVarName $LLMConfig.ApiKeyEnv
+        if ([string]::IsNullOrWhiteSpace($apiKey)) {
+            LogLine "❌ LLM API key not found in env var '$($LLMConfig.ApiKeyEnv)'."
+            [System.Windows.Forms.MessageBox]::Show($form, "LLM API key not found in environment variable '$($LLMConfig.ApiKeyEnv)'. Set it and try again.", "Missing LLM Key", "OK", "Warning") | Out-Null
+            return
+        }
+
         $base = Get-BaseUrl $tbServer.Text
         $encodedSite = Encode-SiteName $CustomSiteName
         $auth = Get-AuthHeader -User $tbUser.Text -Pass $tbPass.Text
@@ -772,9 +775,9 @@ $btnLLM.Add_Click({
         LogLine ("LLM drafting for product: {0}" -f $displayName)
 
         $desc = Invoke-LLMDescription `
-            -ApiUrl $tbApiUrl.Text `
-            -ApiKey $tbApiKey.Text `
-            -Model  $tbModel.Text `
+            -ApiUrl $LLMConfig.ApiUrl `
+            -ApiKey $apiKey `
+            -Model  $LLMConfig.Model `
             -DisplayName $displayName
 
         if ($desc) {
