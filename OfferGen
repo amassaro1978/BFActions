@@ -1,6 +1,6 @@
 # =========================================================
-# Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v5 (Simplified UI + Title format + App Description)
+# BigFix Offer Action Generator (Install / Update / Remove)
+# Baseline: Offers-2025-09-24-v7 (Fixed layout + App Desc + XML bools)
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -82,7 +82,7 @@ function SafeEscape([string]$s) {
 }
 function To-XmlBool([bool]$b) { if ($b) { 'true' } else { 'false' } }
 
-# Clean product name from Fixlet title (no Install/Update/Remove prefixes, no " Win")
+# Clean product name from Fixlet title (strip Install/Update/Remove prefixes, trailing " Win")
 function Parse-FixletTitleToProduct([string]$Title) {
     $t = [string]$Title
     $t = $t -replace '^\s*(?i)(Install|Update|Remove)\s*[:\-]\s*',''
@@ -146,88 +146,7 @@ function Post-XmlFile-InFile {
 }
 
 # =========================
-# FIXLET & GROUP PARSING
-# =========================
-function Get-FixletContainer { param([xml]$Xml)
-    if ($Xml.BES.Fixlet)   { return @{ Type="Fixlet";   Node=$Xml.BES.Fixlet } }
-    if ($Xml.BES.Task)     { return @{ Type="Task";     Node=$Xml.BES.Task } }
-    if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
-    throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
-}
-function Extract-AllRelevanceFromXmlString {
-    param([string]$XmlString,[string]$Context = "Unknown")
-    $all = @()
-    try {
-        $x = [xml]$XmlString
-        $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
-        if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        if ($all.Count -eq 0) {
-            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
-            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        }
-    } catch {}
-    if ($AggressiveRegexFallback -and $all.Count -eq 0) {
-        $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
-        foreach ($mm in $regex.Matches($XmlString)) { $t = ($mm.Groups[1].Value).Trim(); if ($t) { $all += $t } }
-    }
-    return ,$all
-}
-function Extract-SCRFragments {
-    param([string]$XmlString,[string]$Context="Unknown")
-    $frags = @()
-    try {
-        $x = [xml]$XmlString
-        $scrNodes = $x.SelectNodes("//*[local-name()='SearchComponentRelevance']")
-        if ($scrNodes) {
-            foreach ($n in $scrNodes) {
-                $innerR = $n.SelectNodes(".//*[local-name()='Relevance']")
-                if ($innerR -and $innerR.Count -gt 0) {
-                    foreach ($ir in $innerR) { $t = ($ir.InnerText).Trim(); if ($t) { $frags += $t } }
-                } else {
-                    $t = ($n.InnerText).Trim(); if ($t) { $frags += $t }
-                }
-            }
-        }
-    } catch {}
-    return ,$frags
-}
-function Get-GroupClientRelevance {
-    param([string]$BaseUrl,[string]$AuthHeader,[string]$SiteName,[string]$GroupIdNumeric)
-    $encSite = Encode-SiteName $SiteName
-    $candidates = @(
-        "/api/computergroup/custom/$encSite/$GroupIdNumeric",
-        "/api/computergroup/master/$GroupIdNumeric",
-        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"
-    )
-    foreach ($relPath in $candidates) {
-        $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
-        try {
-            $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
-            if ($DumpFetchedXmlToTemp) {
-                $tmp = Join-Path $env:TEMP ("BES_ComputerGroup_{0}.xml" -f $GroupIdNumeric)
-                [System.IO.File]::WriteAllText($tmp, $xmlStr)
-                LogLine "Saved fetched group XML to: $tmp"
-            }
-            $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
-            if ($rels.Count -gt 0) {
-                $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
-                return $joined
-            }
-            $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
-            if ($frags.Count -gt 0) {
-                $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
-                return $joined
-            }
-            LogLine "No usable relevance at ${url}"
-        } catch {
-            LogLine ("❌ Group relevance fetch failed ({0}): {1}" -f $GroupIdNumeric, $_.Exception.Message)
-        }
-    }
-    throw "No relevance found or derivable for group ${GroupIdNumeric}."
-}
-
-# =========================
-# OFFER XML BUILDER (title: "<Kind>: <DisplayName>: <Phase> Offer")
+# OFFER XML BUILDER (console title: "<Kind>: <DisplayName>: <Phase> Offer")
 # =========================
 function Build-OfferXml {
     param(
@@ -258,7 +177,7 @@ function Build-OfferXml {
     }
     $offerMsg   = SafeEscape(("({0} to {1}.  Please wait...)" -f $ing, $DisplayName))
     $offerTitle = SafeEscape(("{0}: {1}: {2} Offer" -f $cat, $DisplayName, $Phase))
-    # Use the UI-provided description; if empty, fall back to a default sentence
+    # Use UI description if provided; otherwise a default
     $offerDescInput = if ([string]::IsNullOrWhiteSpace($OfferDescription)) { "This offer will $verb $DisplayName." } else { $OfferDescription }
     $offerDesc  = SafeEscape($offerDescInput)
     $offerCat   = SafeEscape($cat)
@@ -321,88 +240,135 @@ function Build-OfferXml {
 }
 
 # =========================
-# GUI (minimal + App Description box)
+# GUI (root grid: inputs → buttons → log)
 # =========================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Offer Action Generator"
-$form.Size = New-Object System.Drawing.Size(760, 720)
 $form.StartPosition = "CenterScreen"
+$form.Size = New-Object System.Drawing.Size(820, 720)
+$form.MinimumSize = New-Object System.Drawing.Size(820, 600)
 
-$y = 20
-function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB,[string]$DefaultValue="",$ReadOnly=$false) {
+# Root layout (3 rows)
+$root = New-Object System.Windows.Forms.TableLayoutPanel
+$root.Dock = 'Fill'
+$root.AutoSize = $false
+$root.RowCount = 3
+$root.ColumnCount = 1
+$root.Padding = '10,10,10,10'
+$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))     # inputs
+$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))     # buttons
+$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent,100)))  # log fill
+$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent,100)))
+$form.Controls.Add($root)
+
+# ----- Inputs grid (labels/fields) -----
+$grid = New-Object System.Windows.Forms.TableLayoutPanel
+$grid.Dock = 'Top'
+$grid.AutoSize = $true
+$grid.AutoSizeMode = 'GrowAndShrink'
+$grid.ColumnCount = 2
+$grid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 200)))  # labels
+$grid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))  # inputs
+
+function Add-Row([string]$labelText, [System.Windows.Forms.Control]$ctrl) {
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = $Label
-    $lbl.Location = New-Object System.Drawing.Point(10,$script:y)
-    $lbl.Size = New-Object System.Drawing.Size(170,22)
-    $form.Controls.Add($lbl)
+    $lbl.Text = $labelText
+    $lbl.AutoSize = $true
+    $lbl.Margin = '0,6,12,6'
 
-    if ($IsPassword) { $tb = New-Object System.Windows.Forms.MaskedTextBox; $tb.PasswordChar = '*' }
-    else { $tb = New-Object System.Windows.Forms.TextBox }
+    $ctrl.Margin = '0,2,0,6'
+    $ctrl.Anchor = 'Left,Right'
 
-    $tb.Location = New-Object System.Drawing.Point(190,$script:y)
-    $tb.Size = New-Object System.Drawing.Size(540,22)
-    if ($DefaultValue) { $tb.Text = $DefaultValue }
-    if ($ReadOnly) { $tb.ReadOnly = $true }
-    $form.Controls.Add($tb)
-    $OutTB.Value = $tb
-    $script:y += 34
+    $grid.RowCount += 1
+    $grid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    $grid.Controls.Add($lbl, 0, $grid.RowCount - 1)
+    $grid.Controls.Add($ctrl, 1, $grid.RowCount - 1)
 }
 
-# Server (locked), creds
-$tbServer = $null; Add-Field "BigFix Server:" $false ([ref]$tbServer) "https://test.server:52311" $true
-$tbUser   = $null; Add-Field "Username:"      $false ([ref]$tbUser)
-$tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
+# Server (locked, white background)
+$tbServer = New-Object System.Windows.Forms.TextBox
+$tbServer.Text = "https://test.server:52311"
+$tbServer.ReadOnly = $true
+$tbServer.BackColor = [System.Drawing.SystemColors]::Window
+Add-Row "BigFix Server:" $tbServer
 
-# Only the three Fixlet IDs
-$tbFixletInstall = $null; Add-Field "Fixlet ID (Install):" $false ([ref]$tbFixletInstall)
-$tbFixletUpdate  = $null; Add-Field "Fixlet ID (Update):"  $false ([ref]$tbFixletUpdate)
-$tbFixletRemove  = $null; Add-Field "Fixlet ID (Remove):"  $false ([ref]$tbFixletRemove)
+# Username / Password
+$tbUser = New-Object System.Windows.Forms.TextBox
+Add-Row "Username:" $tbUser
+
+$tbPass = New-Object System.Windows.Forms.MaskedTextBox
+$tbPass.PasswordChar = '*'
+Add-Row "Password:" $tbPass
+
+# Fixlet IDs
+$tbFixletInstall = New-Object System.Windows.Forms.TextBox
+Add-Row "Fixlet ID (Install):" $tbFixletInstall
+
+$tbFixletUpdate = New-Object System.Windows.Forms.TextBox
+Add-Row "Fixlet ID (Update):" $tbFixletUpdate
+
+$tbFixletRemove = New-Object System.Windows.Forms.TextBox
+Add-Row "Fixlet ID (Remove):" $tbFixletRemove
 
 # Application Description (multiline)
-$lblDesc = New-Object System.Windows.Forms.Label
-$lblDesc.Text = "Application Description (Offer tab):"
-$lblDesc.Location = New-Object System.Drawing.Point(10,$y)
-$lblDesc.Size = New-Object System.Drawing.Size(300,22)
-$form.Controls.Add($lblDesc)
-
 $tbAppDesc = New-Object System.Windows.Forms.TextBox
 $tbAppDesc.Multiline = $true
-$tbAppDesc.ScrollBars = "Vertical"
-$tbAppDesc.Location = New-Object System.Drawing.Point(10,$y+24)
-$tbAppDesc.Size = New-Object System.Drawing.Size(720,120)   # roomy for a few sentences
-$form.Controls.Add($tbAppDesc)
-$y += 24 + 120 + 16
+$tbAppDesc.ScrollBars = 'Vertical'
+$tbAppDesc.Height = 110
+$tbAppDesc.Anchor = 'Left,Right'
+$tbAppDesc.Margin = '0,2,0,6'
+$lblDesc = New-Object System.Windows.Forms.Label
+$lblDesc.Text = "Application Description (Offer tab):"
+$lblDesc.AutoSize = $true
+$lblDesc.Margin = '0,6,12,6'
+$grid.RowCount += 1
+$grid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$grid.Controls.Add($lblDesc, 0, $grid.RowCount - 1)
+$grid.Controls.Add($tbAppDesc, 1, $grid.RowCount - 1)
 
-# Buttons
+# Add inputs grid to root row 0
+$root.Controls.Add($grid, 0, 0)
+
+# ----- Buttons row (under inputs) -----
+$btnPanel = New-Object System.Windows.Forms.TableLayoutPanel
+$btnPanel.Dock = 'Top'
+$btnPanel.AutoSize = $true
+$btnPanel.AutoSizeMode = 'GrowAndShrink'
+$btnPanel.ColumnCount = 1
+$btnPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent,100)))
+
 $btnQA = New-Object System.Windows.Forms.Button
 $btnQA.Text = "Create QA Offers (Install / Update / Remove)"
-$btnQA.Location = New-Object System.Drawing.Point(190,$y)
-$btnQA.Size = New-Object System.Drawing.Size(540,32)
-$form.Controls.Add($btnQA)
-$y += 42
+$btnQA.Height = 34
+$btnQA.Dock = 'Top'
+$btnQA.Margin = '0,4,0,6'
+$btnPanel.Controls.Add($btnQA)
 
 $btnDeploy = New-Object System.Windows.Forms.Button
 $btnDeploy.Text = "Create Deploy Offers (Install / Update / Remove)"
-$btnDeploy.Location = New-Object System.Drawing.Point(190,$y)
-$btnDeploy.Size = New-Object System.Drawing.Size(540,32)
-$form.Controls.Add($btnDeploy)
-$y += 42
+$btnDeploy.Height = 34
+$btnDeploy.Dock = 'Top'
+$btnDeploy.Margin = '0,0,0,6'
+$btnPanel.Controls.Add($btnDeploy)
 
-# Log
+# Add buttons panel to root row 1
+$root.Controls.Add($btnPanel, 0, 1)
+
+# ----- Log box (fills remaining space) -----
 $LogBox = New-Object System.Windows.Forms.TextBox
 $LogBox.Multiline = $true
-$LogBox.ScrollBars = "Vertical"
+$LogBox.ScrollBars = 'Vertical'
 $LogBox.ReadOnly = $false
 $LogBox.WordWrap = $false
-$LogBox.Location = New-Object System.Drawing.Point(10,$y)
-$LogBox.Size = New-Object System.Drawing.Size(720,180)
+$LogBox.Dock = 'Fill'
+$LogBox.Margin = '0,6,0,0'
 $LogBox.ContextMenu = New-Object System.Windows.Forms.ContextMenu
 $LogBox.ContextMenu.MenuItems.AddRange(@(
     (New-Object System.Windows.Forms.MenuItem "Copy",       { $LogBox.Copy() }),
     (New-Object System.Windows.Forms.MenuItem "Select All", { $LogBox.SelectAll() })
 ))
-$LogBox.Anchor = "Top,Left,Right,Bottom"
-$form.Controls.Add($LogBox)
+# Add log to root row 2
+$root.Controls.Add($LogBox, 0, 2)
 
 # =========================
 # CORE: confirm + post
