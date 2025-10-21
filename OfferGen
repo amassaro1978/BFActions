@@ -1,6 +1,6 @@
 # =========================================================
 # Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v4 (Simplified UI + Title Format)
+# Baseline: Offers-2025-09-24-v5 (Simplified UI + Title format + App Description)
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -80,9 +80,15 @@ function SafeEscape([string]$s) {
     if ($null -eq $s) { return "" }
     [System.Security.SecurityElement]::Escape($s)
 }
+function To-XmlBool([bool]$b) { if ($b) { 'true' } else { 'false' } }
+
+# Clean product name from Fixlet title (no Install/Update/Remove prefixes, no " Win")
 function Parse-FixletTitleToProduct([string]$Title) {
-    # Keep it simple: strip leading "Update:" and trailing " Win"
-    ($Title -replace '^\s*Update:\s*','' -replace '\s+Win$','').Trim()
+    $t = [string]$Title
+    $t = $t -replace '^\s*(?i)(Install|Update|Remove)\s*[:\-]\s*',''
+    $t = $t -replace '^\s*(?i)Update:\s*',''
+    $t = $t -replace '\s+Win$',''
+    $t.Trim()
 }
 
 # =========================
@@ -232,10 +238,12 @@ function Build-OfferXml {
         [string]$FixletActionName,
         [string]$GroupRelevance,
         [string]$Kind,            # "Install" | "Update" | "Remove"
-        [string]$Phase            # "QA" | "Deploy"
+        [string]$Phase,           # "QA" | "Deploy"
+        [string]$OfferDescription # from UI (Application Description)
     )
 
-    $uiTitleMessage  = SafeEscape(("Update: {0}" -f $DisplayName))
+    # UI title should be just the clean product name
+    $uiTitleMessage  = SafeEscape($DisplayName)
     $siteEsc         = SafeEscape($SiteName)
     $fixletIdEsc     = SafeEscape($FixletId)
     $actionNameEsc   = SafeEscape($FixletActionName)
@@ -250,7 +258,9 @@ function Build-OfferXml {
     }
     $offerMsg   = SafeEscape(("({0} to {1}.  Please wait...)" -f $ing, $DisplayName))
     $offerTitle = SafeEscape(("{0}: {1}: {2} Offer" -f $cat, $DisplayName, $Phase))
-    $offerDesc  = SafeEscape(("This offer will {0} {1}." -f $verb, $DisplayName))
+    # Use the UI-provided description; if empty, fall back to a default sentence
+    $offerDescInput = if ([string]::IsNullOrWhiteSpace($OfferDescription)) { "This offer will $verb $DisplayName." } else { $OfferDescription }
+    $offerDesc  = SafeEscape($offerDescInput)
     $offerCat   = SafeEscape($cat)
 
 @"
@@ -268,7 +278,7 @@ function Build-OfferXml {
     <Settings>
       <!-- Messages -->
       <ActionUITitle>$uiTitleMessage</ActionUITitle>
-      <PreActionShowUI>$($OfferDefaults.PreActionShowUI)</PreActionShowUI>
+      <PreActionShowUI>$(To-XmlBool $OfferDefaults.PreActionShowUI)</PreActionShowUI>
       <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>$offerMsg</Text></RunningMessage>
 
@@ -281,7 +291,7 @@ function Build-OfferXml {
       <UseUTCTime>false</UseUTCTime>
 
       <!-- Reapply & Retry -->
-      <Reapply>$($OfferDefaults.Reapply)</Reapply>
+      <Reapply>$(To-XmlBool $OfferDefaults.Reapply)</Reapply>
       <HasReapplyLimit>false</HasReapplyLimit>
       <HasReapplyInterval>false</HasReapplyInterval>
       <HasRetry>true</HasRetry>
@@ -294,7 +304,7 @@ function Build-OfferXml {
       <HasWhose>false</HasWhose>
       <PreActionCacheDownload>false</PreActionCacheDownload>
       <HasTemporalDistribution>false</HasTemporalDistribution>
-      <ContinueOnErrors>$($OfferDefaults.ContinueOnErr)</ContinueOnErrors>
+      <ContinueOnErrors>$(To-XmlBool $OfferDefaults.ContinueOnErr)</ContinueOnErrors>
       <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
 
       <!-- Offer tab -->
@@ -311,11 +321,11 @@ function Build-OfferXml {
 }
 
 # =========================
-# GUI (minimal)
+# GUI (minimal + App Description box)
 # =========================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Offer Action Generator"
-$form.Size = New-Object System.Drawing.Size(720, 600)
+$form.Size = New-Object System.Drawing.Size(760, 720)
 $form.StartPosition = "CenterScreen"
 
 $y = 20
@@ -330,7 +340,7 @@ function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB,[string]$Default
     else { $tb = New-Object System.Windows.Forms.TextBox }
 
     $tb.Location = New-Object System.Drawing.Point(190,$script:y)
-    $tb.Size = New-Object System.Drawing.Size(500,22)
+    $tb.Size = New-Object System.Drawing.Size(540,22)
     if ($DefaultValue) { $tb.Text = $DefaultValue }
     if ($ReadOnly) { $tb.ReadOnly = $true }
     $form.Controls.Add($tb)
@@ -348,18 +358,33 @@ $tbFixletInstall = $null; Add-Field "Fixlet ID (Install):" $false ([ref]$tbFixle
 $tbFixletUpdate  = $null; Add-Field "Fixlet ID (Update):"  $false ([ref]$tbFixletUpdate)
 $tbFixletRemove  = $null; Add-Field "Fixlet ID (Remove):"  $false ([ref]$tbFixletRemove)
 
+# Application Description (multiline)
+$lblDesc = New-Object System.Windows.Forms.Label
+$lblDesc.Text = "Application Description (Offer tab):"
+$lblDesc.Location = New-Object System.Drawing.Point(10,$y)
+$lblDesc.Size = New-Object System.Drawing.Size(300,22)
+$form.Controls.Add($lblDesc)
+
+$tbAppDesc = New-Object System.Windows.Forms.TextBox
+$tbAppDesc.Multiline = $true
+$tbAppDesc.ScrollBars = "Vertical"
+$tbAppDesc.Location = New-Object System.Drawing.Point(10,$y+24)
+$tbAppDesc.Size = New-Object System.Drawing.Size(720,120)   # roomy for a few sentences
+$form.Controls.Add($tbAppDesc)
+$y += 24 + 120 + 16
+
 # Buttons
 $btnQA = New-Object System.Windows.Forms.Button
 $btnQA.Text = "Create QA Offers (Install / Update / Remove)"
 $btnQA.Location = New-Object System.Drawing.Point(190,$y)
-$btnQA.Size = New-Object System.Drawing.Size(500,32)
+$btnQA.Size = New-Object System.Drawing.Size(540,32)
 $form.Controls.Add($btnQA)
 $y += 42
 
 $btnDeploy = New-Object System.Windows.Forms.Button
 $btnDeploy.Text = "Create Deploy Offers (Install / Update / Remove)"
 $btnDeploy.Location = New-Object System.Drawing.Point(190,$y)
-$btnDeploy.Size = New-Object System.Drawing.Size(500,32)
+$btnDeploy.Size = New-Object System.Drawing.Size(540,32)
 $form.Controls.Add($btnDeploy)
 $y += 42
 
@@ -370,7 +395,7 @@ $LogBox.ScrollBars = "Vertical"
 $LogBox.ReadOnly = $false
 $LogBox.WordWrap = $false
 $LogBox.Location = New-Object System.Drawing.Point(10,$y)
-$LogBox.Size = New-Object System.Drawing.Size(680,260)
+$LogBox.Size = New-Object System.Drawing.Size(720,180)
 $LogBox.ContextMenu = New-Object System.Windows.Forms.ContextMenu
 $LogBox.ContextMenu.MenuItems.AddRange(@(
     (New-Object System.Windows.Forms.MenuItem "Copy",       { $LogBox.Copy() }),
@@ -390,7 +415,8 @@ function Confirm-And-Post-Offers {
         [string]$Pass,
         [string]$FixletInstall,
         [string]$FixletUpdate,
-        [string]$FixletRemove
+        [string]$FixletRemove,
+        [string]$OfferDescriptionFromUi
     )
 
     $LogBox.Clear()
@@ -473,7 +499,8 @@ function Confirm-And-Post-Offers {
                 -FixletActionName     $FixletActionName_Default `
                 -GroupRelevance       $groupRel `
                 -Kind                 $t.Name `
-                -Phase                $Phase
+                -Phase                $Phase `
+                -OfferDescription     $OfferDescriptionFromUi
 
             $safeTitle = ($t.Name -replace '[^\w\-. ]','_') -replace '\s+','_'
             $tmpAction = Join-Path $env:TEMP ("BES_Offer_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
@@ -511,7 +538,8 @@ $btnQA.Add_Click({
         -Pass $tbPass.Text `
         -FixletInstall $tbFixletInstall.Text `
         -FixletUpdate  $tbFixletUpdate.Text `
-        -FixletRemove  $tbFixletRemove.Text
+        -FixletRemove  $tbFixletRemove.Text `
+        -OfferDescriptionFromUi $tbAppDesc.Text
 })
 $btnDeploy.Add_Click({
     Confirm-And-Post-Offers `
@@ -521,7 +549,8 @@ $btnDeploy.Add_Click({
         -Pass $tbPass.Text `
         -FixletInstall $tbFixletInstall.Text `
         -FixletUpdate  $tbFixletUpdate.Text `
-        -FixletRemove  $tbFixletRemove.Text
+        -FixletRemove  $tbFixletRemove.Text `
+        -OfferDescriptionFromUi $tbAppDesc.Text
 })
 
 $form.Topmost = $false
