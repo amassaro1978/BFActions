@@ -1,6 +1,6 @@
 # =========================================================
 # BigFix Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v7 (Fixed layout + App Desc + XML bools)
+# Baseline: Offers-2025-09-24-v8 (Fixed layout + App Desc + XML bools)
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -143,6 +143,90 @@ function Post-XmlFile-InFile {
         }
         throw ($_.Exception.Message)
     }
+}
+
+# =========================
+# FIXLET & GROUP PARSING (RESTORED)
+# =========================
+function Get-FixletContainer { param([xml]$Xml)
+    if ($Xml.BES.Fixlet)   { return @{ Type="Fixlet";   Node=$Xml.BES.Fixlet } }
+    if ($Xml.BES.Task)     { return @{ Type="Task";     Node=$Xml.BES.Task } }
+    if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
+    throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
+}
+
+function Extract-AllRelevanceFromXmlString {
+    param([string]$XmlString,[string]$Context = "Unknown")
+    $all = @()
+    try {
+        $x = [xml]$XmlString
+        $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
+        if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
+        if ($all.Count -eq 0) {
+            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
+            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
+        }
+    } catch {}
+    if ($AggressiveRegexFallback -and $all.Count -eq 0) {
+        $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
+        foreach ($mm in $regex.Matches($XmlString)) { $t = ($mm.Groups[1].Value).Trim(); if ($t) { $all += $t } }
+    }
+    return ,$all
+}
+
+function Extract-SCRFragments {
+    param([string]$XmlString,[string]$Context="Unknown")
+    $frags = @()
+    try {
+        $x = [xml]$XmlString
+        $scrNodes = $x.SelectNodes("//*[local-name()='SearchComponentRelevance']")
+        if ($scrNodes) {
+            foreach ($n in $scrNodes) {
+                $innerR = $n.SelectNodes(".//*[local-name()='Relevance']")
+                if ($innerR -and $innerR.Count -gt 0) {
+                    foreach ($ir in $innerR) { $t = ($ir.InnerText).Trim(); if ($t) { $frags += $t } }
+                } else {
+                    $t = ($n.InnerText).Trim(); if ($t) { $frags += $t }
+                }
+            }
+        }
+    } catch {}
+    return ,$frags
+}
+
+function Get-GroupClientRelevance {
+    param([string]$BaseUrl,[string]$AuthHeader,[string]$SiteName,[string]$GroupIdNumeric)
+    $encSite = Encode-SiteName $SiteName
+    $candidates = @(
+        "/api/computergroup/custom/$encSite/$GroupIdNumeric",
+        "/api/computergroup/master/$GroupIdNumeric",
+        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"
+    )
+    foreach ($relPath in $candidates) {
+        $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
+        try {
+            $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
+            if ($DumpFetchedXmlToTemp) {
+                $tmp = Join-Path $env:TEMP ("BES_ComputerGroup_{0}.xml" -f $GroupIdNumeric)
+                [System.IO.File]::WriteAllText($tmp, $xmlStr)
+                LogLine "Saved fetched group XML to: $tmp"
+            }
+            $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
+            if ($rels.Count -gt 0) {
+                $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
+                return $joined
+            }
+            $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
+            if ($frags.Count -gt 0) {
+                $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
+                return $joined
+            }
+            LogLine "No usable relevance at ${url}"
+        } catch {
+            LogLine ("❌ Group relevance fetch failed ({0}): {1}" -f $GroupIdNumeric, $_.Exception.Message)
+        }
+    }
+    throw "No relevance found or derivable for group ${GroupIdNumeric}."
 }
 
 # =========================
