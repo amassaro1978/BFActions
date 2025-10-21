@@ -1,0 +1,528 @@
+# =========================================================
+# Offer Action Generator (Install / Update / Remove)
+# Baseline: Offers-2025-09-24-v4 (Simplified UI + Title Format)
+# =========================================================
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Web
+
+# =========================
+# CONFIG (hardcoded)
+# =========================
+$LogFile = "C:\temp\BigFixOfferGenerator.log"
+$CustomSiteName = "Test Group Managed (Workstations)"
+
+# Fixlet Action name inside each Fixlet
+$FixletActionName_Default = "Action1"
+
+# Hardcoded group IDs for the two rounds
+$QA_GroupIdWithPrefix     = "00-12345"
+$Deploy_GroupIdWithPrefix = "00-67890"
+
+# Offer settings
+$OfferDefaults = @{
+    PreActionShowUI = $false
+    RetryCount      = 3
+    RetryWaitISO    = "PT1H"
+    StartOffsetISO  = "PT0S"        # starts now
+    EndOffsetISO    = "P365DT0S"    # ends in 1 year
+    Reapply         = $true
+    ContinueOnErr   = $true
+    ActiveUserReq   = "NoRequirement"
+    ActiveUserType  = "AllUsers"
+}
+
+# Behavior toggles
+$IgnoreCertErrors           = $true
+$DumpFetchedXmlToTemp       = $true
+$AggressiveRegexFallback    = $true
+$SaveActionXmlToTemp        = $true
+$PostUsingInvokeWebRequest  = $true
+
+# =========================
+# UTIL / LOGGING
+# =========================
+function Encode-SiteName([string]$Name) {
+    $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
+    $enc = $enc -replace '\+','%20' -replace '\(','%28' -replace '\)','%29'
+    return $enc
+}
+function Get-BaseUrl([string]$ServerInput) {
+    if (-not $ServerInput) { throw "Server is empty." }
+    $s = $ServerInput.Trim()
+    if ($s -notmatch '^(?i)https?://') {
+        if ($s -match ':\d+$') { $s = "https://$s" } else { $s = "https://$s:52311" }
+    }
+    return $s.TrimEnd('/')
+}
+function Join-ApiUrl([string]$BaseUrl,[string]$RelativePath) {
+    $rp = if ($RelativePath.StartsWith("/")) { $RelativePath } else { "/$RelativePath" }
+    $BaseUrl.TrimEnd('/') + $rp
+}
+function Get-AuthHeader([string]$User,[string]$Pass) {
+    $pair  = "$User`:$Pass"
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    "Basic " + [Convert]::ToBase64String($bytes)
+}
+function LogLine($txt) {
+    try {
+        $line = "{0}  {1}" -f (Get-Date -Format 'u'), $txt
+        if ($LogBox) { $LogBox.AppendText($line + "`r`n"); $LogBox.SelectionStart = $LogBox.Text.Length; $LogBox.ScrollToCaret() }
+        Add-Content -Path $LogFile -Value $line
+    } catch {}
+}
+function Get-NumericGroupId([string]$GroupIdWithPrefix) {
+    if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
+    return ($GroupIdWithPrefix -replace '[^\d]','')
+}
+function SafeEscape([string]$s) {
+    if ($null -eq $s) { return "" }
+    [System.Security.SecurityElement]::Escape($s)
+}
+function Parse-FixletTitleToProduct([string]$Title) {
+    # Keep it simple: strip leading "Update:" and trailing " Win"
+    ($Title -replace '^\s*Update:\s*','' -replace '\s+Win$','').Trim()
+}
+
+# =========================
+# HTTP
+# =========================
+if ($IgnoreCertErrors) { try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch { } }
+[System.Net.ServicePointManager]::Expect100Continue = $false
+
+function HttpGetXml {
+    param([string]$Url,[string]$AuthHeader)
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = "GET"
+    $req.Accept = "application/xml"
+    $req.Headers["Accept-Encoding"] = "gzip, deflate"
+    $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    if ($AuthHeader) { $req.Headers["Authorization"] = $AuthHeader }
+    $req.ProtocolVersion = [Version]"1.1"
+    $req.PreAuthenticate = $true
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 45000
+    try {
+        $resp = $req.GetResponse()
+        try {
+            $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+            $content = $sr.ReadToEnd(); $sr.Close()
+        } finally { $resp.Close() }
+        return $content
+    } catch {
+        throw ($_.Exception.GetBaseException().Message)
+    }
+}
+
+function Post-XmlFile-InFile {
+    param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
+    try {
+        $pair  = "$User`:$Pass"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+        $basic = "Basic " + [Convert]::ToBase64String($bytes)
+        $resp = Invoke-WebRequest -Method Post -Uri $Url `
+            -Headers @{ "Authorization" = $basic } `
+            -ContentType "application/xml" `
+            -InFile $XmlFilePath `
+            -UseBasicParsing
+        if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
+    } catch {
+        $respErr = $_.Exception.Response
+        if ($respErr -and $respErr.GetResponseStream) {
+            $rs = $respErr.GetResponseStream()
+            $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
+            $errBody = $sr.ReadToEnd(); $sr.Close()
+            throw "Invoke-WebRequest POST failed :: $errBody"
+        }
+        throw ($_.Exception.Message)
+    }
+}
+
+# =========================
+# FIXLET & GROUP PARSING
+# =========================
+function Get-FixletContainer { param([xml]$Xml)
+    if ($Xml.BES.Fixlet)   { return @{ Type="Fixlet";   Node=$Xml.BES.Fixlet } }
+    if ($Xml.BES.Task)     { return @{ Type="Task";     Node=$Xml.BES.Task } }
+    if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
+    throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
+}
+function Extract-AllRelevanceFromXmlString {
+    param([string]$XmlString,[string]$Context = "Unknown")
+    $all = @()
+    try {
+        $x = [xml]$XmlString
+        $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
+        if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
+        if ($all.Count -eq 0) {
+            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
+            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
+        }
+    } catch {}
+    if ($AggressiveRegexFallback -and $all.Count -eq 0) {
+        $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
+        foreach ($mm in $regex.Matches($XmlString)) { $t = ($mm.Groups[1].Value).Trim(); if ($t) { $all += $t } }
+    }
+    return ,$all
+}
+function Extract-SCRFragments {
+    param([string]$XmlString,[string]$Context="Unknown")
+    $frags = @()
+    try {
+        $x = [xml]$XmlString
+        $scrNodes = $x.SelectNodes("//*[local-name()='SearchComponentRelevance']")
+        if ($scrNodes) {
+            foreach ($n in $scrNodes) {
+                $innerR = $n.SelectNodes(".//*[local-name()='Relevance']")
+                if ($innerR -and $innerR.Count -gt 0) {
+                    foreach ($ir in $innerR) { $t = ($ir.InnerText).Trim(); if ($t) { $frags += $t } }
+                } else {
+                    $t = ($n.InnerText).Trim(); if ($t) { $frags += $t }
+                }
+            }
+        }
+    } catch {}
+    return ,$frags
+}
+function Get-GroupClientRelevance {
+    param([string]$BaseUrl,[string]$AuthHeader,[string]$SiteName,[string]$GroupIdNumeric)
+    $encSite = Encode-SiteName $SiteName
+    $candidates = @(
+        "/api/computergroup/custom/$encSite/$GroupIdNumeric",
+        "/api/computergroup/master/$GroupIdNumeric",
+        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"
+    )
+    foreach ($relPath in $candidates) {
+        $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
+        try {
+            $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
+            if ($DumpFetchedXmlToTemp) {
+                $tmp = Join-Path $env:TEMP ("BES_ComputerGroup_{0}.xml" -f $GroupIdNumeric)
+                [System.IO.File]::WriteAllText($tmp, $xmlStr)
+                LogLine "Saved fetched group XML to: $tmp"
+            }
+            $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
+            if ($rels.Count -gt 0) {
+                $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
+                return $joined
+            }
+            $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
+            if ($frags.Count -gt 0) {
+                $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
+                return $joined
+            }
+            LogLine "No usable relevance at ${url}"
+        } catch {
+            LogLine ("❌ Group relevance fetch failed ({0}): {1}" -f $GroupIdNumeric, $_.Exception.Message)
+        }
+    }
+    throw "No relevance found or derivable for group ${GroupIdNumeric}."
+}
+
+# =========================
+# OFFER XML BUILDER (title: "<Kind>: <DisplayName>: <Phase> Offer")
+# =========================
+function Build-OfferXml {
+    param(
+        [string]$UiBaseTitle,     # fixlet title (for console ActionUITitle context)
+        [string]$DisplayName,     # derived from title for user-facing text
+        [string]$SiteName,
+        [string]$FixletId,
+        [string]$FixletActionName,
+        [string]$GroupRelevance,
+        [string]$Kind,            # "Install" | "Update" | "Remove"
+        [string]$Phase            # "QA" | "Deploy"
+    )
+
+    $uiTitleMessage  = SafeEscape(("Update: {0}" -f $DisplayName))
+    $siteEsc         = SafeEscape($SiteName)
+    $fixletIdEsc     = SafeEscape($FixletId)
+    $actionNameEsc   = SafeEscape($FixletActionName)
+    $groupSafe       = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
+    $groupSafe       = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
+
+    # Texts by kind
+    switch -Regex ($Kind) {
+        '^(?i)install$' { $ing='Installing'; $cat='Install'; $verb='install' }
+        '^(?i)remove$'  { $ing='Removing' ; $cat='Remove' ; $verb='remove'  }
+        default         { $ing='Updating' ; $cat='Update' ; $verb='update'  }
+    }
+    $offerMsg   = SafeEscape(("({0} to {1}.  Please wait...)" -f $ing, $DisplayName))
+    $offerTitle = SafeEscape(("{0}: {1}: {2} Offer" -f $cat, $DisplayName, $Phase))
+    $offerDesc  = SafeEscape(("This offer will {0} {1}." -f $verb, $DisplayName))
+    $offerCat   = SafeEscape($cat)
+
+@"
+<?xml version="1.0" encoding="UTF-8"?>
+<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
+  <SourcedFixletAction>
+    <SourceFixlet>
+      <Sitename>$siteEsc</Sitename>
+      <FixletID>$fixletIdEsc</FixletID>
+      <Action>$actionNameEsc</Action>
+    </SourceFixlet>
+    <Target>
+      <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
+    </Target>
+    <Settings>
+      <!-- Messages -->
+      <ActionUITitle>$uiTitleMessage</ActionUITitle>
+      <PreActionShowUI>$($OfferDefaults.PreActionShowUI)</PreActionShowUI>
+      <HasRunningMessage>true</HasRunningMessage>
+      <RunningMessage><Text>$offerMsg</Text></RunningMessage>
+
+      <!-- Execution -->
+      <HasTimeRange>false</HasTimeRange>
+      <HasStartTime>true</HasStartTime>
+      <StartDateTimeLocalOffset>$($OfferDefaults.StartOffsetISO)</StartDateTimeLocalOffset>
+      <HasEndTime>true</HasEndTime>
+      <EndDateTimeLocalOffset>$($OfferDefaults.EndOffsetISO)</EndDateTimeLocalOffset>
+      <UseUTCTime>false</UseUTCTime>
+
+      <!-- Reapply & Retry -->
+      <Reapply>$($OfferDefaults.Reapply)</Reapply>
+      <HasReapplyLimit>false</HasReapplyLimit>
+      <HasReapplyInterval>false</HasReapplyInterval>
+      <HasRetry>true</HasRetry>
+      <RetryCount>$($OfferDefaults.RetryCount)</RetryCount>
+      <RetryWait Behavior="WaitForInterval">$($OfferDefaults.RetryWaitISO)</RetryWait>
+
+      <!-- Defaults -->
+      <ActiveUserRequirement>$($OfferDefaults.ActiveUserReq)</ActiveUserRequirement>
+      <ActiveUserType>$($OfferDefaults.ActiveUserType)</ActiveUserType>
+      <HasWhose>false</HasWhose>
+      <PreActionCacheDownload>false</PreActionCacheDownload>
+      <HasTemporalDistribution>false</HasTemporalDistribution>
+      <ContinueOnErrors>$($OfferDefaults.ContinueOnErr)</ContinueOnErrors>
+      <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
+
+      <!-- Offer tab -->
+      <IsOffer>true</IsOffer>
+      <OfferCategory>$offerCat</OfferCategory>
+      <OfferDescription>$offerDesc</OfferDescription>
+    </Settings>
+
+    <!-- Console action title -->
+    <Title>$offerTitle</Title>
+  </SourcedFixletAction>
+</BES>
+"@
+}
+
+# =========================
+# GUI (minimal)
+# =========================
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "BigFix Offer Action Generator"
+$form.Size = New-Object System.Drawing.Size(720, 600)
+$form.StartPosition = "CenterScreen"
+
+$y = 20
+function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB,[string]$DefaultValue="",$ReadOnly=$false) {
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Label
+    $lbl.Location = New-Object System.Drawing.Point(10,$script:y)
+    $lbl.Size = New-Object System.Drawing.Size(170,22)
+    $form.Controls.Add($lbl)
+
+    if ($IsPassword) { $tb = New-Object System.Windows.Forms.MaskedTextBox; $tb.PasswordChar = '*' }
+    else { $tb = New-Object System.Windows.Forms.TextBox }
+
+    $tb.Location = New-Object System.Drawing.Point(190,$script:y)
+    $tb.Size = New-Object System.Drawing.Size(500,22)
+    if ($DefaultValue) { $tb.Text = $DefaultValue }
+    if ($ReadOnly) { $tb.ReadOnly = $true }
+    $form.Controls.Add($tb)
+    $OutTB.Value = $tb
+    $script:y += 34
+}
+
+# Server (locked), creds
+$tbServer = $null; Add-Field "BigFix Server:" $false ([ref]$tbServer) "https://test.server:52311" $true
+$tbUser   = $null; Add-Field "Username:"      $false ([ref]$tbUser)
+$tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
+
+# Only the three Fixlet IDs
+$tbFixletInstall = $null; Add-Field "Fixlet ID (Install):" $false ([ref]$tbFixletInstall)
+$tbFixletUpdate  = $null; Add-Field "Fixlet ID (Update):"  $false ([ref]$tbFixletUpdate)
+$tbFixletRemove  = $null; Add-Field "Fixlet ID (Remove):"  $false ([ref]$tbFixletRemove)
+
+# Buttons
+$btnQA = New-Object System.Windows.Forms.Button
+$btnQA.Text = "Create QA Offers (Install / Update / Remove)"
+$btnQA.Location = New-Object System.Drawing.Point(190,$y)
+$btnQA.Size = New-Object System.Drawing.Size(500,32)
+$form.Controls.Add($btnQA)
+$y += 42
+
+$btnDeploy = New-Object System.Windows.Forms.Button
+$btnDeploy.Text = "Create Deploy Offers (Install / Update / Remove)"
+$btnDeploy.Location = New-Object System.Drawing.Point(190,$y)
+$btnDeploy.Size = New-Object System.Drawing.Size(500,32)
+$form.Controls.Add($btnDeploy)
+$y += 42
+
+# Log
+$LogBox = New-Object System.Windows.Forms.TextBox
+$LogBox.Multiline = $true
+$LogBox.ScrollBars = "Vertical"
+$LogBox.ReadOnly = $false
+$LogBox.WordWrap = $false
+$LogBox.Location = New-Object System.Drawing.Point(10,$y)
+$LogBox.Size = New-Object System.Drawing.Size(680,260)
+$LogBox.ContextMenu = New-Object System.Windows.Forms.ContextMenu
+$LogBox.ContextMenu.MenuItems.AddRange(@(
+    (New-Object System.Windows.Forms.MenuItem "Copy",       { $LogBox.Copy() }),
+    (New-Object System.Windows.Forms.MenuItem "Select All", { $LogBox.SelectAll() })
+))
+$LogBox.Anchor = "Top,Left,Right,Bottom"
+$form.Controls.Add($LogBox)
+
+# =========================
+# CORE: confirm + post
+# =========================
+function Confirm-And-Post-Offers {
+    param(
+        [string]$Phase,                 # "QA" or "Deploy"
+        [string]$Server,
+        [string]$User,
+        [string]$Pass,
+        [string]$FixletInstall,
+        [string]$FixletUpdate,
+        [string]$FixletRemove
+    )
+
+    $LogBox.Clear()
+    LogLine "== Begin $Phase Offers =="
+
+    if (-not ($Server -and $User -and $Pass -and $FixletInstall -and $FixletUpdate -and $FixletRemove)) {
+        LogLine "❌ Fill Server, Username, Password, and all 3 Fixlet IDs."
+        return
+    }
+
+    try {
+        $base = Get-BaseUrl $Server
+        $encodedSite = Encode-SiteName $CustomSiteName
+        $auth = Get-AuthHeader -User $User -Pass $Pass
+        $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
+        LogLine "POST URL: ${postUrl}"
+
+        # Pull titles
+        $ids = @($FixletInstall,$FixletUpdate,$FixletRemove)
+        $titles = @()
+        foreach ($fx in $ids) {
+            $fixUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/fixlet/custom/$encodedSite/$fx"
+            $xmlStr = HttpGetXml -Url $fixUrl -AuthHeader $auth
+            if ($DumpFetchedXmlToTemp) {
+                $tmpFix = Join-Path $env:TEMP ("BES_Fixlet_{0}.xml" -f $fx)
+                [System.IO.File]::WriteAllText($tmpFix, $xmlStr)
+                LogLine "Saved fetched fixlet XML to: $tmpFix"
+            }
+            $x = [xml]$xmlStr
+            $node = (Get-FixletContainer -Xml $x).Node
+            $title = [string]$node.Title
+            if (-not $title) { $title = "(Unknown Title: $fx)" }
+            $titles += $title
+        }
+
+        # Group relevance (hardcoded groups)
+        $groupRaw = if ($Phase -ieq "QA") { $QA_GroupIdWithPrefix } else { $Deploy_GroupIdWithPrefix }
+        $groupNum = Get-NumericGroupId $groupRaw
+        if (-not $groupNum) { throw "Could not parse numeric ID from '$groupRaw'." }
+        LogLine "Fetching group relevance for $Phase (group $groupNum)"
+        $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupNum
+
+        # Confirm
+        $lines = @(
+            "Round: $Phase",
+            "Group: $groupRaw",
+            "Fixlets:",
+            " - Install: " + $titles[0],
+            " - Update : " + $titles[1],
+            " - Remove : " + $titles[2],
+            "",
+            "Create OFFER actions for these 3 fixlets?"
+        )
+        $msg = [string]::Join("`r`n",$lines)
+        $dlg = [System.Windows.Forms.MessageBox]::Show(
+            $form, $msg, "Confirm: Create $Phase Offers",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question,
+            [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+        )
+        if ($dlg -ne [System.Windows.Forms.DialogResult]::Yes) {
+            LogLine "🚫 User canceled."
+            return
+        }
+
+        # Post each
+        $triples = @(
+            @{ Name="Install"; FixId=$FixletInstall; Title=$titles[0] },
+            @{ Name="Update";  FixId=$FixletUpdate;  Title=$titles[1] },
+            @{ Name="Remove";  FixId=$FixletRemove;  Title=$titles[2] }
+        )
+
+        foreach ($t in $triples) {
+            $dispName = Parse-FixletTitleToProduct -Title $t.Title
+            $xmlBody = Build-OfferXml `
+                -UiBaseTitle          $t.Title `
+                -DisplayName          $dispName `
+                -SiteName             $CustomSiteName `
+                -FixletId             $t.FixId `
+                -FixletActionName     $FixletActionName_Default `
+                -GroupRelevance       $groupRel `
+                -Kind                 $t.Name `
+                -Phase                $Phase
+
+            $safeTitle = ($t.Name -replace '[^\w\-. ]','_') -replace '\s+','_'
+            $tmpAction = Join-Path $env:TEMP ("BES_Offer_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
+            if ($SaveActionXmlToTemp) {
+                [System.IO.File]::WriteAllText($tmpAction, $xmlBody)
+                LogLine "Saved OFFER action XML for $($t.Name) to: $tmpAction"
+                LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
+            }
+
+            try {
+                if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
+                    Post-XmlFile-InFile -Url $postUrl -User $User -Pass $Pass -XmlFilePath $tmpAction
+                } else {
+                    LogLine "⚠️ Direct POST path disabled; enable if needed."
+                }
+                LogLine ("✅ OFFER posted: {0} ({1})" -f $t.Name, $dispName)
+            } catch {
+                LogLine ("❌ OFFER POST failed for {0}: {1}" -f $t.Name, $_.Exception.Message)
+            }
+        }
+
+        LogLine "All $Phase offers attempted. Log file: $LogFile"
+    }
+    catch {
+        LogLine ("❌ Fatal error ($Phase): {0}" -f ($_.Exception.GetBaseException().Message))
+    }
+}
+
+# Wire up buttons
+$btnQA.Add_Click({
+    Confirm-And-Post-Offers `
+        -Phase "QA" `
+        -Server $tbServer.Text `
+        -User $tbUser.Text `
+        -Pass $tbPass.Text `
+        -FixletInstall $tbFixletInstall.Text `
+        -FixletUpdate  $tbFixletUpdate.Text `
+        -FixletRemove  $tbFixletRemove.Text
+})
+$btnDeploy.Add_Click({
+    Confirm-And-Post-Offers `
+        -Phase "Deploy" `
+        -Server $tbServer.Text `
+        -User $tbUser.Text `
+        -Pass $tbPass.Text `
+        -FixletInstall $tbFixletInstall.Text `
+        -FixletUpdate  $tbFixletUpdate.Text `
+        -FixletRemove  $tbFixletRemove.Text
+})
+
+$form.Topmost = $false
+[void]$form.ShowDialog()
