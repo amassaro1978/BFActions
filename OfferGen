@@ -1,10 +1,11 @@
 # =========================================================
 # BigFix Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v13
+# Baseline: Offers-2025-09-24-v14
+# - Running message: no parentheses; only Update uses "to"
+# - Removed <PreActionCacheDownload> (schema-safe)
 # - LLM via env var key (LITELLM_KEY)
 # - OfferDescriptionHTML (HTML-encoded inside CDATA)
 # - Enhanced POST error logging (PS 5.x safe; multiple fallbacks)
-# - Removed disallowed XML fields (ActiveUserRequirement/ActiveUserType/HasWhose)
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -38,7 +39,7 @@ $OfferDefaults = @{
 # ===== LLM CONFIG (env var) =====
 $LLMConfig = @{
     EnableAuto = $true
-    ApiUrl     = "https://redacted/v1/chat/completions"
+    ApiUrl     = "https://redacted/v1/chat/completions"  # your LiteLLM endpoint
     ApiKeyEnv  = "LITELLM_KEY"
     Model      = "gpt-40"
 }
@@ -261,7 +262,7 @@ function Post-XmlFile-InFile {
             } catch {}
         }
 
-        # Fallback 1: ErrorDetails.Message (PS sometimes stuffs body here)
+        # Fallback 1: ErrorDetails.Message
         if ($null -eq $errBody -and $_.ErrorDetails -and $_.ErrorDetails.Message) {
             $errBody = [string]$_.ErrorDetails.Message
         }
@@ -416,7 +417,14 @@ function Build-OfferXml {
         default         { $ing='Updating' ; $cat='Update' ; $verb='update'  }
     }
 
-    $runningMsg = SafeEscape(("({0} to {1}.  Please wait...)" -f $ing, $DisplayName))
+    # Messages (no parentheses; only Update uses "to")
+    if ($cat -ieq 'Update') {
+        $runningMsgText = ("{0} to {1}. Please wait..." -f $ing, $DisplayName)
+    } else {
+        $runningMsgText = ("{0} {1}. Please wait..." -f $ing, $DisplayName)
+    }
+    $runningMsg = SafeEscape($runningMsgText)
+
     $offerTitle = SafeEscape(("{0}: {1}: {2} Offer" -f $cat, $DisplayName, $Phase))
 
     $descFallback = "This offer will $verb $DisplayName."
@@ -460,7 +468,6 @@ function Build-OfferXml {
       <RetryWait Behavior="WaitForInterval">$($OfferDefaults.RetryWaitISO)</RetryWait>
 
       <!-- Other defaults (schema-safe across versions) -->
-      <PreActionCacheDownload>false</PreActionCacheDownload>
       <HasTemporalDistribution>false</HasTemporalDistribution>
       <ContinueOnErrors>$(To-XmlBool $OfferDefaults.ContinueOnErr)</ContinueOnErrors>
       <PostActionBehavior Behavior="Nothing"></PostActionBehavior>
