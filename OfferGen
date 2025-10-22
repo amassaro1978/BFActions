@@ -1,12 +1,10 @@
 # =========================================================
 # BigFix Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v12
-# - Uses LiteLLM via env var key (LITELLM_KEY)
-# - No LLM URL/Key/Model fields in UI
-# - "Draft Description with LLM" button remains
+# Baseline: Offers-2025-09-24-v13
+# - LLM via env var key (LITELLM_KEY)
 # - OfferDescriptionHTML (HTML-encoded inside CDATA)
-# - Enhanced POST error logging (PS 5.x safe)
-# - Removed disallowed XML fields (ActiveUserRequirement/ActiveUserType)
+# - Enhanced POST error logging (PS 5.x safe; multiple fallbacks)
+# - Removed disallowed XML fields (ActiveUserRequirement/ActiveUserType/HasWhose)
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -37,12 +35,12 @@ $OfferDefaults = @{
     ContinueOnErr   = $true
 }
 
-# ===== LLM CONFIG (uses env var for key) =====
+# ===== LLM CONFIG (env var) =====
 $LLMConfig = @{
     EnableAuto = $true
-    ApiUrl     = "https://redacted/v1/chat/completions"  # <- your LiteLLM host + /v1/chat/completions
-    ApiKeyEnv  = "LITELLM_KEY"                           # <- environment variable name
-    Model      = "gpt-40"                                # <- exact model alias your LiteLLM exposes
+    ApiUrl     = "https://redacted/v1/chat/completions"
+    ApiKeyEnv  = "LITELLM_KEY"
+    Model      = "gpt-40"
 }
 
 # Behavior toggles
@@ -94,7 +92,7 @@ function SafeEscape([string]$s) {
 }
 function To-XmlBool([bool]$b) { if ($b) { 'true' } else { 'false' } }
 
-# Clean product name from Fixlet title (strip Install/Update/Remove prefixes, trailing " Win")
+# Clean product name from Fixlet title
 function Parse-FixletTitleToProduct([string]$Title) {
     $t = [string]$Title
     $t = $t -replace '^\s*(?i)(Install|Update|Remove)\s*[:\-]\s*',''
@@ -109,7 +107,6 @@ function Truncate([string]$s,[int]$max=600) {
     return ($s.Substring(0,$max)).Trim() + "…"
 }
 
-# Build a compact, neutral prompt for a 1–3 sentence offer description
 function Build-LLMPrompt([string]$displayName) {
 @"
 You are generating a short end-user description for a BigFix software offer.
@@ -121,7 +118,6 @@ Avoid marketing fluff, versions in every sentence, and avoid system/IT jargon. N
 "@
 }
 
-# Get API key from env (Process→User→Machine)
 function Get-LLMApiKey([string]$EnvVarName) {
     $k = [Environment]::GetEnvironmentVariable($EnvVarName, "Process")
     if (-not $k) { $k = [Environment]::GetEnvironmentVariable($EnvVarName, "User") }
@@ -129,7 +125,6 @@ function Get-LLMApiKey([string]$EnvVarName) {
     return $k
 }
 
-# Call an internal LLM (OpenAI-compatible OR simple {prompt,model})
 function Invoke-LLMDescription {
     param(
         [Parameter(Mandatory=$true)][string]$ApiUrl,
@@ -220,7 +215,7 @@ function HttpGetXml {
     }
 }
 
-# Enhanced: log HTTP status + full error body and save it to a temp file (PS 5.x safe)
+# Enhanced: detailed error capture (PS 5.x safe)
 function Post-XmlFile-InFile {
     param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
 
@@ -233,7 +228,8 @@ function Post-XmlFile-InFile {
             -Headers @{ "Authorization" = $basic } `
             -ContentType "application/xml" `
             -InFile $XmlFilePath `
-            -UseBasicParsing
+            -UseBasicParsing `
+            -ErrorAction Stop
 
         if ($resp.StatusCode) { LogLine ("POST HTTP {0} {1}" -f [int]$resp.StatusCode, $resp.StatusDescription) }
         if ($resp.Content)    { LogLine ("POST response body (first 500 chars): {0}" -f ($resp.Content.Substring(0,[Math]::Min(500,$resp.Content.Length)))) }
@@ -244,6 +240,7 @@ function Post-XmlFile-InFile {
         $status     = $null
         $statusDesc = $null
         $errBody    = $null
+        $headersStr = $null
 
         $respErr = $ex.Response
         if ($respErr) {
@@ -252,36 +249,56 @@ function Post-XmlFile-InFile {
                 if ($respErr.StatusDescription) { $statusDesc = $respErr.StatusDescription }
             } catch {}
 
+            # Try to stringify a few headers (not all)
             try {
-                if ($respErr.GetResponseStream) {
-                    $rs = $respErr.GetResponseStream()
+                $hdrs = @()
+                foreach ($k in $respErr.Headers.Keys) {
+                    $v = $respErr.Headers[$k]
+                    if ($k -and $v) { $hdrs += ("{0}: {1}" -f $k, $v) }
+                    if ($hdrs.Count -ge 8) { break }
+                }
+                if ($hdrs.Count -gt 0) { $headersStr = [string]::Join("; ", $hdrs) }
+            } catch {}
+        }
+
+        # Fallback 1: ErrorDetails.Message (PS sometimes stuffs body here)
+        if ($null -eq $errBody -and $_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $errBody = [string]$_.ErrorDetails.Message
+        }
+
+        # Fallback 2: response stream
+        if ($null -eq $errBody -and $respErr -and $respErr.GetResponseStream) {
+            try {
+                $rs = $respErr.GetResponseStream()
+                if ($rs) {
                     $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
                     $errBody = $sr.ReadToEnd(); $sr.Close()
                 }
             } catch {}
         }
 
-        # PS 5.x-safe "coalescing"
+        # Fallback 3: InnerException
+        if ($null -eq $errBody -and $ex.InnerException) {
+            $errBody = [string]$ex.InnerException.Message
+        }
+
+        # Log details
         $statusText = if ($null -ne $status) { [string]$status } else { "?" }
         $descText   = if ($null -ne $statusDesc) { [string]$statusDesc } else { "" }
 
-        if ($null -ne $status -or $null -ne $statusDesc) {
-            LogLine ("❌ POST failed :: HTTP {0} {1}" -f $statusText, $descText)
-        }
+        LogLine ("❌ POST failed :: HTTP {0} {1}" -f $statusText, $descText)
+        if ($headersStr) { LogLine ("Response headers: {0}" -f $headersStr) }
+
         if ($errBody) {
             $trimmed = $errBody.Substring(0, [Math]::Min(2000, $errBody.Length))
             LogLine ("❌ Server error body (first 2000 chars): {0}" -f $trimmed)
-
             $errFile = Join-Path $env:TEMP ("BES_Post_Error_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
-            try {
-                [System.IO.File]::WriteAllText($errFile, $errBody, [Text.Encoding]::UTF8)
-                LogLine ("Saved full error to: {0}" -f $errFile)
-            } catch {}
+            try { [System.IO.File]::WriteAllText($errFile, $errBody, [Text.Encoding]::UTF8); LogLine ("Saved full error to: {0}" -f $errFile) } catch {}
         } else {
-            LogLine ("❌ POST failed :: {0}" -f ($ex.GetBaseException().Message))
+            LogLine ("❌ Server did not include an error body.")
         }
 
-        # Throw concise message upstream
+        # Re-throw concise message upstream
         $short = if ($errBody) { $errBody.Substring(0, [Math]::Min(300, $errBody.Length)) } else { "" }
         throw ("Invoke-WebRequest POST failed :: HTTP {0} {1} :: {2}" -f $statusText, $descText, $short)
     }
@@ -371,7 +388,7 @@ function Get-GroupClientRelevance {
 }
 
 # =========================
-# OFFER XML BUILDER (console title: "<Kind>: <DisplayName>: <Phase> Offer")
+# OFFER XML BUILDER
 # =========================
 function Build-OfferXml {
     param(
@@ -386,7 +403,6 @@ function Build-OfferXml {
         [string]$OfferDescription # from UI (Application Description)
     )
 
-    # UI title should be just the clean product name
     $uiTitleMessage  = SafeEscape($DisplayName)
     $siteEsc         = SafeEscape($SiteName)
     $fixletIdEsc     = SafeEscape($FixletId)
@@ -394,21 +410,17 @@ function Build-OfferXml {
     $groupSafe       = if ([string]::IsNullOrWhiteSpace($GroupRelevance)) { "" } else { $GroupRelevance }
     $groupSafe       = $groupSafe -replace ']]>', ']]]]><![CDATA[>'
 
-    # Texts by kind
     switch -Regex ($Kind) {
         '^(?i)install$' { $ing='Installing'; $cat='Install'; $verb='install' }
         '^(?i)remove$'  { $ing='Removing' ; $cat='Remove' ; $verb='remove'  }
         default         { $ing='Updating' ; $cat='Update' ; $verb='update'  }
     }
 
-    # Messages
     $runningMsg = SafeEscape(("({0} to {1}.  Please wait...)" -f $ing, $DisplayName))
     $offerTitle = SafeEscape(("{0}: {1}: {2} Offer" -f $cat, $DisplayName, $Phase))
 
-    # HTML description for Offer tab
     $descFallback = "This offer will $verb $DisplayName."
     $descRaw = if ([string]::IsNullOrWhiteSpace($OfferDescription)) { $descFallback } else { $OfferDescription }
-    # Encode as HTML and convert newlines to <br/>
     $descHtml = [System.Web.HttpUtility]::HtmlEncode($descRaw) -replace "`r?`n","<br/>"
     $offerCat = SafeEscape($cat)
 
@@ -448,7 +460,6 @@ function Build-OfferXml {
       <RetryWait Behavior="WaitForInterval">$($OfferDefaults.RetryWaitISO)</RetryWait>
 
       <!-- Other defaults (schema-safe across versions) -->
-      <HasWhose>false</HasWhose>
       <PreActionCacheDownload>false</PreActionCacheDownload>
       <HasTemporalDistribution>false</HasTemporalDistribution>
       <ContinueOnErrors>$(To-XmlBool $OfferDefaults.ContinueOnErr)</ContinueOnErrors>
@@ -468,7 +479,7 @@ function Build-OfferXml {
 }
 
 # =========================
-# GUI (root grid: inputs → buttons → log)
+# GUI (inputs → buttons → log)
 # =========================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Offer Action Generator"
@@ -476,27 +487,25 @@ $form.StartPosition = "CenterScreen"
 $form.Size = New-Object System.Drawing.Size(900, 740)
 $form.MinimumSize = New-Object System.Drawing.Size(900, 620)
 
-# Root layout (3 rows)
 $root = New-Object System.Windows.Forms.TableLayoutPanel
 $root.Dock = 'Fill'
 $root.AutoSize = $false
 $root.RowCount = 3
 $root.ColumnCount = 1
 $root.Padding = '10,10,10,10'
-$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))     # inputs
-$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))     # buttons
-$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent,100)))  # log fill
+$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent,100)))
 $root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent,100)))
 $form.Controls.Add($root)
 
-# ----- Inputs grid (labels/fields) -----
 $grid = New-Object System.Windows.Forms.TableLayoutPanel
 $grid.Dock = 'Top'
 $grid.AutoSize = $true
 $grid.AutoSizeMode = 'GrowAndShrink'
 $grid.ColumnCount = 2
-$grid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 240)))  # labels
-$grid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))  # inputs
+$grid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 240)))
+$grid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 
 function Add-Row([string]$labelText, [System.Windows.Forms.Control]$ctrl) {
     $lbl = New-Object System.Windows.Forms.Label
@@ -513,14 +522,12 @@ function Add-Row([string]$labelText, [System.Windows.Forms.Control]$ctrl) {
     $grid.Controls.Add($ctrl, 1, $grid.RowCount - 1)
 }
 
-# Server (locked, white background)
 $tbServer = New-Object System.Windows.Forms.TextBox
 $tbServer.Text = "https://test.server:52311"
 $tbServer.ReadOnly = $true
 $tbServer.BackColor = [System.Drawing.SystemColors]::Window
 Add-Row "BigFix Server:" $tbServer
 
-# Username / Password
 $tbUser = New-Object System.Windows.Forms.TextBox
 Add-Row "Username:" $tbUser
 
@@ -528,7 +535,6 @@ $tbPass = New-Object System.Windows.Forms.MaskedTextBox
 $tbPass.PasswordChar = '*'
 Add-Row "Password:" $tbPass
 
-# Fixlet IDs
 $tbFixletInstall = New-Object System.Windows.Forms.TextBox
 Add-Row "Fixlet ID (Install):" $tbFixletInstall
 
@@ -538,7 +544,6 @@ Add-Row "Fixlet ID (Update):" $tbFixletUpdate
 $tbFixletRemove = New-Object System.Windows.Forms.TextBox
 Add-Row "Fixlet ID (Remove):" $tbFixletRemove
 
-# Application Description (multiline)
 $tbAppDesc = New-Object System.Windows.Forms.TextBox
 $tbAppDesc.Multiline = $true
 $tbAppDesc.ScrollBars = 'Vertical'
@@ -554,7 +559,6 @@ $grid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Fo
 $grid.Controls.Add($lblDesc, 0, $grid.RowCount - 1)
 $grid.Controls.Add($tbAppDesc, 1, $grid.RowCount - 1)
 
-# Button to draft description via LLM (under the description box)
 $btnLLM = New-Object System.Windows.Forms.Button
 $btnLLM.Text = "Draft Description with LLM"
 $btnLLM.Height = 28
@@ -562,10 +566,8 @@ $btnLLM.Width  = 240
 $btnLLM.Anchor = 'Left'
 Add-Row "" $btnLLM
 
-# Add inputs grid to root row 0
 $root.Controls.Add($grid, 0, 0)
 
-# ----- Buttons row (under inputs) -----
 $btnPanel = New-Object System.Windows.Forms.TableLayoutPanel
 $btnPanel.Dock = 'Top'
 $btnPanel.AutoSize = $true
@@ -587,10 +589,8 @@ $btnDeploy.Dock = 'Top'
 $btnDeploy.Margin = '0,0,0,6'
 $btnPanel.Controls.Add($btnDeploy)
 
-# Add buttons panel to root row 1
 $root.Controls.Add($btnPanel, 0, 1)
 
-# ----- Log box (fills remaining space) -----
 $LogBox = New-Object System.Windows.Forms.TextBox
 $LogBox.Multiline = $true
 $LogBox.ScrollBars = 'Vertical'
@@ -603,7 +603,6 @@ $LogBox.ContextMenu.MenuItems.AddRange(@(
     (New-Object System.Windows.Forms.MenuItem "Copy",       { $LogBox.Copy() }),
     (New-Object System.Windows.Forms.MenuItem "Select All", { $LogBox.SelectAll() })
 ))
-# Add log to root row 2
 $root.Controls.Add($LogBox, 0, 2)
 
 # =========================
