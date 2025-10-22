@@ -1,10 +1,12 @@
 # =========================================================
 # BigFix Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v10
+# Baseline: Offers-2025-09-24-v12
 # - Uses LiteLLM via env var key (LITELLM_KEY)
 # - No LLM URL/Key/Model fields in UI
 # - "Draft Description with LLM" button remains
 # - OfferDescriptionHTML (HTML-encoded inside CDATA)
+# - Enhanced POST error logging (PS 5.x safe)
+# - Removed disallowed XML fields (ActiveUserRequirement/ActiveUserType)
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -33,14 +35,12 @@ $OfferDefaults = @{
     EndOffsetISO    = "P365DT0S"    # ends in 1 year
     Reapply         = $true
     ContinueOnErr   = $true
-    ActiveUserReq   = "NoRequirement"
-    ActiveUserType  = "AllUsers"
 }
 
 # ===== LLM CONFIG (uses env var for key) =====
 $LLMConfig = @{
     EnableAuto = $true
-    ApiUrl     = "https://redacted/v1/chat/completions"  # <- your LiteLLM base + /v1/chat/completions
+    ApiUrl     = "https://redacted/v1/chat/completions"  # <- your LiteLLM host + /v1/chat/completions
     ApiKeyEnv  = "LITELLM_KEY"                           # <- environment variable name
     Model      = "gpt-40"                                # <- exact model alias your LiteLLM exposes
 }
@@ -220,27 +220,70 @@ function HttpGetXml {
     }
 }
 
+# Enhanced: log HTTP status + full error body and save it to a temp file (PS 5.x safe)
 function Post-XmlFile-InFile {
     param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
+
     try {
         $pair  = "$User`:$Pass"
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
         $basic = "Basic " + [Convert]::ToBase64String($bytes)
+
         $resp = Invoke-WebRequest -Method Post -Uri $Url `
             -Headers @{ "Authorization" = $basic } `
             -ContentType "application/xml" `
             -InFile $XmlFilePath `
             -UseBasicParsing
-        if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
-    } catch {
-        $respErr = $_.Exception.Response
-        if ($respErr -and $respErr.GetResponseStream) {
-            $rs = $respErr.GetResponseStream()
-            $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
-            $errBody = $sr.ReadToEnd(); $sr.Close()
-            throw "Invoke-WebRequest POST failed :: $errBody"
+
+        if ($resp.StatusCode) { LogLine ("POST HTTP {0} {1}" -f [int]$resp.StatusCode, $resp.StatusDescription) }
+        if ($resp.Content)    { LogLine ("POST response body (first 500 chars): {0}" -f ($resp.Content.Substring(0,[Math]::Min(500,$resp.Content.Length)))) }
+        return
+    }
+    catch {
+        $ex = $_.Exception
+        $status     = $null
+        $statusDesc = $null
+        $errBody    = $null
+
+        $respErr = $ex.Response
+        if ($respErr) {
+            try {
+                if ($respErr.StatusCode)        { $status     = [int]$respErr.StatusCode }
+                if ($respErr.StatusDescription) { $statusDesc = $respErr.StatusDescription }
+            } catch {}
+
+            try {
+                if ($respErr.GetResponseStream) {
+                    $rs = $respErr.GetResponseStream()
+                    $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
+                    $errBody = $sr.ReadToEnd(); $sr.Close()
+                }
+            } catch {}
         }
-        throw ($_.Exception.Message)
+
+        # PS 5.x-safe "coalescing"
+        $statusText = if ($null -ne $status) { [string]$status } else { "?" }
+        $descText   = if ($null -ne $statusDesc) { [string]$statusDesc } else { "" }
+
+        if ($null -ne $status -or $null -ne $statusDesc) {
+            LogLine ("❌ POST failed :: HTTP {0} {1}" -f $statusText, $descText)
+        }
+        if ($errBody) {
+            $trimmed = $errBody.Substring(0, [Math]::Min(2000, $errBody.Length))
+            LogLine ("❌ Server error body (first 2000 chars): {0}" -f $trimmed)
+
+            $errFile = Join-Path $env:TEMP ("BES_Post_Error_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
+            try {
+                [System.IO.File]::WriteAllText($errFile, $errBody, [Text.Encoding]::UTF8)
+                LogLine ("Saved full error to: {0}" -f $errFile)
+            } catch {}
+        } else {
+            LogLine ("❌ POST failed :: {0}" -f ($ex.GetBaseException().Message))
+        }
+
+        # Throw concise message upstream
+        $short = if ($errBody) { $errBody.Substring(0, [Math]::Min(300, $errBody.Length)) } else { "" }
+        throw ("Invoke-WebRequest POST failed :: HTTP {0} {1} :: {2}" -f $statusText, $descText, $short)
     }
 }
 
@@ -261,10 +304,9 @@ function Extract-AllRelevanceFromXmlString {
         $x = [xml]$XmlString
         $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
         if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        if ($all.Count -eq 0) {
-            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
-            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        }
+        if ($all.Count -gt 0) { return ,$all }
+        $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
+        if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
     } catch {}
     if ($AggressiveRegexFallback -and $all.Count -eq 0) {
         $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
@@ -405,9 +447,7 @@ function Build-OfferXml {
       <RetryCount>$($OfferDefaults.RetryCount)</RetryCount>
       <RetryWait Behavior="WaitForInterval">$($OfferDefaults.RetryWaitISO)</RetryWait>
 
-      <!-- Defaults -->
-      <ActiveUserRequirement>$($OfferDefaults.ActiveUserReq)</ActiveUserRequirement>
-      <ActiveUserType>$($OfferDefaults.ActiveUserType)</ActiveUserType>
+      <!-- Other defaults (schema-safe across versions) -->
       <HasWhose>false</HasWhose>
       <PreActionCacheDownload>false</PreActionCacheDownload>
       <HasTemporalDistribution>false</HasTemporalDistribution>
