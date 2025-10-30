@@ -1,6 +1,6 @@
 # =========================================================
 # BigFix Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v16 (Direct Group Membership Option)
+# Baseline: Offers-2025-09-24-v16-DirectGroup
 # - Default: uses "member of group <id> of site whose(name...)" as CustomRelevance
 # - Optional: can fetch group relevance XML with a hardcoded site override
 # - Keeps: LLM-normalized descriptions, schema-safe, detailed error logging, updated running messages
@@ -743,20 +743,24 @@ function Confirm-And-Post-Offers {
             $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $siteForGroup -GroupIdNumeric $groupNum
         }
 
-        # Confirm
-        $lines = @(
-            "Round: $Phase",
-            "Target Group: $groupRaw",
-            if ($UseDirectGroupMembershipRelevance) { "Target Mode: Direct membership clause" } else { "Target Mode: Fetched group relevance" },
-            "",
-            "Fixlets:",
-            " - Install: " + $titles[0],
-            " - Update : " + $titles[1],
-            " - Remove : " + $titles[2],
-            "",
-            "Create OFFER actions for these 3 fixlets?"
-        )
-        $msg = [string]::Join("`r`n",$lines)
+        # Confirm (fixed: no inline if in array literal)
+        $lines = @()
+        $lines += "Round: $Phase"
+        $lines += "Target Group: $groupRaw"
+        if ($UseDirectGroupMembershipRelevance) {
+            $lines += "Target Mode: Direct membership clause"
+        } else {
+            $lines += "Target Mode: Fetched group relevance"
+        }
+        $lines += ""
+        $lines += "Fixlets:"
+        $lines += " - Install: $($titles[0])"
+        $lines += " - Update : $($titles[1])"
+        $lines += " - Remove : $($titles[2])"
+        $lines += ""
+        $lines += "Create OFFER actions for these 3 fixlets?"
+
+        $msg = [string]::Join("`r`n", $lines)
         $dlg = [System.Windows.Forms.MessageBox]::Show(
             $form, $msg, "Confirm: Create $Phase Offers",
             [System.Windows.Forms.MessageBoxButtons]::YesNo,
