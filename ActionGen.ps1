@@ -1,12 +1,8 @@
 # =========================================================
-# BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
-# Updates (No-Drift Hardening):
-#   - Snap all absolute times to exact minute (:00 seconds, 0 ms)
-#   - Compute a single snapped postNow outside the loop
-#   - Build ISO durations from integer seconds (no rounding)
-# Targeting:
-#   - Direct membership: (member of group <id> of sites)
-# Everything else preserved from locked baseline.
+# BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog (ABSOLUTE TIME FIX)
+# Change: Use absolute local timestamps to eliminate seconds drift:
+#   <StartDateTimeLocal>, <EndDateTimeLocal>, <DeadlineDateTimeLocal>
+# Targeting: (member of group <id> of sites)
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -38,9 +34,9 @@ $FixletActionNameMap = @{
 }
 
 # Targeting mode
-$UseDirectGroupMembershipRelevance = $true      # default ON
-$UseSitesPlural = $true                         # true => (member of group <id> of sites), false => specific site
-$GroupSiteNameForSpecificMode = $CustomSiteName # only used if $UseSitesPlural = $false
+$UseDirectGroupMembershipRelevance = $true
+$UseSitesPlural = $true                         # true => (member of group <id> of sites)
+$GroupSiteNameForSpecificMode = $CustomSiteName # only if $UseSitesPlural = $false
 
 # Behavior toggles
 $IgnoreCertErrors           = $true
@@ -86,37 +82,16 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-
-# Snap a DateTime to exact minute (seconds=0, ms=0)
+# Snap to exact minute (:00 seconds)
 function Snap-ToExactMinute([datetime]$dt) {
     $d = $dt
     if ($d.Second -ne 0) { $d = $d.AddSeconds(-$d.Second) }
     if ($d.Millisecond -ne 0) { $d = $d.AddMilliseconds(-$d.Millisecond) }
     return $d
 }
-
-# Build ISO-8601 duration string from integer total seconds (always includes seconds)
-function Build-IsoFromSeconds([int]$totalSec) {
-    if ($totalSec -lt 0) { $totalSec = 0 }
-    $days  = [int]([Math]::Floor($totalSec / 86400))
-    $rem   = $totalSec - ($days * 86400)
-    $hours = [int]([Math]::Floor($rem / 3600))
-    $rem   = $rem - ($hours * 3600)
-    $mins  = [int]([Math]::Floor($rem / 60))
-    $secs  = [int]($rem - ($mins * 60))
-
-    $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
-    $tParts = @()
-    if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
-    if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
-    $tParts += ("{0}S" -f $secs)  # always explicit seconds
-    return $dPart + "T" + ($tParts -join "")
-}
-
-function Write-Utf8NoBom([string]$Path,[string]$Content) {
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    if ($null -eq $Content) { $Content = "" }
-    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+function IsoLocal([datetime]$dt) {
+    # Absolute local time with explicit :00 seconds
+    return (Snap-ToExactMinute $dt).ToString("yyyy-MM-dd'T'HH:mm:ss")
 }
 function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
     $delta = ([int]$weekday - [int]$base.DayOfWeek + 7) % 7
@@ -126,6 +101,11 @@ function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
 function SafeEscape([string]$s) {
     if ($null -eq $s) { return "" }
     [System.Security.SecurityElement]::Escape($s)
+}
+function Write-Utf8NoBom([string]$Path,[string]$Content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    if ($null -eq $Content) { $Content = "" }
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
 
 # =========================
@@ -199,81 +179,6 @@ function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# (Legacy fetch kept for optional fallback)
-function Extract-AllRelevanceFromXmlString {
-    param([string]$XmlString,[string]$Context = "Unknown")
-    $all = @()
-    try {
-        $x = [xml]$XmlString
-        $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
-        if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        if ($all.Count -eq 0) {
-            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
-            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        }
-    } catch { LogLine "[$Context] XML parse failed: $($_.Exception.Message)" }
-    if ($AggressiveRegexFallback -and $all.Count -eq 0) {
-        try {
-            $regex = [regex]'(?is)<Relevance\b[^>]*>(.*?)</Relevance>'
-            foreach ($mm in $regex.Matches($XmlString)) { $t = ($mm.Groups[1].Value).Trim(); if ($t) { $all += $t } }
-        } catch { LogLine "[$Context] Regex relevance fallback failed: $($_.Exception.Message)" }
-    }
-    return ,$all
-}
-function Extract-SCRFragments {
-    param([string]$XmlString,[string]$Context="Unknown")
-    $frags = @()
-    try {
-        $x = [xml]$XmlString
-        $scrNodes = $x.SelectNodes("//*[local-name()='SearchComponentRelevance']")
-        if ($scrNodes) {
-            foreach ($n in $scrNodes) {
-                $innerR = $n.SelectNodes(".//*[local-name()='Relevance']")
-                if ($innerR -and $innerR.Count -gt 0) {
-                    foreach ($ir in $innerR) { $t = ($ir.InnerText).Trim(); if ($t) { $frags += $t } }
-                } else {
-                    $t = ($n.InnerText).Trim(); if ($t) { $frags += $t }
-                }
-            }
-        }
-    } catch { LogLine "[$Context] SCR parse failed: $($_.Exception.Message)" }
-    return ,$frags
-}
-function Get-GroupClientRelevance {
-    param([string]$BaseUrl,[string]$AuthHeader,[string]$SiteName,[string]$GroupIdNumeric)
-    $encSite = Encode-SiteName $SiteName
-    $candidates = @(
-        "/api/computergroup/custom/$encSite/$GroupIdNumeric",
-        "/api/computergroup/master/$GroupIdNumeric",
-        "/api/computergroup/operator/$($env:USERNAME)/$GroupIdNumeric"
-    )
-    foreach ($relPath in $candidates) {
-        $url = Join-ApiUrl -BaseUrl $BaseUrl -RelativePath $relPath
-        try {
-            $xmlStr = HttpGetXml -Url $url -AuthHeader $AuthHeader
-            if ($DumpFetchedXmlToTemp) {
-                $tmp = Join-Path $env:TEMP ("BES_ComputerGroup_{0}.xml" -f $GroupIdNumeric)
-                Write-Utf8NoBom -Path $tmp -Content $xmlStr
-                LogLine "Saved fetched group XML to: $tmp"
-            }
-            $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
-            if ($rels.Count -gt 0) {
-                $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
-                return $joined
-            }
-            $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
-            if ($frags.Count -gt 0) {
-                $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
-                return $joined
-            }
-            LogLine "No usable relevance at ${url}"
-        } catch {
-            LogLine ("❌ Group relevance fetch failed ({0}): {1}" -f $GroupIdNumeric, $_.Exception.Message)
-        }
-    }
-    throw "No relevance found or derivable for group ${GroupIdNumeric}."
-}
-
 # Direct membership relevance
 function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeric,[bool]$UseSitesPluralLocal = $UseSitesPlural) {
     if ($UseSitesPluralLocal) {
@@ -285,7 +190,7 @@ function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeri
 }
 
 # =========================
-# ACTION XML BUILDER
+# ACTION XML BUILDER (ABSOLUTE TIME)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -296,16 +201,16 @@ function Build-SourcedFixletActionXml {
         [string]$FixletId,
         [string]$FixletActionName,
         [string]$GroupRelevance,
-        [string]$StartOffset,            # PT…
-        [string]$HasEndText,             # "true"/"false"
-        [string]$EndOffset,              # PT… or empty
-        [string]$HasTimeRangeText,       # "true"/"false"
-        [string]$TRStartStr,             # "HH:mm:ss" or ""
-        [string]$TREndStr,               # "HH:mm:ss" or ""
-        [string]$ShowPreActionUIText,    # "true"/"false"
+        [string]$StartLocal,            # yyyy-MM-ddTHH:mm:ss
+        [string]$HasEndText,            # "true"/"false"
+        [string]$EndLocal,              # yyyy-MM-ddTHH:mm:ss or ""
+        [string]$HasTimeRangeText,      # "true"/"false"
+        [string]$TRStartStr,            # "HH:mm:ss" or ""
+        [string]$TREndStr,              # "HH:mm:ss" or ""
+        [string]$ShowPreActionUIText,   # "true"/"false"
         [string]$PreActionText,
-        [string]$AskToSaveWorkText,      # "true"/"false"
-        [string]$DeadlineOffset          # PT… or empty (Force only)
+        [string]$AskToSaveWorkText,     # "true"/"false"
+        [string]$DeadlineLocal          # yyyy-MM-ddTHH:mm:ss or "" (Force only)
     )
 
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
@@ -332,36 +237,20 @@ $trEndLine
     }
 
     $deadlineInner = ""
-    if ($DeadlineOffset) {
+    if ($DeadlineLocal) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
-        <DeadlineLocalOffset>$DeadlineOffset</DeadlineLocalOffset>
-"@
-    }
-
-    $preActionBlock = ""
-    if ($ShowPreActionUIText -ieq "true") {
-$preActionBlock = @"
-      <PreActionShowUI>true</PreActionShowUI>
-      <PreAction>
-        <Text>$preTextEsc</Text>
-        <AskToSaveWork>$AskToSaveWorkText</AskToSaveWork>
-        <ShowActionButton>false</ShowActionButton>
-        <ShowCancelButton>false</ShowCancelButton>
-$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
-      </PreAction>
-"@
-    } else {
-$preActionBlock = @"
-      <PreActionShowUI>false</PreActionShowUI>
+        <DeadlineDateTimeLocal>$DeadlineLocal</DeadlineDateTimeLocal>
 "@
     }
 
     $endLine = ""
-    if ($HasEndText -ieq "true" -and $EndOffset) {
-        $endLine = "      <EndDateTimeLocalOffset>$EndOffset</EndDateTimeLocalOffset>`n"
+    if ($HasEndText -ieq "true" -and $EndLocal) {
+        $endLine = "      <EndDateTimeLocal>$EndLocal</EndDateTimeLocal>`n"
     }
+
+    $startLine = "      <StartDateTimeLocal>$StartLocal</StartDateTimeLocal>"
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -377,17 +266,26 @@ $preActionBlock = @"
     </Target>
     <Settings>
       <ActionUITitle>$uiTitleMessage</ActionUITitle>
-$preActionBlock      <HasRunningMessage>true</HasRunningMessage>
+      <PreActionShowUI>$ShowPreActionUIText</PreActionShowUI>
+      $(if ($ShowPreActionUIText -ieq "true") { @"
+      <PreAction>
+        <Text>$preTextEsc</Text>
+        <AskToSaveWork>$AskToSaveWorkText</AskToSaveWork>
+        <ShowActionButton>false</ShowActionButton>
+        <ShowCancelButton>false</ShowCancelButton>
+$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
+      </PreAction>
+"@ } else { "" })
+      <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
       <HasTimeRange>$HasTimeRangeText</HasTimeRange>
 $timeRangeBlock      <HasStartTime>true</HasStartTime>
-      <StartDateTimeLocalOffset>$StartOffset</StartDateTimeLocalOffset>
+$startLine
       <HasEndTime>$HasEndText</HasEndTime>
 $endLine      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
       <HasWhose>false</HasWhose>
-      <PreActionCacheDownload>false</PreActionCacheDownload>
       <Reapply>true</Reapply>
       <HasReapplyLimit>false</HasReapplyLimit>
       <HasReapplyInterval>false</HasReapplyInterval>
@@ -531,7 +429,7 @@ $btn.Add_Click({
         LogLine "Parsed title (console): $titleRaw"
         LogLine "Display name (messages): $displayName"
 
-        # ---- Absolute desired times, snapped to exact minute ----
+        # ---- Absolute desired times, snapped to exact minute (:00) ----
         $PilotStart = Snap-ToExactMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",[System.Globalization.CultureInfo]::InvariantCulture))
         $DeployStart = Snap-ToExactMinute($PilotStart.AddDays(1))
         $ConfStart   = Snap-ToExactMinute($PilotStart.AddDays(1))
@@ -568,12 +466,6 @@ $btn.Add_Click({
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
         LogLine "POST URL: ${postUrl}"
 
-        # ==== NO-DRIFT: compute a single snapped postNow once ====
-        $postNow = Get-Date
-        if ($postNow.Millisecond -ne 0) { $postNow = $postNow.AddMilliseconds(-$postNow.Millisecond) }
-        $ticksOver = $postNow.Ticks % [TimeSpan]::TicksPerSecond
-        if ($ticksOver -ne 0) { $postNow = $postNow.AddTicks(-$ticksOver) }
-
         foreach ($cfg in $actions) {
             $a = $cfg.Name
             LogLine "---- Building: $a ----"
@@ -584,33 +476,18 @@ $btn.Add_Click({
             if (-not $groupIdNumeric) { LogLine ("❌ Could not parse numeric ID from '{0}' for {1}" -f $groupIdRaw, $a); continue }
 
             # === Targeting ===
-            $groupRel = $null
-            if ($UseDirectGroupMembershipRelevance) {
+            $groupRel = if ($UseDirectGroupMembershipRelevance) {
                 $siteForSpecific = if ([string]::IsNullOrWhiteSpace($GroupSiteNameForSpecificMode)) { $CustomSiteName } else { $GroupSiteNameForSpecificMode }
-                $groupRel = Build-GroupMembershipRelevance -SiteName $siteForSpecific -GroupIdNumeric $groupIdNumeric -UseSitesPluralLocal:$UseSitesPlural
-                LogLine ("Using direct membership relevance: {0}" -f $groupRel)
+                Build-GroupMembershipRelevance -SiteName $siteForSpecific -GroupIdNumeric $groupIdNumeric -UseSitesPluralLocal:$UseSitesPlural
             } else {
-                try {
-                    LogLine "Fetching group relevance for $a (group $groupIdNumeric)"
-                    $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
-                    $grLen = 0; if ($groupRel) { $grLen = $groupRel.Length }
-                    LogLine ("Fetched group relevance len ({0}): {1}" -f $a, $grLen)
-                } catch {
-                    LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
-                    continue
-                }
+                throw "Direct membership relevance is required by current baseline."
             }
+            LogLine ("Using direct membership relevance: {0}" -f $groupRel)
 
-            $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
-
-            # ==== NO-DRIFT OFFSETS: integer seconds from single postNow ====
-            $deltaStartSec    = [int][Math]::Max(0, [Math]::Floor(($cfg.AbsStart - $postNow).TotalSeconds))
-            $deltaEndSec      = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { [int][Math]::Max(0, [Math]::Floor(($cfg.AbsEnd - $postNow).TotalSeconds)) } else { $null }
-            $deltaDeadlineSec = if ($cfg.AbsDeadline) { [int][Math]::Max(0, [Math]::Floor(($cfg.AbsDeadline - $postNow).TotalSeconds)) } else { $null }
-
-            $startOff    = Build-IsoFromSeconds $deltaStartSec
-            $endOff      = if ($deltaEndSec -ne $null) { Build-IsoFromSeconds $deltaEndSec } else { "" }
-            $deadlineOff = if ($deltaDeadlineSec -ne $null) { Build-IsoFromSeconds $deltaDeadlineSec } else { "" }
+            # ==== ABSOLUTE TIME STRINGS ====
+            $startLocal    = IsoLocal $cfg.AbsStart
+            $endLocal      = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { IsoLocal $cfg.AbsEnd } else { "" }
+            $deadlineLocal = if ($cfg.AbsDeadline) { IsoLocal $cfg.AbsDeadline } else { "" }
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
@@ -618,25 +495,23 @@ $btn.Add_Click({
                 -DisplayName          $displayName `
                 -SiteName             $CustomSiteName `
                 -FixletId             $fixId `
-                -FixletActionName     $fixletActionName `
+                -FixletActionName     $FixletActionNameMap[$a] `
                 -GroupRelevance       $groupRel `
-                -StartOffset          $startOff `
+                -StartLocal           $startLocal `
                 -HasEndText           $cfg.HasEnd `
-                -EndOffset            $endOff `
+                -EndLocal             $endLocal `
                 -HasTimeRangeText     $cfg.HasTR `
                 -TRStartStr           $cfg.TRS `
                 -TREndStr             $cfg.TRE `
                 -ShowPreActionUIText  $cfg.ShowUI `
                 -PreActionText        $cfg.Msg `
                 -AskToSaveWorkText    $cfg.SaveAsk `
-                -DeadlineOffset       $deadlineOff
-
-            $xmlBodyToSend = $xmlBody
+                -DeadlineLocal        $deadlineLocal
 
             $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
             $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
             if ($SaveActionXmlToTemp) {
-                Write-Utf8NoBom -Path $tmpAction -Content $xmlBodyToSend
+                Write-Utf8NoBom -Path $tmpAction -Content $xmlBody
                 LogLine "Saved action XML for $a to: $tmpAction"
                 LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
             }
