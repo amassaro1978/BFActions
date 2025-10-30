@@ -1,7 +1,7 @@
 # =========================================================
-# BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog (ABSOLUTE TIME FIX)
-# Change: Use absolute local timestamps to eliminate seconds drift:
-#   <StartDateTimeLocal>, <EndDateTimeLocal>, <DeadlineDateTimeLocal>
+# BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
+# Patch: Force deadline back to <DeadlineLocalOffset>PT24H</DeadlineLocalOffset>
+#        while keeping absolute local timestamps for start/end to prevent drift.
 # Targeting: (member of group <id> of sites)
 # =========================================================
 
@@ -41,7 +41,6 @@ $GroupSiteNameForSpecificMode = $CustomSiteName # only if $UseSitesPlural = $fal
 # Behavior toggles
 $IgnoreCertErrors           = $true
 $DumpFetchedXmlToTemp       = $true
-$AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
 $PostUsingInvokeWebRequest  = $true
 
@@ -140,6 +139,7 @@ function HttpGetXml {
 
 function Post-XmlFile-InFile {
     param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
+
     try {
         $pair  = "$User`:$Pass"
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
@@ -157,9 +157,10 @@ function Post-XmlFile-InFile {
             $rs = $respErr.GetResponseStream()
             $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
             $errBody = $sr.ReadToEnd(); $sr.Close()
-            LogLine ("❌ Server error body (first 2000 chars): {0}" -f ($errBody.Substring(0,[Math]::Min(2000,$errBody.Length))))
             $errFile = Join-Path $env:TEMP ("BES_Post_Error_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
-            try { [System.IO.File]::WriteAllText($errFile, $errBody, [Text.Encoding]::UTF8); LogLine ("Saved full error to: $errFile") } catch {}
+            try { [System.IO.File]::WriteAllText($errFile, $errBody, [Text.Encoding]::UTF8) } catch {}
+            LogLine ("❌ Server Error body (first 2000 chars): {0}" -f ($errBody.Substring(0,[Math]::Min(2000,$errBody.Length))))
+            LogLine ("Saved full error to: {0}" -f $errFile)
             throw "Invoke-WebRequest POST failed :: $errBody"
         }
         throw ($_.Exception.Message)
@@ -190,7 +191,7 @@ function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeri
 }
 
 # =========================
-# ACTION XML BUILDER (ABSOLUTE TIME)
+# ACTION XML BUILDER (ABSOLUTE START/END; FLEXIBLE DEADLINE)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -210,7 +211,8 @@ function Build-SourcedFixletActionXml {
         [string]$ShowPreActionUIText,   # "true"/"false"
         [string]$PreActionText,
         [string]$AskToSaveWorkText,     # "true"/"false"
-        [string]$DeadlineLocal          # yyyy-MM-ddTHH:mm:ss or "" (Force only)
+        [string]$DeadlineLocal,         # yyyy-MM-ddTHH:mm:ss or ""
+        [string]$DeadlineOffset         # PT24H (Force only) or ""
     )
 
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
@@ -242,6 +244,12 @@ $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
         <DeadlineDateTimeLocal>$DeadlineLocal</DeadlineDateTimeLocal>
+"@
+    } elseif ($DeadlineOffset) {
+$deadlineInner = @"
+        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
+        <DeadlineType>Absolute</DeadlineType>
+        <DeadlineLocalOffset>$DeadlineOffset</DeadlineLocalOffset>
 "@
     }
 
@@ -434,7 +442,7 @@ $btn.Add_Click({
         $DeployStart = Snap-ToExactMinute($PilotStart.AddDays(1))
         $ConfStart   = Snap-ToExactMinute($PilotStart.AddDays(1))
 
-        # Run window start 22:00 for Pilot/Deploy/Conf (baseline)
+        # Run window 22:00–06:59 for Pilot/Deploy/Conf
         $TRStartStr   = "22:00:00"
         $TREndStr     = "06:59:00"
 
@@ -446,21 +454,25 @@ $btn.Add_Click({
         if ($nextTueAfterPilot -le $PilotStart) { $nextTueAfterPilot = $nextTueAfterPilot.AddDays(7) }
         $DeployEnd  = Snap-ToExactMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
 
-        # Force starts next Tuesday 07:00 AM (no TimeRange); deadline next day 07:00
+        # Force starts next Tuesday 07:00 AM (no TimeRange)
         $ForceStart    = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))
-        $ForceDeadline = Snap-ToExactMinute($ForceStart.AddDays(1))
+        # We still compute a friendly absolute time for the user-facing message:
+        $ForceDeadlineAbsForMsg = Snap-ToExactMinute($ForceStart.AddDays(1))
+        # But for posting, use offset form to satisfy prod schema:
+        $ForceDeadlineOffset = "PT24H"
+
         # 1-year end times for Conference & Force
         $ConfEnd    = Snap-ToExactMinute($ConfStart.AddYears(1))
         $ForceEnd   = Snap-ToExactMinute($ForceStart.AddYears(1))
 
         $actions = @(
-            @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
-            @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
-            @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
+            @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineLocal="";  DeadlineOffset=""      },
+            @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineLocal="";  DeadlineOffset=""      },
+            @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineLocal="";  DeadlineOffset="" },
             @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
-                    $displayName, $ForceDeadline.ToString("M/d/yyyy h:mm tt"));
-               SaveAsk="true"; AbsDeadline=$ForceDeadline }
+                    $displayName, $ForceDeadlineAbsForMsg.ToString("M/d/yyyy h:mm tt"));
+               SaveAsk="true"; DeadlineLocal=""; DeadlineOffset=$ForceDeadlineOffset }
         )
 
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
@@ -487,7 +499,9 @@ $btn.Add_Click({
             # ==== ABSOLUTE TIME STRINGS ====
             $startLocal    = IsoLocal $cfg.AbsStart
             $endLocal      = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { IsoLocal $cfg.AbsEnd } else { "" }
-            $deadlineLocal = if ($cfg.AbsDeadline) { IsoLocal $cfg.AbsDeadline } else { "" }
+
+            $deadlineLocal = $cfg.DeadlineLocal     # empty for Force now
+            $deadlineOff   = $cfg.DeadlineOffset    # PT24H for Force, empty otherwise
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
@@ -506,7 +520,8 @@ $btn.Add_Click({
                 -ShowPreActionUIText  $cfg.ShowUI `
                 -PreActionText        $cfg.Msg `
                 -AskToSaveWorkText    $cfg.SaveAsk `
-                -DeadlineLocal        $deadlineLocal
+                -DeadlineLocal        $deadlineLocal `
+                -DeadlineOffset       $deadlineOff
 
             $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
             $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
