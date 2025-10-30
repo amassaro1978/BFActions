@@ -1,7 +1,7 @@
 # =========================================================
 # BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
-# Patch: Force deadline back to <DeadlineLocalOffset>PT24H</DeadlineLocalOffset>
-#        while keeping absolute local timestamps for start/end to prevent drift.
+# Force timing: Next Tuesday 07:00 after selected Wednesday; deadline = ForceStart + 24h
+# Starts/Ends absolute local (:00 seconds) — no drift
 # Targeting: (member of group <id> of sites)
 # =========================================================
 
@@ -106,6 +106,22 @@ function Write-Utf8NoBom([string]$Path,[string]$Content) {
     if ($null -eq $Content) { $Content = "" }
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
+# Build ISO-8601 duration rounded to nearest second (no drift)
+function To-IsoDurationRounded([TimeSpan]$ts) {
+    $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
+    if ($totalSec -lt 60) { $totalSec = 60 } # floor at 60s to avoid already-expired deadlines
+    $days  = [int]([Math]::Floor($totalSec / 86400))
+    $rem   = $totalSec - ($days * 86400)
+    $hours = [int]([Math]::Floor($rem / 3600)); $rem -= ($hours * 3600)
+    $mins  = [int]([Math]::Floor($rem / 60));   $rem -= ($mins * 60)
+    $secs  = [int]$rem
+    $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
+    $tParts = @()
+    if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
+    if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
+    if ($secs  -gt 0 -or $tParts.Count -eq 0) { $tParts += ("{0}S" -f $secs) }
+    return $dPart + "T" + ($tParts -join "")
+}
 
 # =========================
 # HTTP
@@ -139,7 +155,6 @@ function HttpGetXml {
 
 function Post-XmlFile-InFile {
     param([string]$Url,[string]$User,[string]$Pass,[string]$XmlFilePath)
-
     try {
         $pair  = "$User`:$Pass"
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
@@ -191,7 +206,7 @@ function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeri
 }
 
 # =========================
-# ACTION XML BUILDER (ABSOLUTE START/END; FLEXIBLE DEADLINE)
+# ACTION XML BUILDER (ABSOLUTE START/END; OFFSET DEADLINE OPTION)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -212,7 +227,7 @@ function Build-SourcedFixletActionXml {
         [string]$PreActionText,
         [string]$AskToSaveWorkText,     # "true"/"false"
         [string]$DeadlineLocal,         # yyyy-MM-ddTHH:mm:ss or ""
-        [string]$DeadlineOffset         # PT24H (Force only) or ""
+        [string]$DeadlineOffset         # PT… or ""
     )
 
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
@@ -438,7 +453,7 @@ $btn.Add_Click({
         LogLine "Display name (messages): $displayName"
 
         # ---- Absolute desired times, snapped to exact minute (:00) ----
-        $PilotStart = Snap-ToExactMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",[System.Globalization.CultureInfo]::InvariantCulture))
+        $PilotStart  = Snap-ToExactMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",[System.Globalization.CultureInfo]::InvariantCulture))
         $DeployStart = Snap-ToExactMinute($PilotStart.AddDays(1))
         $ConfStart   = Snap-ToExactMinute($PilotStart.AddDays(1))
 
@@ -447,23 +462,26 @@ $btn.Add_Click({
         $TREndStr     = "06:59:00"
 
         # Pilot ends next morning 06:59
-        $PilotEnd   = Snap-ToExactMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
+        $PilotEnd = Snap-ToExactMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
 
         # Deploy ends the following Tuesday at 06:55 AM (relative to anchor Wed)
         $nextTueAfterPilot = Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)
         if ($nextTueAfterPilot -le $PilotStart) { $nextTueAfterPilot = $nextTueAfterPilot.AddDays(7) }
-        $DeployEnd  = Snap-ToExactMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
+        $DeployEnd = Snap-ToExactMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
 
-        # Force starts next Tuesday 07:00 AM (no TimeRange)
-        $ForceStart    = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))
-        # We still compute a friendly absolute time for the user-facing message:
-        $ForceDeadlineAbsForMsg = Snap-ToExactMinute($ForceStart.AddDays(1))
-        # But for posting, use offset form to satisfy prod schema:
-        $ForceDeadlineOffset = "PT24H"
+        # -------- FORCE: Next Tuesday 07:00 AFTER the selected Wednesday ----------
+        $ForceStart = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))  # Tue 07:00 after anchor Wed
+        # Desired absolute deadline = ForceStart + 24h (i.e., Wed 07:00)
+        $ForceDeadlineAbs = Snap-ToExactMinute($ForceStart.AddDays(1))
+
+        # Compute DeadlineLocalOffset relative to when we post (prod schema-safe)
+        $postNow = Get-Date
+        $forceDeadlineOffsetTS = $ForceDeadlineAbs - $postNow
+        $ForceDeadlineOffset = To-IsoDurationRounded $forceDeadlineOffsetTS
 
         # 1-year end times for Conference & Force
-        $ConfEnd    = Snap-ToExactMinute($ConfStart.AddYears(1))
-        $ForceEnd   = Snap-ToExactMinute($ForceStart.AddYears(1))
+        $ConfEnd  = Snap-ToExactMinute($ConfStart.AddYears(1))
+        $ForceEnd = Snap-ToExactMinute($ForceStart.AddYears(1))
 
         $actions = @(
             @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineLocal="";  DeadlineOffset=""      },
@@ -471,7 +489,7 @@ $btn.Add_Click({
             @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineLocal="";  DeadlineOffset="" },
             @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
-                    $displayName, $ForceDeadlineAbsForMsg.ToString("M/d/yyyy h:mm tt"));
+                    $displayName, $ForceDeadlineAbs.ToString("M/d/yyyy h:mm tt"));
                SaveAsk="true"; DeadlineLocal=""; DeadlineOffset=$ForceDeadlineOffset }
         )
 
@@ -500,8 +518,8 @@ $btn.Add_Click({
             $startLocal    = IsoLocal $cfg.AbsStart
             $endLocal      = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { IsoLocal $cfg.AbsEnd } else { "" }
 
-            $deadlineLocal = $cfg.DeadlineLocal     # empty for Force now
-            $deadlineOff   = $cfg.DeadlineOffset    # PT24H for Force, empty otherwise
+            $deadlineLocal = $cfg.DeadlineLocal
+            $deadlineOff   = $cfg.DeadlineOffset
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
