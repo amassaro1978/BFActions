@@ -1,8 +1,11 @@
 # =========================================================
 # BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
-# Updates:
-#   - Targeting: direct membership clause (member of group <id> of sites)
-#   - Timing: no-seconds-drift via floor + second-snapped postNow
+# Updates (No-Drift Hardening):
+#   - Snap all absolute times to exact minute (:00 seconds, 0 ms)
+#   - Compute a single snapped postNow outside the loop
+#   - Build ISO durations from integer seconds (no rounding)
+# Targeting:
+#   - Direct membership: (member of group <id> of sites)
 # Everything else preserved from locked baseline.
 # =========================================================
 
@@ -34,8 +37,7 @@ $FixletActionNameMap = @{
     "Conference/Training Rooms" = "Action1"
 }
 
-# --- Targeting mode ---
-# Use direct membership clause rather than fetching group relevance
+# Targeting mode
 $UseDirectGroupMembershipRelevance = $true      # default ON
 $UseSitesPlural = $true                         # true => (member of group <id> of sites), false => specific site
 $GroupSiteNameForSpecificMode = $CustomSiteName # only used if $UseSitesPlural = $false
@@ -84,15 +86,18 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-# Round to exact minute (zero seconds/ms)
-function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
 
-# === NO-DRIFT OFFSET BUILDER (Floor + :00s) ===
-function To-IsoDurationFloor([TimeSpan]$ts) {
-    if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
-    $totalSec = [Math]::Floor($ts.TotalSeconds)    # never +1s
+# Snap a DateTime to exact minute (seconds=0, ms=0)
+function Snap-ToExactMinute([datetime]$dt) {
+    $d = $dt
+    if ($d.Second -ne 0) { $d = $d.AddSeconds(-$d.Second) }
+    if ($d.Millisecond -ne 0) { $d = $d.AddMilliseconds(-$d.Millisecond) }
+    return $d
+}
+
+# Build ISO-8601 duration string from integer total seconds (always includes seconds)
+function Build-IsoFromSeconds([int]$totalSec) {
     if ($totalSec -lt 0) { $totalSec = 0 }
-
     $days  = [int]([Math]::Floor($totalSec / 86400))
     $rem   = $totalSec - ($days * 86400)
     $hours = [int]([Math]::Floor($rem / 3600))
@@ -104,10 +109,10 @@ function To-IsoDurationFloor([TimeSpan]$ts) {
     $tParts = @()
     if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
     if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
-    # always include seconds
-    $tParts += ("{0}S" -f $secs)
+    $tParts += ("{0}S" -f $secs)  # always explicit seconds
     return $dPart + "T" + ($tParts -join "")
 }
+
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     if ($null -eq $Content) { $Content = "" }
@@ -194,7 +199,7 @@ function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
 
-# (Legacy) fetch group XML relevance — kept for optional fallback
+# (Legacy fetch kept for optional fallback)
 function Extract-AllRelevanceFromXmlString {
     param([string]$XmlString,[string]$Context = "Unknown")
     $all = @()
@@ -454,7 +459,7 @@ $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# NOTE: Timeslot selector is dormant per baseline; default is 11:00 PM
+# Timeslot selector dormant; default is 11:00 PM
 $DefaultAnchorTime = "11:00 PM"
 
 # Button
@@ -526,30 +531,29 @@ $btn.Add_Click({
         LogLine "Parsed title (console): $titleRaw"
         LogLine "Display name (messages): $displayName"
 
-        # ---- Absolute desired times (seconds = 0) ----
-        $PilotStart   = Round-ToMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null))
-        $DeployStart  = Round-ToMinute($PilotStart.AddDays(1))
-        $ConfStart    = Round-ToMinute($PilotStart.AddDays(1))
+        # ---- Absolute desired times, snapped to exact minute ----
+        $PilotStart = Snap-ToExactMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",[System.Globalization.CultureInfo]::InvariantCulture))
+        $DeployStart = Snap-ToExactMinute($PilotStart.AddDays(1))
+        $ConfStart   = Snap-ToExactMinute($PilotStart.AddDays(1))
 
         # Run window start 22:00 for Pilot/Deploy/Conf (baseline)
         $TRStartStr   = "22:00:00"
         $TREndStr     = "06:59:00"
 
         # Pilot ends next morning 06:59
-        $PilotEnd     = Round-ToMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
+        $PilotEnd   = Snap-ToExactMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
 
         # Deploy ends the following Tuesday at 06:55 AM (relative to anchor Wed)
         $nextTueAfterPilot = Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)
         if ($nextTueAfterPilot -le $PilotStart) { $nextTueAfterPilot = $nextTueAfterPilot.AddDays(7) }
-        $DeployEnd    = Round-ToMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
+        $DeployEnd  = Snap-ToExactMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
 
-        # Force starts next Tuesday 07:00 AM (no TimeRange) — timeslot cascade not used (dormant)
-        $ForceStart   = Round-ToMinute($nextTueAfterPilot.AddHours(7))
-        $ForceDeadline= Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM (deadline)
-
+        # Force starts next Tuesday 07:00 AM (no TimeRange); deadline next day 07:00
+        $ForceStart    = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))
+        $ForceDeadline = Snap-ToExactMinute($ForceStart.AddDays(1))
         # 1-year end times for Conference & Force
-        $ConfEnd      = Round-ToMinute($ConfStart.AddYears(1))
-        $ForceEnd     = Round-ToMinute($ForceStart.AddYears(1))
+        $ConfEnd    = Snap-ToExactMinute($ConfStart.AddYears(1))
+        $ForceEnd   = Snap-ToExactMinute($ForceStart.AddYears(1))
 
         $actions = @(
             @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
@@ -563,6 +567,12 @@ $btn.Add_Click({
 
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
         LogLine "POST URL: ${postUrl}"
+
+        # ==== NO-DRIFT: compute a single snapped postNow once ====
+        $postNow = Get-Date
+        if ($postNow.Millisecond -ne 0) { $postNow = $postNow.AddMilliseconds(-$postNow.Millisecond) }
+        $ticksOver = $postNow.Ticks % [TimeSpan]::TicksPerSecond
+        if ($ticksOver -ne 0) { $postNow = $postNow.AddTicks(-$ticksOver) }
 
         foreach ($cfg in $actions) {
             $a = $cfg.Name
@@ -593,14 +603,14 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # ==== NO-DRIFT: snap postNow to :00 and floor offsets ====
-            $postNow = Get-Date
-            $postNow = $postNow.AddMilliseconds(-$postNow.Millisecond)
-            $postNow = $postNow.AddTicks(-($postNow.Ticks % [TimeSpan]::TicksPerSecond))
+            # ==== NO-DRIFT OFFSETS: integer seconds from single postNow ====
+            $deltaStartSec    = [int][Math]::Max(0, [Math]::Floor(($cfg.AbsStart - $postNow).TotalSeconds))
+            $deltaEndSec      = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { [int][Math]::Max(0, [Math]::Floor(($cfg.AbsEnd - $postNow).TotalSeconds)) } else { $null }
+            $deltaDeadlineSec = if ($cfg.AbsDeadline) { [int][Math]::Max(0, [Math]::Floor(($cfg.AbsDeadline - $postNow).TotalSeconds)) } else { $null }
 
-            $startOff    = To-IsoDurationFloor ($cfg.AbsStart - $postNow)
-            $endOff      = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationFloor ($cfg.AbsEnd - $postNow) } else { "" }
-            $deadlineOff = if ($cfg.AbsDeadline) { To-IsoDurationFloor ($cfg.AbsDeadline - $postNow) } else { "" }
+            $startOff    = Build-IsoFromSeconds $deltaStartSec
+            $endOff      = if ($deltaEndSec -ne $null) { Build-IsoFromSeconds $deltaEndSec } else { "" }
+            $deadlineOff = if ($deltaDeadlineSec -ne $null) { Build-IsoFromSeconds $deltaDeadlineSec } else { "" }
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
@@ -631,7 +641,7 @@ $btn.Add_Click({
                 LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
             }
 
-            # Confirmation dialog (show once before posting all)
+            # Confirmation dialog (once, on first/ Pilot)
             if ($a -eq "Pilot") {
                 $dlg = [System.Windows.Forms.MessageBox]::Show(
                     $form,
