@@ -1,9 +1,9 @@
 # =========================================================
 # BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
-# CHANGE: Targeting now defaults to direct membership relevance:
-#         (member of group <id> of sites)
-# Everything else preserved from locked baseline (no drift, confirm dialog,
-# Wednesday-only date, default 11:00 PM anchor, Deploy end next Tuesday 06:55 AM, etc.)
+# Updates:
+#   - Targeting: direct membership clause (member of group <id> of sites)
+#   - Timing: no-seconds-drift via floor + second-snapped postNow
+# Everything else preserved from locked baseline.
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -34,7 +34,7 @@ $FixletActionNameMap = @{
     "Conference/Training Rooms" = "Action1"
 }
 
-# --- Targeting mode (NEW) ---
+# --- Targeting mode ---
 # Use direct membership clause rather than fetching group relevance
 $UseDirectGroupMembershipRelevance = $true      # default ON
 $UseSitesPlural = $true                         # true => (member of group <id> of sites), false => specific site
@@ -87,22 +87,25 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
 # Round to exact minute (zero seconds/ms)
 function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
 
-# Build ISO-8601 duration — rounded to nearest second (no drift)
-function To-IsoDurationRounded([TimeSpan]$ts) {
+# === NO-DRIFT OFFSET BUILDER (Floor + :00s) ===
+function To-IsoDurationFloor([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
-    $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
+    $totalSec = [Math]::Floor($ts.TotalSeconds)    # never +1s
     if ($totalSec -lt 0) { $totalSec = 0 }
+
     $days  = [int]([Math]::Floor($totalSec / 86400))
     $rem   = $totalSec - ($days * 86400)
     $hours = [int]([Math]::Floor($rem / 3600))
     $rem   = $rem - ($hours * 3600)
     $mins  = [int]([Math]::Floor($rem / 60))
     $secs  = [int]($rem - ($mins * 60))
+
     $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
     $tParts = @()
     if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
     if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
-    if ($secs  -gt 0 -or $tParts.Count -eq 0) { $tParts += ("{0}S" -f $secs) }
+    # always include seconds
+    $tParts += ("{0}S" -f $secs)
     return $dPart + "T" + ($tParts -join "")
 }
 function Write-Utf8NoBom([string]$Path,[string]$Content) {
@@ -266,7 +269,7 @@ function Get-GroupClientRelevance {
     throw "No relevance found or derivable for group ${GroupIdNumeric}."
 }
 
-# NEW: build direct membership relevance
+# Direct membership relevance
 function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeric,[bool]$UseSitesPluralLocal = $UseSitesPlural) {
     if ($UseSitesPluralLocal) {
         return "(member of group $GroupIdNumeric of sites)"
@@ -431,7 +434,7 @@ $tbUser   = $null; Add-Field "Username:"      $false ([ref]$tbUser)
 $tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
 $tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
-# Date (future Wednesdays only) — unchanged baseline
+# Date (future Wednesdays only)
 $lblDate = New-Object Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
 $lblDate.Location = New-Object System.Drawing.Point(10,$y)
@@ -527,6 +530,7 @@ $btn.Add_Click({
         $PilotStart   = Round-ToMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null))
         $DeployStart  = Round-ToMinute($PilotStart.AddDays(1))
         $ConfStart    = Round-ToMinute($PilotStart.AddDays(1))
+
         # Run window start 22:00 for Pilot/Deploy/Conf (baseline)
         $TRStartStr   = "22:00:00"
         $TREndStr     = "06:59:00"
@@ -539,9 +543,10 @@ $btn.Add_Click({
         if ($nextTueAfterPilot -le $PilotStart) { $nextTueAfterPilot = $nextTueAfterPilot.AddDays(7) }
         $DeployEnd    = Round-ToMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
 
-        # Force starts next Tuesday 07:00 AM (no TimeRange) — per baseline, no cascade since timeslot UI dormant
+        # Force starts next Tuesday 07:00 AM (no TimeRange) — timeslot cascade not used (dormant)
         $ForceStart   = Round-ToMinute($nextTueAfterPilot.AddHours(7))
         $ForceDeadline= Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM (deadline)
+
         # 1-year end times for Conference & Force
         $ConfEnd      = Round-ToMinute($ConfStart.AddYears(1))
         $ForceEnd     = Round-ToMinute($ForceStart.AddYears(1))
@@ -568,7 +573,7 @@ $btn.Add_Click({
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
             if (-not $groupIdNumeric) { LogLine ("❌ Could not parse numeric ID from '{0}' for {1}" -f $groupIdRaw, $a); continue }
 
-            # === NEW TARGETING: Build direct membership relevance (or fallback to fetch) ===
+            # === Targeting ===
             $groupRel = $null
             if ($UseDirectGroupMembershipRelevance) {
                 $siteForSpecific = if ([string]::IsNullOrWhiteSpace($GroupSiteNameForSpecificMode)) { $CustomSiteName } else { $GroupSiteNameForSpecificMode }
@@ -588,11 +593,14 @@ $btn.Add_Click({
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Fresh offsets right before POST — with rounding to whole seconds (no drift)
+            # ==== NO-DRIFT: snap postNow to :00 and floor offsets ====
             $postNow = Get-Date
-            $startOff   = To-IsoDurationRounded ($cfg.AbsStart - $postNow)
-            $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationRounded ($cfg.AbsEnd - $postNow) } else { "" }
-            $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDurationRounded ($cfg.AbsDeadline - $postNow) } else { "" }
+            $postNow = $postNow.AddMilliseconds(-$postNow.Millisecond)
+            $postNow = $postNow.AddTicks(-($postNow.Ticks % [TimeSpan]::TicksPerSecond))
+
+            $startOff    = To-IsoDurationFloor ($cfg.AbsStart - $postNow)
+            $endOff      = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationFloor ($cfg.AbsEnd - $postNow) } else { "" }
+            $deadlineOff = if ($cfg.AbsDeadline) { To-IsoDurationFloor ($cfg.AbsDeadline - $postNow) } else { "" }
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
@@ -623,7 +631,7 @@ $btn.Add_Click({
                 LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
             }
 
-            # Confirmation dialog (baseline)
+            # Confirmation dialog (show once before posting all)
             if ($a -eq "Pilot") {
                 $dlg = [System.Windows.Forms.MessageBox]::Show(
                     $form,
