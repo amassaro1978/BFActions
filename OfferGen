@@ -1,9 +1,11 @@
 # =========================================================
 # BigFix Offer Action Generator (Install / Update / Remove)
-# Baseline: Offers-2025-09-24-v16-DirectGroup
-# - Default: uses "member of group <id> of site whose(name...)" as CustomRelevance
-# - Optional: can fetch group relevance XML with a hardcoded site override
-# - Keeps: LLM-normalized descriptions, schema-safe, detailed error logging, updated running messages
+# Baseline: Offers-2025-09-24-v17-DirectGroupSitesPlural
+# - Default targeting: (member of group <id> of sites)
+# - Optional: site-specific clause or fetched group relevance
+# - Includes: LLM-normalized descriptions, schema-safe XML,
+#             detailed error logging, updated running messages,
+#             confirmation dialog
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -24,8 +26,12 @@ $UseDirectGroupMembershipRelevance = $true
 
 # If you turn OFF the direct mode (set to $false), the tool will fetch the group's relevance XML.
 # When groups are in a DIFFERENT site than the fixlets, hardcode that site here:
-# e.g. "Production Device Groups"
 $GroupSiteNameOverride = "Production Device Groups"  # used only if $UseDirectGroupMembershipRelevance -eq $false
+
+# Site-agnostic vs site-specific membership clause
+# true  -> (member of group <id> of sites)
+# false -> (member of group <id> of site whose(name of it = "<site>"))
+$UseSitesPlural = $true
 
 # Fixlet Action name inside each Fixlet
 $FixletActionName_Default = "Action1"
@@ -387,7 +393,6 @@ function Extract-SCRFragments {
 function Get-GroupClientRelevance {
     param([string]$BaseUrl,[string]$AuthHeader,[string]$SiteName,[string]$GroupIdNumeric)
 
-    # This function now honors a hardcoded site override to support groups living in a different site.
     $encSite = Encode-SiteName $SiteName
     $candidates = @(
         "/api/computergroup/custom/$encSite/$GroupIdNumeric",
@@ -422,13 +427,20 @@ function Get-GroupClientRelevance {
     throw "No relevance found or derivable for group ${GroupIdNumeric}."
 }
 
-# NEW: Build membership clause directly (recommended in prod)
-function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeric) {
-    # Escape quotes in site name so relevance stays valid
-    $siteEsc = $SiteName.Replace('"','\"')
-    # Client Relevance:
-    #   member of group <id> of site whose (name of it = "<site name>")
-    return "(member of group $GroupIdNumeric of site whose (name of it = `"$siteEsc`"))"
+# NEW: Direct membership clause (toggleable form)
+function Build-GroupMembershipRelevance(
+    [string]$SiteName,
+    [string]$GroupIdNumeric,
+    [bool]$UseSitesPluralLocal = $UseSitesPlural
+) {
+    if ($UseSitesPluralLocal) {
+        # Site-agnostic: matches the group id in any site
+        return "(member of group $GroupIdNumeric of sites)"
+    } else {
+        # Site-specific: match only the named site
+        $siteEsc = $SiteName.Replace('"','\"')
+        return "(member of group $GroupIdNumeric of site whose (name of it = `"$siteEsc`"))"
+    }
 }
 
 # =========================
@@ -733,7 +745,7 @@ function Confirm-And-Post-Offers {
         $groupRel = $null
 
         if ($UseDirectGroupMembershipRelevance) {
-            # Use direct membership relevance (recommended)
+            # Use direct membership relevance (recommended) — site agnostic by default
             $groupRel = Build-GroupMembershipRelevance -SiteName $GroupSiteNameOverride -GroupIdNumeric $groupNum
             LogLine ("Using direct membership relevance: {0}" -f $groupRel)
         } else {
@@ -743,12 +755,16 @@ function Confirm-And-Post-Offers {
             $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $siteForGroup -GroupIdNumeric $groupNum
         }
 
-        # Confirm (fixed: no inline if in array literal)
+        # Confirm (no inline if in array literal)
         $lines = @()
         $lines += "Round: $Phase"
         $lines += "Target Group: $groupRaw"
         if ($UseDirectGroupMembershipRelevance) {
-            $lines += "Target Mode: Direct membership clause"
+            if ($UseSitesPlural) {
+                $lines += "Target Mode: Direct membership clause (of sites)"
+            } else {
+                $lines += "Target Mode: Direct membership clause (specific site)"
+            }
         } else {
             $lines += "Target Mode: Fetched group relevance"
         }
@@ -788,7 +804,7 @@ function Confirm-And-Post-Offers {
                 -FixletActionName $FixletActionName_Default `
                 -GroupRelevance $groupRel `
                 -TitleFromServer $t.Title `
-                -OfferDescriptionFromUi $OfferDescriptionFromUi
+                -OfferDescriptionFromUi $tbAppDesc.Text
 
             $safeTitle = ($t.Name -replace '[^\w\-. ]','_') -replace '\s+','_'
             $tmpAction = Join-Path $env:TEMP ("BES_Offer_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
