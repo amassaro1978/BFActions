@@ -1,13 +1,21 @@
+# =========================================================
+# BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
+# CHANGE: Targeting now defaults to direct membership relevance:
+#         (member of group <id> of sites)
+# Everything else preserved from locked baseline (no drift, confirm dialog,
+# Wednesday-only date, default 11:00 PM anchor, Deploy end next Tuesday 06:55 AM, etc.)
+# =========================================================
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Web
 
 # =========================
-# CONFIG (EDIT THESE)
+# CONFIG
 # =========================
 $LogFile = "C:\temp\BigFixActionGenerator.log"
 
-# Site that hosts the Fixlet + (ideally) the Computer Groups
+# Site that hosts the Fixlet
 $CustomSiteName = "Test Group Managed (Workstations)"
 
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric)
@@ -18,7 +26,7 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12345"
 }
 
-# Fixlet Action name to invoke (use your actual Fixlet action name(s))
+# Fixlet Action name to invoke inside the Fixlet
 $FixletActionNameMap = @{
     "Pilot"                     = "Action1"
     "Deploy"                    = "Action1"
@@ -26,12 +34,18 @@ $FixletActionNameMap = @{
     "Conference/Training Rooms" = "Action1"
 }
 
+# --- Targeting mode (NEW) ---
+# Use direct membership clause rather than fetching group relevance
+$UseDirectGroupMembershipRelevance = $true      # default ON
+$UseSitesPlural = $true                         # true => (member of group <id> of sites), false => specific site
+$GroupSiteNameForSpecificMode = $CustomSiteName # only used if $UseSitesPlural = $false
+
 # Behavior toggles
 $IgnoreCertErrors           = $true
 $DumpFetchedXmlToTemp       = $true
 $AggressiveRegexFallback    = $true
 $SaveActionXmlToTemp        = $true
-$PostUsingInvokeWebRequest  = $true   # file-based POST (-InFile), per baseline
+$PostUsingInvokeWebRequest  = $true
 
 # =========================
 # UTIL / LOGGING
@@ -70,10 +84,10 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
-# Round a DateTime to exact minute (seconds & ms -> 0)
+# Round to exact minute (zero seconds/ms)
 function Round-ToMinute([datetime]$dt) { $dt.Date.AddHours($dt.Hour).AddMinutes($dt.Minute) }
 
-# Build ISO-8601 duration but **rounded to nearest second** (baseline helper; still used for deadline offset)
+# Build ISO-8601 duration — rounded to nearest second (no drift)
 function To-IsoDurationRounded([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
@@ -146,7 +160,8 @@ function Post-XmlFile-InFile {
             -Headers @{ "Authorization" = $basic } `
             -ContentType "application/xml" `
             -InFile $XmlFilePath `
-            -UseBasicParsing
+            -UseBasicParsing `
+            -ErrorAction Stop
         if ($resp.Content) { LogLine "POST response: $($resp.Content)" }
     } catch {
         $respErr = $_.Exception.Response
@@ -154,6 +169,9 @@ function Post-XmlFile-InFile {
             $rs = $respErr.GetResponseStream()
             $sr = New-Object IO.StreamReader($rs, [Text.Encoding]::UTF8)
             $errBody = $sr.ReadToEnd(); $sr.Close()
+            LogLine ("❌ Server error body (first 2000 chars): {0}" -f ($errBody.Substring(0,[Math]::Min(2000,$errBody.Length))))
+            $errFile = Join-Path $env:TEMP ("BES_Post_Error_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
+            try { [System.IO.File]::WriteAllText($errFile, $errBody, [Text.Encoding]::UTF8); LogLine ("Saved full error to: $errFile") } catch {}
             throw "Invoke-WebRequest POST failed :: $errBody"
         }
         throw ($_.Exception.Message)
@@ -169,31 +187,11 @@ function Get-FixletContainer { param([xml]$Xml)
     if ($Xml.BES.Baseline) { return @{ Type="Baseline"; Node=$Xml.BES.Baseline } }
     throw "Unknown BES content type (no <Fixlet>, <Task>, or <Baseline>)."
 }
-function Get-ActionAndRelevance {
-    param($ContainerNode)
-    $rels = @()
-    $direct = $ContainerNode.SelectNodes("./*[local-name()='Relevance']")
-    if ($direct) { foreach ($n in $direct) { $t = ($n.InnerText).Trim(); if ($t) { $rels += $t } } }
-    if ($rels.Count -eq 0) {
-        $any = $ContainerNode.SelectNodes(".//*[local-name()='Relevance']")
-        if ($any) { foreach ($n in $any) { $t = ($n.InnerText).Trim(); if ($t) { $rels += $t } } }
-    }
-    $act = $null
-    if ($ContainerNode.Action) { $act = $ContainerNode.Action | Select-Object -First 1 }
-    if (-not $act -and $ContainerNode.DefaultAction) { $act = $ContainerNode.DefaultAction }
-    if (-not $act) { throw "No <Action> or <DefaultAction> block found." }
-    $script = $null
-    if ($act.ActionScript) {
-        $script = [string]$act.ActionScript.'#text'
-        if ([string]::IsNullOrWhiteSpace($script)) { $script = $act.ActionScript.InnerText }
-    }
-    if (-not $script) { throw "Action found but no <ActionScript> content present." }
-    LogLine ("Fixlet relevance nodes found: {0}" -f $rels.Count)
-    return @{ Relevance=$rels; ActionScript=$script }
-}
 function Parse-FixletTitleToProduct([string]$Title) {
     ($Title -replace '^Update:\s*','' -replace '\s+Win$','').Trim()
 }
+
+# (Legacy) fetch group XML relevance — kept for optional fallback
 function Extract-AllRelevanceFromXmlString {
     param([string]$XmlString,[string]$Context = "Unknown")
     $all = @()
@@ -201,9 +199,10 @@ function Extract-AllRelevanceFromXmlString {
         $x = [xml]$XmlString
         $cgRels = $x.SelectNodes("//*[local-name()='ComputerGroup']//*[local-name()='Relevance']")
         if ($cgRels) { foreach ($n in $cgRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
-        if ($all.Count -gt 0) { return ,$all }
-        $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
-        if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
+        if ($all.Count -eq 0) {
+            $globalRels = $x.SelectNodes("//*[local-name()='Relevance']")
+            if ($globalRels) { foreach ($n in $globalRels) { $t = ($n.InnerText).Trim(); if ($t) { $all += $t } } }
+        }
     } catch { LogLine "[$Context] XML parse failed: $($_.Exception.Message)" }
     if ($AggressiveRegexFallback -and $all.Count -eq 0) {
         try {
@@ -252,15 +251,11 @@ function Get-GroupClientRelevance {
             $rels = Extract-AllRelevanceFromXmlString -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
             if ($rels.Count -gt 0) {
                 $joined = ($rels | ForEach-Object { "($_)" }) -join " AND "
-                $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
-                LogLine "Built relevance :: ${snippet}..."
                 return $joined
             }
             $frags = Extract-SCRFragments -XmlString $xmlStr -Context "Group:$GroupIdNumeric"
             if ($frags.Count -gt 0) {
                 $joined = ($frags | ForEach-Object { "($_)" }) -join " AND "
-                $snippet = $joined.Substring(0, [Math]::Min(200, $joined.Length))
-                LogLine "Built relevance from SearchComponentRelevance :: ${snippet}..."
                 return $joined
             }
             LogLine "No usable relevance at ${url}"
@@ -268,11 +263,21 @@ function Get-GroupClientRelevance {
             LogLine ("❌ Group relevance fetch failed ({0}): {1}" -f $GroupIdNumeric, $_.Exception.Message)
         }
     }
-    throw "No relevance found or derivable for group ${GroupIdNumeric} in custom/master/operator."
+    throw "No relevance found or derivable for group ${GroupIdNumeric}."
+}
+
+# NEW: build direct membership relevance
+function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeric,[bool]$UseSitesPluralLocal = $UseSitesPlural) {
+    if ($UseSitesPluralLocal) {
+        return "(member of group $GroupIdNumeric of sites)"
+    } else {
+        $siteEsc = $SiteName.Replace('"','\"')
+        return "(member of group $GroupIdNumeric of site whose (name of it = `"$siteEsc`"))"
+    }
 }
 
 # =========================
-# ACTION XML BUILDER (supports absolute local start/end)
+# ACTION XML BUILDER
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -283,18 +288,16 @@ function Build-SourcedFixletActionXml {
         [string]$FixletId,
         [string]$FixletActionName,
         [string]$GroupRelevance,
-        [string]$StartOffset,            # PT… (ignored if StartLocalStr provided)
+        [string]$StartOffset,            # PT…
         [string]$HasEndText,             # "true"/"false"
-        [string]$EndOffset,              # PT… or empty (ignored if EndLocalStr provided)
+        [string]$EndOffset,              # PT… or empty
         [string]$HasTimeRangeText,       # "true"/"false"
         [string]$TRStartStr,             # "HH:mm:ss" or ""
         [string]$TREndStr,               # "HH:mm:ss" or ""
         [string]$ShowPreActionUIText,    # "true"/"false"
         [string]$PreActionText,
         [string]$AskToSaveWorkText,      # "true"/"false"
-        [string]$DeadlineOffset,         # PT… or empty (kept as offset)
-        [string]$StartLocalStr = "",     # "yyyy-MM-ddTHH:mm:ss" local absolute
-        [string]$EndLocalStr   = ""      # "yyyy-MM-ddTHH:mm:ss" local absolute
+        [string]$DeadlineOffset          # PT… or empty (Force only)
     )
 
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
@@ -347,20 +350,9 @@ $preActionBlock = @"
 "@
     }
 
-    # Prefer absolute local timestamps if provided
-    $startLine = if ($StartLocalStr) {
-        "      <StartDateTimeLocal>$StartLocalStr</StartDateTimeLocal>`n"
-    } else {
-        "      <StartDateTimeLocalOffset>$StartOffset</StartDateTimeLocalOffset>`n"
-    }
-
     $endLine = ""
-    if ($HasEndText -ieq "true") {
-        if ($EndLocalStr) {
-            $endLine = "      <EndDateTimeLocal>$EndLocalStr</EndDateTimeLocal>`n"
-        } elseif ($EndOffset) {
-            $endLine = "      <EndDateTimeLocalOffset>$EndOffset</EndDateTimeLocalOffset>`n"
-        }
+    if ($HasEndText -ieq "true" -and $EndOffset) {
+        $endLine = "      <EndDateTimeLocalOffset>$EndOffset</EndDateTimeLocalOffset>`n"
     }
 
 @"
@@ -381,7 +373,8 @@ $preActionBlock      <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
       <HasTimeRange>$HasTimeRangeText</HasTimeRange>
 $timeRangeBlock      <HasStartTime>true</HasStartTime>
-$startLine      <HasEndTime>$HasEndText</HasEndTime>
+      <StartDateTimeLocalOffset>$StartOffset</StartDateTimeLocalOffset>
+      <HasEndTime>$HasEndText</HasEndTime>
 $endLine      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
       <ActiveUserType>AllUsers</ActiveUserType>
@@ -438,7 +431,7 @@ $tbUser   = $null; Add-Field "Username:"      $false ([ref]$tbUser)
 $tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
 $tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
-# Date (future Wednesdays only)
+# Date (future Wednesdays only) — unchanged baseline
 $lblDate = New-Object Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
 $lblDate.Location = New-Object System.Drawing.Point(10,$y)
@@ -451,39 +444,15 @@ $cbDate.Location = New-Object System.Drawing.Point(160,$y)
 $cbDate.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbDate)
 $y += 34
-# next 20 Wednesdays
+
+# populate next 20 Wednesdays
 $today = Get-Date
 $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# Time (fixed list 11:00 PM – 12:45 AM, 15m)
-$lblTime = New-Object System.Windows.Forms.Label
-$lblTime.Text = "Schedule Time:"
-$lblTime.Location = New-Object System.Drawing.Point(10,$y)
-$lblTime.Size = New-Object System.Drawing.Size(140,22)
-$form.Controls.Add($lblTime)
-
-$cbTime = New-Object System.Windows.Forms.ComboBox
-$cbTime.DropDownStyle = 'DropDownList'
-$cbTime.Location = New-Object System.Drawing.Point(160,$y)
-$cbTime.Size = New-Object System.Drawing.Size(160,22)
-$form.Controls.Add($cbTime)
-$y += 42
-
-$cbTime.Items.AddRange(@(
-    "11:00 PM","11:15 PM","11:30 PM","11:45 PM",
-    "12:00 AM","12:15 AM","12:30 AM","12:45 AM"
-))
-
-# Red warning label (shown only for 12:00 AM and later)
-$lblWarn = New-Object System.Windows.Forms.Label
-$lblWarn.ForeColor = [System.Drawing.Color]::Red
-$lblWarn.Location = New-Object System.Drawing.Point(160,$y)
-$lblWarn.Size = New-Object System.Drawing.Size(440,34)
-$lblWarn.Visible = $false
-$form.Controls.Add($lblWarn)
-$y += 34
+# NOTE: Timeslot selector is dormant per baseline; default is 11:00 PM
+$DefaultAnchorTime = "11:00 PM"
 
 # Button
 $btn = New-Object System.Windows.Forms.Button
@@ -509,23 +478,6 @@ $LogBox.ContextMenu.MenuItems.AddRange(@(
 $LogBox.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($LogBox)
 
-# --- helper for warning text ---
-function Update-WarnLabel {
-    param([string]$slot,[string]$dateStr)
-    if ($slot -and $slot -like '12:* AM') {
-        try {
-            $wed = [datetime]::ParseExact($dateStr,'yyyy-MM-dd',$null)
-            $thu = $wed.AddDays(1)
-            $lblWarn.Text = "⚠️ Please note: Since you selected $slot, this deployment will technically start on Thursday, " + $thu.ToString('yyyy-MM-dd')
-            $lblWarn.Visible = $true
-        } catch { $lblWarn.Visible = $false }
-    } else {
-        $lblWarn.Visible = $false
-    }
-}
-$cbTime.add_SelectedIndexChanged({ Update-WarnLabel $cbTime.SelectedItem $cbDate.SelectedItem })
-$cbDate.add_SelectedIndexChanged({ Update-WarnLabel $cbTime.SelectedItem $cbDate.SelectedItem })
-
 # =========================
 # ACTION
 # =========================
@@ -538,12 +490,12 @@ $btn.Add_Click({
     $pass   = $tbPass.Text
     $fixId  = if ($tbFixlet.Text) { $tbFixlet.Text.Trim() } else { "" }
     $dStr   = $cbDate.SelectedItem
-    $tStr   = $cbTime.SelectedItem
+    $tStr   = $DefaultAnchorTime
 
     LogLine ("Fields: server='{0}' user='{1}' fixId='{2}' date='{3}' time='{4}'" -f (Fmt $server),(Fmt $user),(Fmt $fixId),(Fmt $dStr),(Fmt $tStr))
 
-    if (-not ($server -and $user -and $pass -and $fixId -and $dStr -and $tStr)) {
-        LogLine "❌ Please fill in Server, Username, Password, Fixlet ID, Date, and Time."
+    if (-not ($server -and $user -and $pass -and $fixId -and $dStr)) {
+        LogLine "❌ Please fill in Server, Username, Password, Fixlet ID, and Date."
         return
     }
 
@@ -572,64 +524,36 @@ $btn.Add_Click({
         LogLine "Display name (messages): $displayName"
 
         # ---- Absolute desired times (seconds = 0) ----
-        # Anchor on the selected Wednesday date; roll Pilot only if midnight slot
-        $AnchorWed = [datetime]::ParseExact($dStr,'yyyy-MM-dd',$null)
-        $slotTOD   = ([datetime]::ParseExact($tStr,'h:mm tt',$null)).TimeOfDay
-        $isMidnightSlot = ($tStr -like '12:* AM')
+        $PilotStart   = Round-ToMinute([datetime]::ParseExact("$dStr $tStr","yyyy-MM-dd h:mm tt",$null))
+        $DeployStart  = Round-ToMinute($PilotStart.AddDays(1))
+        $ConfStart    = Round-ToMinute($PilotStart.AddDays(1))
+        # Run window start 22:00 for Pilot/Deploy/Conf (baseline)
+        $TRStartStr   = "22:00:00"
+        $TREndStr     = "06:59:00"
 
-        # Pilot: Wed + time, or (if midnight) Thu + time
-        if ($isMidnightSlot) {
-            $PilotStart = Round-ToMinute($AnchorWed.AddDays(1).Add($slotTOD))  # Thu 00:xx
-        } else {
-            $PilotStart = Round-ToMinute($AnchorWed.Add($slotTOD))             # Wed 23:xx
-        }
+        # Pilot ends next morning 06:59
+        $PilotEnd     = Round-ToMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
 
-        # Deploy/Conf start = Pilot + 1 day
-        $DeployStart = Round-ToMinute($PilotStart.AddDays(1))
-        $ConfStart   = Round-ToMinute($PilotStart.AddDays(1))
+        # Deploy ends the following Tuesday at 06:55 AM (relative to anchor Wed)
+        $nextTueAfterPilot = Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)
+        if ($nextTueAfterPilot -le $PilotStart) { $nextTueAfterPilot = $nextTueAfterPilot.AddDays(7) }
+        $DeployEnd    = Round-ToMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
 
-        # Pilot window end: same-day if start < 7am; otherwise next-day
-        if ($PilotStart.TimeOfDay -lt ([TimeSpan]::FromHours(7))) {
-            $PilotEndCalc = $PilotStart.Date.AddHours(6).AddMinutes(59)
-        } else {
-            $PilotEndCalc = $PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59)
-        }
-        $PilotEnd = Round-ToMinute($PilotEndCalc)
-
-        # Deploy window end: following Tuesday 06:55 AM (relative to Wednesday anchor)
-        $NextTue   = Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)
-        $DeployEnd = Round-ToMinute($NextTue.Date.AddHours(6).AddMinutes(55))
-
-        # Force: base on Wed anchor → next Tuesday 7:00 AM (and deadline Wed 7:00 AM)
-        $ForceStart    = Round-ToMinute((Get-NextWeekday -base $AnchorWed -weekday ([DayOfWeek]::Tuesday)).AddHours(7))
-        $ForceDeadline = Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM
-
+        # Force starts next Tuesday 07:00 AM (no TimeRange) — per baseline, no cascade since timeslot UI dormant
+        $ForceStart   = Round-ToMinute($nextTueAfterPilot.AddHours(7))
+        $ForceDeadline= Round-ToMinute($ForceStart.AddDays(1))     # Wed 7:00 AM (deadline)
         # 1-year end times for Conference & Force
-        $ConfEnd  = Round-ToMinute($ConfStart.AddYears(1))
-        $ForceEnd = Round-ToMinute($ForceStart.AddYears(1))
-
-        # Run between window strings
-        $TRStartStr  = "19:00:00"
-        $TREndStr    = "06:59:00"
-
-        # Absolute strings for ALL actions (rock solid :00)
-        $PilotStartLocalStr = $PilotStart.ToString("yyyy-MM-ddTHH:mm:ss")
-        $PilotEndLocalStr   = $PilotEnd.ToString("yyyy-MM-ddTHH:mm:ss")
-        $DeployStartLocalStr= $DeployStart.ToString("yyyy-MM-ddTHH:mm:ss")
-        $DeployEndLocalStr  = $DeployEnd.ToString("yyyy-MM-ddTHH:mm:ss")
-        $ConfStartLocalStr  = $ConfStart.ToString("yyyy-MM-ddTHH:mm:ss")
-        $ConfEndLocalStr    = $ConfEnd.ToString("yyyy-MM-ddTHH:mm:ss")
-        $ForceStartLocalStr = $ForceStart.ToString("yyyy-MM-ddTHH:mm:ss")
-        $ForceEndLocalStr   = $ForceEnd.ToString("yyyy-MM-ddTHH:mm:ss")
+        $ConfEnd      = Round-ToMinute($ConfStart.AddYears(1))
+        $ForceEnd     = Round-ToMinute($ForceStart.AddYears(1))
 
         $actions = @(
-            @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=$PilotStartLocalStr;  EndLocal=$PilotEndLocalStr  },
-            @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=$DeployStartLocalStr; EndLocal=$DeployEndLocalStr },
-            @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null; StartLocal=$ConfStartLocalStr; EndLocal=$ConfEndLocalStr },
+            @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
+            @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
+            @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; AbsDeadline=$null },
             @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
                     $displayName, $ForceDeadline.ToString("M/d/yyyy h:mm tt"));
-               SaveAsk="true"; AbsDeadline=$ForceDeadline; StartLocal=$ForceStartLocalStr; EndLocal=$ForceEndLocalStr }
+               SaveAsk="true"; AbsDeadline=$ForceDeadline }
         )
 
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
@@ -644,22 +568,29 @@ $btn.Add_Click({
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
             if (-not $groupIdNumeric) { LogLine ("❌ Could not parse numeric ID from '{0}' for {1}" -f $groupIdRaw, $a); continue }
 
-            # fetch group relevance
-            try {
-                LogLine "Fetching group relevance for $a (group $groupIdNumeric)"
-                $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
-                $grLen = 0; if ($groupRel) { $grLen = $groupRel.Length }
-                LogLine ("Group relevance len ({0}): {1}" -f $a, $grLen)
-            } catch {
-                LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
-                continue
+            # === NEW TARGETING: Build direct membership relevance (or fallback to fetch) ===
+            $groupRel = $null
+            if ($UseDirectGroupMembershipRelevance) {
+                $siteForSpecific = if ([string]::IsNullOrWhiteSpace($GroupSiteNameForSpecificMode)) { $CustomSiteName } else { $GroupSiteNameForSpecificMode }
+                $groupRel = Build-GroupMembershipRelevance -SiteName $siteForSpecific -GroupIdNumeric $groupIdNumeric -UseSitesPluralLocal:$UseSitesPlural
+                LogLine ("Using direct membership relevance: {0}" -f $groupRel)
+            } else {
+                try {
+                    LogLine "Fetching group relevance for $a (group $groupIdNumeric)"
+                    $groupRel = Get-GroupClientRelevance -BaseUrl $base -AuthHeader $auth -SiteName $CustomSiteName -GroupIdNumeric $groupIdNumeric
+                    $grLen = 0; if ($groupRel) { $grLen = $groupRel.Length }
+                    LogLine ("Fetched group relevance len ({0}): {1}" -f $a, $grLen)
+                } catch {
+                    LogLine ("❌ Could not fetch/build group relevance for {0}: {1}" -f $a, $_.Exception.Message)
+                    continue
+                }
             }
 
             $fixletActionName = ($FixletActionNameMap[$a]); if (-not $fixletActionName) { $fixletActionName = "Action1" }
 
-            # Offsets still computed (not used when StartLocal/EndLocal are present)
-            $postNow    = Get-Date
-            $startOff   = To-IsoDurationRounded ($cfg.AbsStart   - $postNow)
+            # Fresh offsets right before POST — with rounding to whole seconds (no drift)
+            $postNow = Get-Date
+            $startOff   = To-IsoDurationRounded ($cfg.AbsStart - $postNow)
             $endOff     = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { To-IsoDurationRounded ($cfg.AbsEnd - $postNow) } else { "" }
             $deadlineOff= if ($cfg.AbsDeadline) { To-IsoDurationRounded ($cfg.AbsDeadline - $postNow) } else { "" }
 
@@ -680,9 +611,7 @@ $btn.Add_Click({
                 -ShowPreActionUIText  $cfg.ShowUI `
                 -PreActionText        $cfg.Msg `
                 -AskToSaveWorkText    $cfg.SaveAsk `
-                -DeadlineOffset       $deadlineOff `
-                -StartLocalStr        $cfg.StartLocal `
-                -EndLocalStr          $cfg.EndLocal
+                -DeadlineOffset       $deadlineOff
 
             $xmlBodyToSend = $xmlBody
 
@@ -692,6 +621,22 @@ $btn.Add_Click({
                 Write-Utf8NoBom -Path $tmpAction -Content $xmlBodyToSend
                 LogLine "Saved action XML for $a to: $tmpAction"
                 LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
+            }
+
+            # Confirmation dialog (baseline)
+            if ($a -eq "Pilot") {
+                $dlg = [System.Windows.Forms.MessageBox]::Show(
+                    $form,
+                    ("Fixlet: {0}`r`nCreate the 4 actions (Pilot/Deploy/Force/Conf) now?" -f $titleRaw),
+                    "Confirm — Create Actions",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Question,
+                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+                )
+                if ($dlg -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    LogLine "🚫 User canceled."
+                    return
+                }
             }
 
             try {
