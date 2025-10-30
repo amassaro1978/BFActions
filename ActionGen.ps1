@@ -106,10 +106,10 @@ function Write-Utf8NoBom([string]$Path,[string]$Content) {
     if ($null -eq $Content) { $Content = "" }
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
-# Build ISO-8601 duration rounded to nearest second (no drift)
+# Build ISO-8601 duration rounded to nearest second (kept in case needed elsewhere)
 function To-IsoDurationRounded([TimeSpan]$ts) {
     $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
-    if ($totalSec -lt 60) { $totalSec = 60 } # floor at 60s to avoid already-expired deadlines
+    if ($totalSec -lt 60) { $totalSec = 60 }
     $days  = [int]([Math]::Floor($totalSec / 86400))
     $rem   = $totalSec - ($days * 86400)
     $hours = [int]([Math]::Floor($rem / 3600)); $rem -= ($hours * 3600)
@@ -206,7 +206,7 @@ function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeri
 }
 
 # =========================
-# ACTION XML BUILDER (ABSOLUTE START/END; OFFSET DEADLINE OPTION)
+# ACTION XML BUILDER (ABSOLUTE START/END; ABSOLUTE DEADLINE OPTION)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -471,13 +471,8 @@ $btn.Add_Click({
 
         # -------- FORCE: Next Tuesday 07:00 AFTER the selected Wednesday ----------
         $ForceStart = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))  # Tue 07:00 after anchor Wed
-        # Desired absolute deadline = ForceStart + 24h (i.e., Wed 07:00)
+        # Desired absolute deadline = ForceStart + 24h (i.e., Wed 07:00) — pin seconds to :00
         $ForceDeadlineAbs = Snap-ToExactMinute($ForceStart.AddDays(1))
-
-        # Compute DeadlineLocalOffset relative to when we post (prod schema-safe)
-        $postNow = Get-Date
-        $forceDeadlineOffsetTS = $ForceDeadlineAbs - $postNow
-        $ForceDeadlineOffset = To-IsoDurationRounded $forceDeadlineOffsetTS
 
         # 1-year end times for Conference & Force
         $ConfEnd  = Snap-ToExactMinute($ConfStart.AddYears(1))
@@ -490,7 +485,7 @@ $btn.Add_Click({
             @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
                     $displayName, $ForceDeadlineAbs.ToString("M/d/yyyy h:mm tt"));
-               SaveAsk="true"; DeadlineLocal=""; DeadlineOffset=$ForceDeadlineOffset }
+               SaveAsk="true"; DeadlineLocal=(IsoLocal $ForceDeadlineAbs); DeadlineOffset="" }
         )
 
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
