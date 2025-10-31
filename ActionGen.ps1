@@ -1,6 +1,6 @@
 # =========================================================
 # BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
-# Patch: Force deadline uses compensated <DeadlineLocalOffset> to pin :00 seconds (no drift)
+# Patch: Force deadline uses minute-boundary wait + PT{minutes}M offset (pins :00, no drift)
 # Pilot/Deploy/Conf unchanged; targeting via (member of group <id> of sites); confirm dialog
 # Timeslot UI dormant (defaults to 11:00 PM); Wednesday-only date selector
 # =========================================================
@@ -71,7 +71,7 @@ function Get-AuthHeader([string]$User,[string]$Pass) {
 }
 function LogLine($txt) {
     try {
-        $line = "{0}  {1}" -f (Get-Date -Format 'u'), $txt
+        $line = "{0}  {1}" -f (Get-Date - Format 'u'), $txt
         if ($LogBox) { $LogBox.AppendText($line + "`r`n"); $LogBox.SelectionStart = $LogBox.Text.Length; $LogBox.ScrollToCaret() }
         Add-Content -Path $LogFile -Value $line
     } catch {}
@@ -101,7 +101,7 @@ function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
     $base.Date.AddDays($delta)
 }
 
-# Build ISO-8601 duration rounded to nearest second (kept for general use)
+# Build ISO-8601 duration rounded to nearest second (general use)
 function To-IsoDurationRounded([TimeSpan]$ts) {
     $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
     if ($totalSec -lt 60) { $totalSec = 60 } # floor at 60s so it's never "already expired"
@@ -117,17 +117,21 @@ function To-IsoDurationRounded([TimeSpan]$ts) {
     return $dPart + "T" + ($tParts -join "")
 }
 
-# Compensated offset so deadline lands exactly at :00 on server
-function Get-OffsetToAbsoluteAtZeroSeconds([datetime]$absoluteTarget) {
-    $now = Get-Date
-    # move "now" to the next exact minute (:00)
-    $toNextMinute = [TimeSpan]::FromSeconds(60 - $now.Second) - [TimeSpan]::FromMilliseconds($now.Millisecond)
-    if ($toNextMinute.TotalMilliseconds -lt 0) { $toNextMinute = [TimeSpan]::Zero }
-    $nowAtZero = $now + $toNextMinute
-
-    $delta = $absoluteTarget - $nowAtZero
-    if ($delta.TotalSeconds -lt 60) { $delta = [TimeSpan]::FromSeconds(60) }
-    To-IsoDurationRounded $delta
+# === Minute-boundary wait + whole-minute offset helpers (for Force deadline) ===
+function Wait-ForTopOfMinute {
+    # Blocks until local seconds == 0 (keeps short sleeps to remain responsive)
+    while ($true) {
+        $n = Get-Date
+        $ms = (60 - $n.Second)*1000 - $n.Millisecond
+        if ($ms -le 5) { break }
+        Start-Sleep -Milliseconds ([Math]::Min($ms, 200))
+    }
+}
+function To-IsoDurationMinutes([TimeSpan]$ts) {
+    # Return PT{wholeMinutes}M (no seconds) so server lands at :00
+    if ($ts.TotalMinutes -lt 1) { return "PT1M" }
+    $m = [int][Math]::Ceiling($ts.TotalMinutes)
+    return "PT{0}M" -f $m
 }
 
 function SafeEscape([string]$s) {
@@ -489,8 +493,15 @@ $btn.Add_Click({
         # -------- FORCE: Next Tuesday 07:00 AFTER the selected Wednesday ----------
         $ForceStart       = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))   # Tue 07:00
         $ForceDeadlineAbs = Snap-ToExactMinute($ForceStart.AddDays(1))           # Wed 07:00
-        # Compensated offset so the deadline lands on :00 even with transit time
-        $ForceDeadlineOffset = Get-OffsetToAbsoluteAtZeroSeconds $ForceDeadlineAbs
+
+        # ---- Force deadline offset with zero-seconds guarantee ----
+        # 1) Wait until the top of a minute so server 'now' ~ :00 when we compute/post Force
+        LogLine "Aligning to minute boundary for Force deadline..."
+        Wait-ForTopOfMinute
+        $nowAligned = Get-Date
+        # 2) Compute whole-minute offset to the absolute deadline
+        $ForceDeadlineOffset = To-IsoDurationMinutes ($ForceDeadlineAbs - $nowAligned)
+        LogLine ("Force deadline absolute: {0} | offset: {1}" -f ($ForceDeadlineAbs.ToString("yyyy-MM-dd HH:mm:ss")), $ForceDeadlineOffset)
 
         # 1-year end times for Conference & Force (unchanged)
         $ConfEnd  = Snap-ToExactMinute($ConfStart.AddYears(1))
