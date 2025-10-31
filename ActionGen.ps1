@@ -1,9 +1,8 @@
 # =========================================================
 # BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
-# CHANGES FROM BASELINE:
-#   1) Targeting: direct membership relevance "(member of group <id> of sites)"
-#   2) Force deadline drift fix: send absolute DeadlineDateTimeLocal (no seconds drift)
-# Everything else preserved exactly as baseline.
+# CHANGES (only these two):
+#   1) Targeting: "(member of group <id> of sites)"
+#   2) Force deadline: use DeadlineLocalOffset computed at top-of-minute to prevent drift
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -11,11 +10,11 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Web
 
 # =========================
-# CONFIG
+# CONFIG (baseline)
 # =========================
 $LogFile = "C:\temp\BigFixActionGenerator.log"
 
-# Site that hosts the Fixlet (unchanged)
+# Site that hosts the Fixlet (baseline)
 $CustomSiteName = "Test Group Managed (Workstations)"
 
 # Action -> Computer Group ID (keep 00- prefix; we'll strip to numeric)
@@ -26,7 +25,7 @@ $GroupMap = @{
     "Conference/Training Rooms" = "00-12345"
 }
 
-# Fixlet Action name to invoke inside the Fixlet (unchanged)
+# Fixlet Action name to invoke inside the Fixlet (baseline)
 $FixletActionNameMap = @{
     "Pilot"                     = "Action1"
     "Deploy"                    = "Action1"
@@ -34,18 +33,17 @@ $FixletActionNameMap = @{
     "Conference/Training Rooms" = "Action1"
 }
 
-# === Targeting mode (ONLY TARGETING CHANGE KEPT) ===
+# === Targeting mode (ONLY TARGETING CHANGE) ===
 $UseDirectGroupMembershipRelevance = $true  # use (member of group <id> of sites)
-$UseSitesPlural = $true                     # always "of sites"
 
-# Behavior toggles (unchanged)
+# Behavior toggles (baseline)
 $IgnoreCertErrors           = $true
 $DumpFetchedXmlToTemp       = $true
 $SaveActionXmlToTemp        = $true
 $PostUsingInvokeWebRequest  = $true
 
 # =========================
-# UTIL / LOGGING  (unchanged)
+# UTIL / LOGGING  (baseline)
 # =========================
 function Encode-SiteName([string]$Name) {
     $enc = [System.Web.HttpUtility]::UrlEncode($Name, [System.Text.Encoding]::UTF8)
@@ -94,11 +92,11 @@ function IsoLocal([datetime]$dt) {
     return (Snap-ToExactMinute $dt).ToString("yyyy-MM-dd'T'HH:mm:ss")
 }
 
-# Rounded offset (baseline general)
+# Rounded offset builder (baseline general-purpose)
 function To-IsoDurationRounded([TimeSpan]$ts) {
     if ($ts.Ticks -lt 0) { $ts = [TimeSpan]::Zero }
     $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
-    if ($totalSec -lt 60) { $totalSec = 60 } # ensure not "already expired"
+    if ($totalSec -lt 60) { $totalSec = 60 } # guard
     $days  = [int]([Math]::Floor($totalSec / 86400))
     $rem   = $totalSec - ($days * 86400)
     $hours = [int]([Math]::Floor($rem / 3600)); $rem -= ($hours * 3600)
@@ -129,8 +127,18 @@ function Write-Utf8NoBom([string]$Path,[string]$Content) {
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
 
+# ===== Top-of-minute sync (NEW, to prevent Force deadline drift)
+function Wait-ForTopOfMinute {
+    # Sleep until seconds == 0 to avoid drift when using DeadlineLocalOffset
+    do {
+        $now = Get-Date
+        $sleepMs = (60 - $now.Second) * 1000 - $now.Millisecond
+        if ($sleepMs -gt 0 -and $sleepMs -lt 60000) { Start-Sleep -Milliseconds $sleepMs }
+    } while ((Get-Date).Second -ne 0)
+}
+
 # =========================
-# HTTP (unchanged)
+# HTTP (baseline)
 # =========================
 if ($IgnoreCertErrors) { try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch { } }
 [System.Net.ServicePointManager]::Expect100Continue = $false
@@ -189,7 +197,7 @@ function Post-XmlFile-InFile {
 }
 
 # =========================
-# ACTION XML BUILDER (baseline + absolute deadline support)
+# ACTION XML BUILDER (baseline, deadline=OFFSET ONLY)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -209,7 +217,7 @@ function Build-SourcedFixletActionXml {
         [string]$ShowPreActionUIText,   # "true"/"false"
         [string]$PreActionText,
         [string]$AskToSaveWorkText,     # "true"/"false"
-        [string]$DeadlineLocal,         # yyyy-MM-ddTHH:mm:ss or ""
+        [string]$DeadlineLocal,         # (ignored now; keep for signature stability)
         [string]$DeadlineOffset         # PT… or ""
     )
 
@@ -236,14 +244,9 @@ $trEndLine
 "@
     }
 
+    # Offset-only (schema correct). Absolute variant removed to avoid post failures.
     $deadlineInner = ""
-    if ($DeadlineLocal) {
-$deadlineInner = @"
-        <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
-        <DeadlineType>Absolute</DeadlineType>
-        <DeadlineDateTimeLocal>$DeadlineLocal</DeadlineDateTimeLocal>
-"@
-    } elseif ($DeadlineOffset) {
+    if ($DeadlineOffset) {
 $deadlineInner = @"
         <DeadlineBehavior>RunAutomatically</DeadlineBehavior>
         <DeadlineType>Absolute</DeadlineType>
@@ -255,8 +258,6 @@ $deadlineInner = @"
     if ($HasEndText -ieq "true" -and $EndLocal) {
         $endLine = "      <EndDateTimeLocal>$EndLocal</EndDateTimeLocal>`n"
     }
-
-    $startLine = "      <StartDateTimeLocal>$StartLocal</StartDateTimeLocal>"
 
 @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -286,7 +287,7 @@ $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
       <HasTimeRange>$HasTimeRangeText</HasTimeRange>
 $timeRangeBlock      <HasStartTime>true</HasStartTime>
-$startLine
+      <StartDateTimeLocal>$StartLocal</StartDateTimeLocal>
       <HasEndTime>$HasEndText</HasEndTime>
 $endLine      <UseUTCTime>false</UseUTCTime>
       <ActiveUserRequirement>NoRequirement</ActiveUserRequirement>
@@ -310,7 +311,7 @@ $endLine      <UseUTCTime>false</UseUTCTime>
 }
 
 # =========================
-# GUI  (unchanged baseline)
+# GUI  (baseline)
 # =========================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Action Generator"
@@ -357,16 +358,16 @@ $cbDate.Size = New-Object System.Drawing.Size(160,22)
 $form.Controls.Add($cbDate)
 $y += 34
 
-# populate next 20 Wednesdays (unchanged)
+# populate next 20 Wednesdays (baseline)
 $today = Get-Date
 $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# Timeslot selector dormant; default is 11:00 PM (unchanged)
+# Timeslot selector dormant; default is 11:00 PM (baseline)
 $DefaultAnchorTime = "11:00 PM"
 
-# Button (unchanged)
+# Button (baseline)
 $btn = New-Object System.Windows.Forms.Button
 $btn.Text = "Generate & Post 4 Actions (Pilot/Deploy/Force/Conf)"
 $btn.Location = New-Object System.Drawing.Point(160,$y)
@@ -374,9 +375,10 @@ $btn.Size = New-Object System.Drawing.Size(320,32)
 $form.Controls.Add($btn)
 $y += 42
 
-# Log (unchanged)
+# Log (baseline)
 $LogBox = New-Object System.Windows.Forms.TextBox
 $LogBox.Multiline = $true
+# (left writable intentionally for copy/select context menu)
 $LogBox.ScrollBars = "Vertical"
 $LogBox.ReadOnly = $false
 $LogBox.WordWrap = $false
@@ -391,7 +393,7 @@ $LogBox.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($LogBox)
 
 # =========================
-# ACTION  (baseline; only targeting + absolute Force deadline wired)
+# ACTION  (baseline; only targeting + Force deadline drift-safe)
 # =========================
 $btn.Add_Click({
     $LogBox.Clear()
@@ -426,7 +428,7 @@ $btn.Add_Click({
         }
 
         $fixletXml = [xml]$fixletContent
-        # container + title (unchanged)
+        # container + title (baseline)
         $containerNode = $null
         if ($fixletXml.BES.Fixlet)   { $containerNode = $fixletXml.BES.Fixlet }
         elseif ($fixletXml.BES.Task) { $containerNode = $fixletXml.BES.Task }
@@ -454,10 +456,9 @@ $btn.Add_Click({
         if ($nextTueAfterPilot -le $PilotStart) { $nextTueAfterPilot = $nextTueAfterPilot.AddDays(7) }
         $DeployEnd = Snap-ToExactMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
 
-        # FORCE start Tue 07:00; deadline +24h (absolute to kill drift)
-        $ForceStart           = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))     # Tue 07:00
-        $ForceDeadlineAbs     = Snap-ToExactMinute($ForceStart.AddDays(1))             # Wed 07:00
-        $ForceDeadlineLocalStr= IsoLocal $ForceDeadlineAbs
+        # FORCE start Tue 07:00 (baseline)
+        $ForceStart       = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))     # Tue 07:00
+        $ForceDeadlineAbs = Snap-ToExactMinute($ForceStart.AddDays(1))             # Wed 07:00
 
         # 1-year end times (baseline)
         $ConfEnd  = Snap-ToExactMinute($ConfStart.AddYears(1))
@@ -465,19 +466,17 @@ $btn.Add_Click({
 
         # === Targeting (ONLY TARGETING CHANGE): direct membership relevance ===
         function Build-GroupMembershipRelevance([string]$GroupIdNumeric) {
-            if ($UseSitesPlural) { return "(member of group $GroupIdNumeric of sites)" }
-            else { return "(member of group $GroupIdNumeric of sites)" } # keep 'sites' per spec
+            return "(member of group $GroupIdNumeric of sites)"
         }
 
         $actions = @(
             @{ Name="Pilot"; AbsStart=$PilotStart;  AbsEnd=$PilotEnd;    HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineLocal=""; DeadlineOffset="" },
             @{ Name="Deploy";AbsStart=$DeployStart; AbsEnd=$DeployEnd;   HasEnd="true";  HasTR="true";  TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineLocal=""; DeadlineOffset="" },
             @{ Name="Conference/Training Rooms"; AbsStart=$ConfStart; AbsEnd=$ConfEnd; HasEnd="true"; HasTR="true"; TRS=$TRStartStr; TRE=$TREndStr; ShowUI="false"; Msg=""; SaveAsk="false"; DeadlineLocal=""; DeadlineOffset="" },
-            @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE="";
-               ShowUI="true";
+            @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
                     $displayName, $ForceDeadlineAbs.ToString("M/d/yyyy h:mm tt"));
-               SaveAsk="true"; DeadlineLocal=$ForceDeadlineLocalStr; DeadlineOffset="" }
+               SaveAsk="true"; DeadlineLocal=""; DeadlineOffset="" }
         )
 
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
@@ -499,8 +498,15 @@ $btn.Add_Click({
             $startLocal    = IsoLocal $cfg.AbsStart
             $endLocal      = if ($cfg.HasEnd -ieq "true" -and $cfg.AbsEnd) { IsoLocal $cfg.AbsEnd } else { "" }
 
-            $deadlineLocal = $cfg.DeadlineLocal
-            $deadlineOff   = $cfg.DeadlineOffset
+            # Deadline offset:
+            $deadlineOff = $cfg.DeadlineOffset
+            if ($a -eq "Force") {
+                # Align to top-of-minute to eliminate drift when using DeadlineLocalOffset
+                Wait-ForTopOfMinute
+                $postNow = Get-Date
+                $deadlineOff = To-IsoDurationRounded ($ForceDeadlineAbs - $postNow)
+                LogLine ("Force deadline computed as offset from {0}: {1}" -f ($postNow.ToString("HH:mm:ss")), $deadlineOff)
+            }
 
             $xmlBody = Build-SourcedFixletActionXml `
                 -ActionTitle          $a `
@@ -519,7 +525,7 @@ $btn.Add_Click({
                 -ShowPreActionUIText  $cfg.ShowUI `
                 -PreActionText        $cfg.Msg `
                 -AskToSaveWorkText    $cfg.SaveAsk `
-                -DeadlineLocal        $deadlineLocal `
+                -DeadlineLocal        "" `
                 -DeadlineOffset       $deadlineOff
 
             $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
