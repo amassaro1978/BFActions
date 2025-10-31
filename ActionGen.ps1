@@ -1,8 +1,8 @@
 # =========================================================
 # BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
-# Force timing: Next Tuesday 07:00 after selected Wednesday; deadline = ForceStart + 24h
-# Starts/Ends absolute local (:00 seconds) — no drift
-# Targeting: (member of group <id> of sites)
+# Patch: Force deadline uses compensated <DeadlineLocalOffset> to pin :00 seconds (no drift)
+# Pilot/Deploy/Conf unchanged; targeting via (member of group <id> of sites); confirm dialog
+# Timeslot UI dormant (defaults to 11:00 PM); Wednesday-only date selector
 # =========================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -81,6 +81,7 @@ function Get-NumericGroupId([string]$GroupIdWithPrefix) {
     if ($GroupIdWithPrefix -match '^\d{2}-(\d+)$') { return $Matches[1] }
     return ($GroupIdWithPrefix -replace '[^\d]','')
 }
+
 # Snap to exact minute (:00 seconds)
 function Snap-ToExactMinute([datetime]$dt) {
     $d = $dt
@@ -92,11 +93,43 @@ function IsoLocal([datetime]$dt) {
     # Absolute local time with explicit :00 seconds
     return (Snap-ToExactMinute $dt).ToString("yyyy-MM-dd'T'HH:mm:ss")
 }
+
+# Next specified weekday after a base date
 function Get-NextWeekday([datetime]$base,[System.DayOfWeek]$weekday) {
     $delta = ([int]$weekday - [int]$base.DayOfWeek + 7) % 7
     if ($delta -le 0) { $delta += 7 }
     $base.Date.AddDays($delta)
 }
+
+# Build ISO-8601 duration rounded to nearest second (kept for general use)
+function To-IsoDurationRounded([TimeSpan]$ts) {
+    $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
+    if ($totalSec -lt 60) { $totalSec = 60 } # floor at 60s so it's never "already expired"
+    $days  = [int]([Math]::Floor($totalSec / 86400)); $rem = $totalSec - ($days * 86400)
+    $hours = [int]([Math]::Floor($rem / 3600));       $rem -= $hours * 3600
+    $mins  = [int]([Math]::Floor($rem / 60));         $rem -= $mins * 60
+    $secs  = [int]$rem
+    $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
+    $tParts = @()
+    if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
+    if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
+    if ($secs  -gt 0 -or $tParts.Count -eq 0) { $tParts += ("{0}S" -f $secs) }
+    return $dPart + "T" + ($tParts -join "")
+}
+
+# Compensated offset so deadline lands exactly at :00 on server
+function Get-OffsetToAbsoluteAtZeroSeconds([datetime]$absoluteTarget) {
+    $now = Get-Date
+    # move "now" to the next exact minute (:00)
+    $toNextMinute = [TimeSpan]::FromSeconds(60 - $now.Second) - [TimeSpan]::FromMilliseconds($now.Millisecond)
+    if ($toNextMinute.TotalMilliseconds -lt 0) { $toNextMinute = [TimeSpan]::Zero }
+    $nowAtZero = $now + $toNextMinute
+
+    $delta = $absoluteTarget - $nowAtZero
+    if ($delta.TotalSeconds -lt 60) { $delta = [TimeSpan]::FromSeconds(60) }
+    To-IsoDurationRounded $delta
+}
+
 function SafeEscape([string]$s) {
     if ($null -eq $s) { return "" }
     [System.Security.SecurityElement]::Escape($s)
@@ -105,22 +138,6 @@ function Write-Utf8NoBom([string]$Path,[string]$Content) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     if ($null -eq $Content) { $Content = "" }
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
-}
-# Build ISO-8601 duration rounded to nearest second (kept in case needed elsewhere)
-function To-IsoDurationRounded([TimeSpan]$ts) {
-    $totalSec = [Math]::Round($ts.TotalSeconds, 0, [System.MidpointRounding]::AwayFromZero)
-    if ($totalSec -lt 60) { $totalSec = 60 }
-    $days  = [int]([Math]::Floor($totalSec / 86400))
-    $rem   = $totalSec - ($days * 86400)
-    $hours = [int]([Math]::Floor($rem / 3600)); $rem -= ($hours * 3600)
-    $mins  = [int]([Math]::Floor($rem / 60));   $rem -= ($mins * 60)
-    $secs  = [int]$rem
-    $dPart = if ($days -gt 0) { "P{0}D" -f $days } else { "P" }
-    $tParts = @()
-    if ($hours -gt 0) { $tParts += ("{0}H" -f $hours) }
-    if ($mins  -gt 0) { $tParts += ("{0}M" -f $mins) }
-    if ($secs  -gt 0 -or $tParts.Count -eq 0) { $tParts += ("{0}S" -f $secs) }
-    return $dPart + "T" + ($tParts -join "")
 }
 
 # =========================
@@ -206,7 +223,7 @@ function Build-GroupMembershipRelevance([string]$SiteName,[string]$GroupIdNumeri
 }
 
 # =========================
-# ACTION XML BUILDER (ABSOLUTE START/END; ABSOLUTE DEADLINE OPTION)
+# ACTION XML BUILDER (ABSOLUTE START/END; DEADLINE supports Local or Offset)
 # =========================
 function Build-SourcedFixletActionXml {
     param(
@@ -457,24 +474,25 @@ $btn.Add_Click({
         $DeployStart = Snap-ToExactMinute($PilotStart.AddDays(1))
         $ConfStart   = Snap-ToExactMinute($PilotStart.AddDays(1))
 
-        # Run window 22:00–06:59 for Pilot/Deploy/Conf
+        # Run window 22:00–06:59 for Pilot/Deploy/Conf (unchanged)
         $TRStartStr   = "22:00:00"
         $TREndStr     = "06:59:00"
 
-        # Pilot ends next morning 06:59
+        # Pilot ends next morning 06:59 (unchanged)
         $PilotEnd = Snap-ToExactMinute($PilotStart.Date.AddDays(1).AddHours(6).AddMinutes(59))
 
-        # Deploy ends the following Tuesday at 06:55 AM (relative to anchor Wed)
+        # Deploy ends the following Tuesday at 06:55 AM (unchanged)
         $nextTueAfterPilot = Get-NextWeekday -base $PilotStart -weekday ([DayOfWeek]::Tuesday)
         if ($nextTueAfterPilot -le $PilotStart) { $nextTueAfterPilot = $nextTueAfterPilot.AddDays(7) }
         $DeployEnd = Snap-ToExactMinute($nextTueAfterPilot.AddHours(6).AddMinutes(55))
 
         # -------- FORCE: Next Tuesday 07:00 AFTER the selected Wednesday ----------
-        $ForceStart = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))  # Tue 07:00 after anchor Wed
-        # Desired absolute deadline = ForceStart + 24h (i.e., Wed 07:00) — pin seconds to :00
-        $ForceDeadlineAbs = Snap-ToExactMinute($ForceStart.AddDays(1))
+        $ForceStart       = Snap-ToExactMinute($nextTueAfterPilot.AddHours(7))   # Tue 07:00
+        $ForceDeadlineAbs = Snap-ToExactMinute($ForceStart.AddDays(1))           # Wed 07:00
+        # Compensated offset so the deadline lands on :00 even with transit time
+        $ForceDeadlineOffset = Get-OffsetToAbsoluteAtZeroSeconds $ForceDeadlineAbs
 
-        # 1-year end times for Conference & Force
+        # 1-year end times for Conference & Force (unchanged)
         $ConfEnd  = Snap-ToExactMinute($ConfStart.AddYears(1))
         $ForceEnd = Snap-ToExactMinute($ForceStart.AddYears(1))
 
@@ -485,7 +503,7 @@ $btn.Add_Click({
             @{ Name="Force"; AbsStart=$ForceStart; AbsEnd=$ForceEnd; HasEnd="true"; HasTR="false"; TRS=""; TRE=""; ShowUI="true";
                Msg=("{0} update will be enforced on {1}.  Please leave your machine on overnight to get the automated update.  Otherwise, please close the application and run the update now" -f `
                     $displayName, $ForceDeadlineAbs.ToString("M/d/yyyy h:mm tt"));
-               SaveAsk="true"; DeadlineLocal=(IsoLocal $ForceDeadlineAbs); DeadlineOffset="" }
+               SaveAsk="true"; DeadlineLocal=""; DeadlineOffset=$ForceDeadlineOffset }
         )
 
         $postUrl = Join-ApiUrl -BaseUrl $base -RelativePath "/api/actions"
