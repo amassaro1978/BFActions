@@ -1,52 +1,114 @@
-#region Close only Sirsi/JWF javaw.exe
-# Path to the bundled JRE\bin folder (trailing backslash not required)
-$JreBinPath   = 'C:\Program Files (x86)\Sirsi\JWF\JRE\bin'
-$TargetExe    = Join-Path $JreBinPath 'javaw.exe'
+#region Close only Sirsi/JWF javaw.exe (PSADT logging via Write-ADTLogEntry)
 
-try {
-    # Get only javaw.exe processes
-    $javawList = Get-CimInstance -ClassName Win32_Process -Query "
-        SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process
-        WHERE Name='javaw.exe'
-    " -ErrorAction Stop
+# --- SETTINGS (edit as needed) ---
+$JreBinPath = 'C:\Program Files (x86)\Sirsi\JWF\JRE\bin'   # bundled JRE\bin path
+$GraceWaitMs = 8000                                        # wait after CloseMainWindow
 
-    # Filter to just the bundled JRE instances
-    $target = $javawList | Where-Object {
-        $_.ExecutablePath -and (
-            $_.ExecutablePath -ieq $TargetExe -or
-            $_.ExecutablePath.StartsWith($JreBinPath, [System.StringComparison]::InvariantCultureIgnoreCase)
-        )
+# --- Helper for consistent logging ---
+function Write-LogA {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet(1,2,3)][int]$Severity = 1            # 1=Info, 2=Warn, 3=Error
+    )
+    # Prefix severity tag for readability in your logs
+    $prefix = switch ($Severity) { 1 {'[INFO] '} 2 {'[WARN] '} 3 {'[ERR ] '} }
+    Write-ADTLogEntry -Message ($prefix + $Message) -Source $adtsession.InstallPhase
+}
+
+# Normalize path with trailing backslash for StartsWith()
+$normalized = ([System.IO.Path]::GetFullPath($JreBinPath)).TrimEnd('\') + '\'
+Write-LogA "Scanning for javaw.exe under: $normalized"
+
+# 1) Enumerate ALL javaw.exe for diagnostics
+$allJavaw = Get-CimInstance Win32_Process -Filter "Name='javaw.exe'" -ErrorAction SilentlyContinue
+if (-not $allJavaw) {
+    Write-LogA "No javaw.exe processes currently running."
+    return
+}
+foreach ($p in $allJavaw) {
+    Write-LogA ("javaw PID {0}; Path='{1}'; Cmd='{2}'" -f $p.ProcessId, $p.ExecutablePath, $p.CommandLine)
+}
+
+# 2) Filter to JUST the bundled JRE instances by ExecutablePath
+$targets = $allJavaw | Where-Object {
+    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($normalized, [System.StringComparison]::InvariantCultureIgnoreCase)
+}
+
+if (-not $targets) {
+    Write-LogA "No Sirsi/JWF javaw.exe instances matched path '$normalized'." 2
+    return
+}
+
+$pidList = $targets.ProcessId
+Write-LogA "Matched Sirsi/JWF javaw.exe PID(s): $($pidList -join ', ')"
+
+# 3) Attempt close/kill per PID, and report parent (for relaunch clues)
+foreach ($t in $targets) {
+    $pid = $t.ProcessId
+    # Try to identify the parent process (may be a service wrapper)
+    try {
+        $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$($t.ParentProcessId)" -ErrorAction Stop
+        Write-LogA ("PID {0} parent: {1} ({2})" -f $pid, $t.ParentProcessId, $pp.Name)
+        if ($pp.Name -match '^(services\.exe|nssm\.exe|srvany\.exe|wrapper\.exe)$') {
+            Write-LogA "PID $pid likely launched by a service/wrapper. Consider stopping that service first." 2
+        }
+    } catch {
+        Write-LogA "PID $pid parent lookup failed: $($_.Exception.Message)" 2
     }
 
-    if (-not $target) {
-        Write-Log -Message "No Sirsi/JWF javaw.exe instances found." -Severity 1
-    } else {
-        $pids = $target.ProcessId
-        Write-Log -Message "Found Sirsi/JWF javaw.exe PID(s): $($pids -join ', ')" -Severity 1
+    try {
+        $gp = Get-Process -Id $pid -ErrorAction Stop
 
-        foreach ($pid in $pids) {
+        # 3a) Graceful close if there is a window
+        if ($gp.MainWindowHandle -ne 0) {
+            Write-LogA "PID $pid: attempting CloseMainWindow()"
+            [void]$gp.CloseMainWindow()
+            if ($gp.WaitForExit($GraceWaitMs)) {
+                Write-LogA "PID $pid exited gracefully."
+                continue
+            } else {
+                Write-LogA "PID $pid did not exit after CloseMainWindow()." 2
+            }
+        } else {
+            Write-LogA "PID $pid has no main window; skipping graceful close."
+        }
+
+        # 3b) Force kill with Stop-Process
+        try {
+            Write-LogA "PID $pid: Stop-Process -Force" 2
+            Stop-Process -Id $pid -Force -ErrorAction Stop
+            Start-Sleep -Milliseconds 500
+        } catch {
+            Write-LogA "PID $pid Stop-Process failed: $($_.Exception.Message)" 2
+        }
+
+        # 3c) If still alive, use WMI Terminate
+        if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {
+            Write-LogA "PID $pid still alive; trying WMI Terminate()" 2
             try {
-                $proc = Get-Process -Id $pid -ErrorAction Stop
-
-                if ($proc.MainWindowHandle -ne 0) {
-                    Write-Log -Message "Attempting graceful close for PID $pid (windowed)." -Severity 1
-                    [void]$proc.CloseMainWindow()
-                    if (-not $proc.WaitForExit(10 * 1000)) {
-                        Write-Log -Message "Graceful close timed out for PID $pid. Forcing termination." -Severity 2
-                        Stop-Process -Id $pid -Force -ErrorAction Stop
-                    } else {
-                        Write-Log -Message "PID $pid exited gracefully." -Severity 1
-                    }
-                } else {
-                    Write-Log -Message "PID $pid has no window. Forcing termination." -Severity 2
-                    Stop-Process -Id $pid -Force -ErrorAction Stop
-                }
+                $ci  = Get-CimInstance Win32_Process -Filter "ProcessId=$pid" -ErrorAction Stop
+                $res = Invoke-CimMethod -InputObject $ci -MethodName Terminate -Arguments @{ Reason = 5 } -ErrorAction Stop
+                Write-LogA "PID $pid WMI Terminate() returned $($res.ReturnValue)."
             } catch {
-                Write-Log -Message "Failed to close PID $pid. $_" -Severity 3
+                Write-LogA "PID $pid WMI Terminate() failed: $($_.Exception.Message)" 2
             }
         }
+
+        # 3d) If somehow still alive, nuke tree with taskkill
+        if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {
+            Write-LogA "PID $pid still alive; taskkill /T /F" 3
+            $tk = Start-Process -FilePath "$env:WINDIR\System32\taskkill.exe" -ArgumentList "/PID $pid /T /F" -PassThru -Wait -WindowStyle Hidden
+            Write-LogA "taskkill exit code for PID $pid: $($tk.ExitCode)"
+        }
+
+        if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {
+            Write-LogA "PID $pid is STILL running after all methods. Likely being relaunched; stop its parent service/wrapper." 3
+        } else {
+            Write-LogA "PID $pid terminated."
+        }
+    } catch {
+        Write-LogA "PID $pid handling error: $($_.Exception.Message)" 3
     }
-} catch {
-    Write-Log -Message "Error enumerating javaw.exe processes. $_" -Severity 3
 }
+
 #endregion
