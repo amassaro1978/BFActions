@@ -1,42 +1,84 @@
-	# Update existing JSON file if a setting is missing or incorrect.
-	$FULLPATH=Get-ChildItem -Path C:\Users -Filter Settings.json -Recurse -ErrorAction SilentlyContinue -Force | %{$_.FullName}
-	$USERSVPATH=Split-Path -Path $FULLPATH
-	ForEach ($ONEPATH in $USERSVPATH) 
-	{ 
-		If ($ONEPATH -ilike '*\code\*')
-		{
-			$JSONPATH=$ONEPATH + '\Settings.json'
-			$GLOBALSTORAGEDIR=$ONEPATH + '\GlobalStorage'
-			$json = Get-Content -Path $JSONPATH | ConvertFrom-Json -ErrorAction SilentlyContinue
-				if ($json."telemetry.enableTelemetry" -ne "false" -or $json."update.enableWindowsBackgroundUpdates" -ne "false" -or $json."update.mode" -ne "none" -or $json."telemetry.enableCrashReporter" -ne "false") 
-				{
-					# Update the settings if they are incorrect
+# Update existing JSON file if a setting is missing or incorrect.
+$FULLPATH = Get-ChildItem -Path 'C:\Users' -Filter 'Settings.json' -Recurse -ErrorAction SilentlyContinue -Force | ForEach-Object { $_.FullName }
 
-                    $json | Add-Member -MemberType NoteProperty -Name telemetry -Value ([PSCustomObject]@{})
-                    $json.telemetry | Add-Member -MemberType NoteProperty -Name enableTelemetry -Value $false
-                    $json.telemetry | Add-Member -MemberType NoteProperty -Name enableCrashReporter -Value $false
+foreach ($JSONPATH in $FULLPATH) {
+    # Only target VS Code settings.json under ...\Code\User\
+    if ($JSONPATH -notmatch '\\Code\\User\\Settings\.json$') { continue }
 
-                    $json | Add-Member -MemberType NoteProperty -Name update -Value ([PSCustomObject]@{})
-                    $json.update | Add-Member -MemberType NoteProperty -Name enableWindowsBackgroundUpdates -Value $false
-                    $json.update | Add-Member -MemberType NoteProperty -Name mode -Value "none"
+    $USERSVPATH       = Split-Path -Path $JSONPATH
+    $GLOBALSTORAGEDIR = Join-Path -Path $USERSVPATH -ChildPath 'GlobalStorage'
 
-					$json.telemetry.enableTelemetry = $false
-					$json.update.enableWindowsBackgroundUpdates = $false
-					$json.update.mode = "none"
-					$json.telemetry.enableCrashReporter = $false
-					Write-ADTLogEntry -Message "Updated $JSONPATH" -Source $adtSession.InstallPhase
-				}
-			else 
-			{
-				# Create a new JSON object with the desired settings
-				$newJson = @{				
-					"telemetry.enableTelemetry" = "false";
-					"update.enableWindowsBackgroundUpdates" = "false";
-					"update.mode" = "none";
-					"telemetry.enableCrashReporter" = "false"
-				}
-				# If the file is empty, overwrite it with the new JSON object
-				$json = $newJson
-			}
-			# Convert the PowerShell object back to JSON and save it to the file
-			$json | ConvertTo-Json -Depth 100 | Set-Content -Path $JSONPATH
+    # Desired VS Code settings
+    $desiredSettings = @{
+        'telemetry.enableTelemetry'             = $false
+        'update.enableWindowsBackgroundUpdates' = $false
+        'update.mode'                           = 'none'
+        'telemetry.enableCrashReporter'         = $false
+    }
+
+    # Read existing JSON (if any)
+    $jsonObject = $null
+    $fileContent = $null
+
+    try {
+        if (Test-Path -LiteralPath $JSONPATH) {
+            $fileContent = Get-Content -LiteralPath $JSONPATH -Raw -ErrorAction SilentlyContinue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($fileContent)) {
+            # Empty or missing file – start with an empty object
+            $jsonObject = [PSCustomObject]@{}
+        }
+        else {
+            $jsonObject = $fileContent | ConvertFrom-Json -ErrorAction Stop
+        }
+    }
+    catch {
+        # If parsing fails, log and start fresh
+        Write-ADTLogEntry -Message "Failed to parse JSON from '$JSONPATH': $($_.Exception.Message). Initializing empty object." -Source $adtSession.InstallPhase
+        $jsonObject = [PSCustomObject]@{}
+    }
+
+    if ($null -eq $jsonObject) {
+        $jsonObject = [PSCustomObject]@{}
+    }
+
+    $changed = $false
+
+    # Ensure each desired setting exists and is set to the correct value
+    foreach ($setting in $desiredSettings.GetEnumerator()) {
+        $name  = $setting.Key
+        $value = $setting.Value
+
+        $prop = $jsonObject.PSObject.Properties[$name]
+
+        if ($null -eq $prop) {
+            # Property doesn't exist – add it
+            $jsonObject | Add-Member -MemberType NoteProperty -Name $name -Value $value
+            $changed = $true
+            Write-ADTLogEntry -Message "Added '$name' = '$value' to '$JSONPATH'." -Source $adtSession.InstallPhase
+        }
+        else {
+            # Property exists – update if different
+            if ($prop.Value -ne $value) {
+                $prop.Value = $value
+                $changed = $true
+                Write-ADTLogEntry -Message "Updated '$name' to '$value' in '$JSONPATH'." -Source $adtSession.InstallPhase
+            }
+        }
+    }
+
+    # Write back only if something changed
+    if ($changed) {
+        try {
+            $jsonObject | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $JSONPATH -Encoding UTF8
+            Write-ADTLogEntry -Message "Updated VS Code settings at '$JSONPATH'." -Source $adtSession.InstallPhase
+        }
+        catch {
+            Write-ADTLogEntry -Message "Failed to write '$JSONPATH': $($_.Exception.Message)." -Source $adtSession.InstallPhase
+        }
+    }
+    else {
+        Write-ADTLogEntry -Message "No changes required for '$JSONPATH'." -Source $adtSession.InstallPhase
+    }
+}
