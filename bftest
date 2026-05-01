@@ -1,15 +1,71 @@
-# --- Confirmation dialog before creating actions ---
-$fixletFullName = if ($titleRaw) { $titleRaw } else { "(unknown fixlet title)" }
-$confirmMsg = "Fixlet: $fixletFullName`r`n`r`nAre you sure you want to create these 4 actions on this fixlet?`r`n`r`nClick Yes to Proceed or No to cancel."
-$dlg = [System.Windows.Forms.MessageBox]::Show(
-    $form,
-    $confirmMsg,
-    "Confirm: Create 4 Actions",
-    [System.Windows.Forms.MessageBoxButtons]::YesNo,
-    [System.Windows.Forms.MessageBoxIcon]::Question,
-    [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+$defaultIni = 'C:\path\to\your\default\octave-gui.ini'
+
+$settings = @(
+    @{ Section = 'news';            Key = 'Allow_web_connection';   Value = 'false' }
+    @{ Section = 'General';         Key = 'ShowMessageOfTheDay';    Value = 'false' }
+    @{ Section = 'MainWindow';      Key = 'Current_directory_list'; Value = ''      }
+    @{ Section = 'filesdockwidget'; Key = 'Mru_dir_list';           Value = ''      }
 )
-if ($dlg -ne [System.Windows.Forms.DialogResult]::Yes) {
-    LogLine "🚫 User canceled at confirmation dialog."
-    return
+
+$iniRelPath = 'AppData\Roaming\octave\octave-gui.ini'
+
+foreach ($profile in (Get-WmiObject Win32_UserProfile | Where-Object { $_.Special -eq $false })) {
+    $iniPath = Join-Path $profile.LocalPath $iniRelPath
+
+    if (-not (Test-Path $iniPath)) {
+        $destDir = Split-Path $iniPath
+        if (-not (Test-Path $destDir)) {
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        }
+        Copy-Item -Path $defaultIni -Destination $iniPath
+        Write-Host "Copied default: $iniPath"
+    }
+
+    $lines = [System.Collections.Generic.List[string]](Get-Content $iniPath)
+    $changed = $false
+
+    foreach ($s in $settings) {
+        $sectionHeader = "[$($s.Section)]"
+        $newLine       = "$($s.Key)=$($s.Value)"
+        $pattern       = "^$($s.Key)\s*="
+
+        # Find section index
+        $secIdx = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i].Trim() -eq $sectionHeader) { $secIdx = $i; break }
+        }
+
+        if ($secIdx -eq -1) {
+            # Section missing — append section + key
+            $lines.Add('')
+            $lines.Add($sectionHeader)
+            $lines.Add($newLine)
+            $changed = $true
+            continue
+        }
+
+        # Look for key within this section
+        $keyIdx = -1
+        for ($i = $secIdx + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\[') { break }
+            if ($lines[$i] -match $pattern) { $keyIdx = $i; break }
+        }
+
+        if ($keyIdx -eq -1) {
+            # Key missing — insert after section header
+            $lines.Insert($secIdx + 1, $newLine)
+            $changed = $true
+        } elseif ($lines[$keyIdx] -ne $newLine) {
+            # Key exists but wrong value
+            $lines[$keyIdx] = $newLine
+            $changed = $true
+        }
+    }
+
+    if ($changed) {
+        Set-Content -Path $iniPath -Value $lines -Encoding UTF8
+        Write-Host "Updated: $iniPath"
+    } else {
+        Write-Host "OK (no changes): $iniPath"
+    }
 }
