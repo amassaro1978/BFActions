@@ -218,7 +218,8 @@ function Build-SourcedFixletActionXml {
         [string]$PreActionText,
         [string]$AskToSaveWorkText,     # "true"/"false"
         [string]$DeadlineLocal,         # (ignored now; keep for signature stability)
-        [string]$DeadlineOffset         # PT… or ""
+        [string]$DeadlineOffset,        # PT… or ""
+        [bool]$SilentMessaging = $false # omit all BigFix client user messaging
     )
 
     $consoleTitle    = SafeEscape(("{0}: {1}" -f $UiBaseTitle, $ActionTitle))
@@ -259,19 +260,22 @@ $deadlineInner = @"
         $endLine = "      <EndDateTimeLocal>$EndLocal</EndDateTimeLocal>`n"
     }
 
-@"
-<?xml version="1.0" encoding="UTF-8"?>
-<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
-  <SourcedFixletAction>
-    <SourceFixlet>
-      <Sitename>$siteEsc</Sitename>
-      <FixletID>$fixletIdEsc</FixletID>
-      <Action>$actionNameEsc</Action>
-    </SourceFixlet>
-    <Target>
-      <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
-    </Target>
-    <Settings>
+    # Keep all BigFix client-facing messages in one block so silent mode
+    # cannot accidentally leave a title, pre-action prompt, or running message.
+    $userMessagingBlock = ""
+    if ($SilentMessaging) {
+$userMessagingBlock = @"
+      <PreActionShowUI>false</PreActionShowUI>
+      $(if ($DeadlineOffset) { @"
+      <PreAction>
+$deadlineInner        <ShowConfirmation>false</ShowConfirmation>
+      </PreAction>
+"@ } else { "" })
+      <HasRunningMessage>false</HasRunningMessage>
+"@
+        $userMessagingBlock += if ($userMessagingBlock.Contains("`r`n")) { "`r`n" } else { "`n" }
+    } else {
+$userMessagingBlock = @"
       <ActionUITitle>$uiTitleMessage</ActionUITitle>
       <PreActionShowUI>$ShowPreActionUIText</PreActionShowUI>
       $(if ($ShowPreActionUIText -ieq "true") { @"
@@ -285,7 +289,24 @@ $deadlineInner        <ShowConfirmation>false</ShowConfirmation>
 "@ } else { "" })
       <HasRunningMessage>true</HasRunningMessage>
       <RunningMessage><Text>Updating to $dispEsc... Please wait.</Text></RunningMessage>
-      <HasTimeRange>$HasTimeRangeText</HasTimeRange>
+"@
+        $userMessagingBlock += if ($userMessagingBlock.Contains("`r`n")) { "`r`n" } else { "`n" }
+    }
+
+@"
+<?xml version="1.0" encoding="UTF-8"?>
+<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
+  <SourcedFixletAction>
+    <SourceFixlet>
+      <Sitename>$siteEsc</Sitename>
+      <FixletID>$fixletIdEsc</FixletID>
+      <Action>$actionNameEsc</Action>
+    </SourceFixlet>
+    <Target>
+      <CustomRelevance><![CDATA[$groupSafe]]></CustomRelevance>
+    </Target>
+    <Settings>
+$userMessagingBlock      <HasTimeRange>$HasTimeRangeText</HasTimeRange>
 $timeRangeBlock      <HasStartTime>true</HasStartTime>
       <StartDateTimeLocal>$StartLocal</StartDateTimeLocal>
       <HasEndTime>$HasEndText</HasEndTime>
@@ -311,86 +332,168 @@ $endLine      <UseUTCTime>false</UseUTCTime>
 }
 
 # =========================
-# GUI  (baseline)
+# GUI (modern dark theme aligned with the PSADT SFX Builder)
 # =========================
+$colorWindow = [System.Drawing.ColorTranslator]::FromHtml("#111827")
+$colorCard   = [System.Drawing.ColorTranslator]::FromHtml("#182233")
+$colorInput  = [System.Drawing.ColorTranslator]::FromHtml("#1F2937")
+$colorText   = [System.Drawing.ColorTranslator]::FromHtml("#F9FAFB")
+$colorMuted  = [System.Drawing.ColorTranslator]::FromHtml("#9CA3AF")
+$colorAccent = [System.Drawing.ColorTranslator]::FromHtml("#2563EB")
+$colorInfo   = [System.Drawing.ColorTranslator]::FromHtml("#93C5FD")
+$colorLog    = [System.Drawing.ColorTranslator]::FromHtml("#0B1220")
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "BigFix Action Generator"
-$form.Size = New-Object System.Drawing.Size(640, 780)
+$form.ClientSize = New-Object System.Drawing.Size(900, 780)
+$form.MinimumSize = New-Object System.Drawing.Size(900, 700)
 $form.StartPosition = "CenterScreen"
+$form.BackColor = $colorWindow
+$form.ForeColor = $colorText
+$form.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 
-$y = 20
+$header = New-Object System.Windows.Forms.Label
+$header.Text = "BigFix Action Generator"
+$header.Location = New-Object System.Drawing.Point(28, 22)
+$header.Size = New-Object System.Drawing.Size(700, 38)
+$header.Font = New-Object System.Drawing.Font("Segoe UI", 22, [System.Drawing.FontStyle]::Bold)
+$header.ForeColor = $colorText
+$form.Controls.Add($header)
+
+$subheader = New-Object System.Windows.Forms.Label
+$subheader.Text = "Create and post scheduled Pilot, Deploy, Force, and Conference actions."
+$subheader.Location = New-Object System.Drawing.Point(30, 62)
+$subheader.Size = New-Object System.Drawing.Size(790, 24)
+$subheader.ForeColor = $colorMuted
+$form.Controls.Add($subheader)
+
+$inputCard = New-Object System.Windows.Forms.Panel
+$inputCard.Location = New-Object System.Drawing.Point(28, 102)
+$inputCard.Size = New-Object System.Drawing.Size(844, 205)
+$inputCard.Anchor = "Top,Left,Right"
+$inputCard.BackColor = $colorCard
+$form.Controls.Add($inputCard)
+
+$script:y = 18
 function Add-Field([string]$Label,[bool]$IsPassword,[ref]$OutTB,[string]$DefaultValue="",$ReadOnly=$false) {
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = $Label
-    $lbl.Location = New-Object System.Drawing.Point(10,$script:y)
-    $lbl.Size = New-Object System.Drawing.Size(140,22)
-    $form.Controls.Add($lbl)
+    $lbl.Location = New-Object System.Drawing.Point(18,$script:y)
+    $lbl.Size = New-Object System.Drawing.Size(155,26)
+    $lbl.ForeColor = $colorText
+    $inputCard.Controls.Add($lbl)
 
     if ($IsPassword) { $tb = New-Object System.Windows.Forms.MaskedTextBox; $tb.PasswordChar = '*' }
     else { $tb = New-Object System.Windows.Forms.TextBox }
 
-    $tb.Location = New-Object System.Drawing.Point(160,$script:y)
-    $tb.Size = New-Object System.Drawing.Size(440,22)
+    $tb.Location = New-Object System.Drawing.Point(178,$script:y)
+    $tb.Size = New-Object System.Drawing.Size(640,26)
+    $tb.Anchor = "Top,Left,Right"
+    $tb.BackColor = $colorInput
+    $tb.ForeColor = $colorText
+    $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     if ($DefaultValue) { $tb.Text = $DefaultValue }
-    if ($ReadOnly) { $tb.ReadOnly = $true }
-    $form.Controls.Add($tb)
+    if ($ReadOnly) { $tb.ReadOnly = $true; $tb.ForeColor = $colorMuted }
+    $inputCard.Controls.Add($tb)
     $OutTB.Value = $tb
     $script:y += 34
 }
 
-# Pre-populate BigFix Server with default and lock it
+# Pre-populate BigFix Server with default and lock it.
 $tbServer = $null; Add-Field "BigFix Server:" $false ([ref]$tbServer) "https://test.server:52311" $true
 $tbUser   = $null; Add-Field "Username:"      $false ([ref]$tbUser)
 $tbPass   = $null; Add-Field "Password:"      $true  ([ref]$tbPass)
 $tbFixlet = $null; Add-Field "Fixlet ID:"     $false ([ref]$tbFixlet)
 
-# Date (future Wednesdays only)
-$lblDate = New-Object Windows.Forms.Label
+# Date (future Wednesdays only).
+$lblDate = New-Object System.Windows.Forms.Label
 $lblDate.Text = "Schedule Date (Wed):"
-$lblDate.Location = New-Object System.Drawing.Point(10,$y)
-$lblDate.Size = New-Object System.Drawing.Size(140,22)
-$form.Controls.Add($lblDate)
+$lblDate.Location = New-Object System.Drawing.Point(18,$script:y)
+$lblDate.Size = New-Object System.Drawing.Size(155,26)
+$lblDate.ForeColor = $colorText
+$inputCard.Controls.Add($lblDate)
 
 $cbDate = New-Object System.Windows.Forms.ComboBox
 $cbDate.DropDownStyle = 'DropDownList'
-$cbDate.Location = New-Object System.Drawing.Point(160,$y)
-$cbDate.Size = New-Object System.Drawing.Size(160,22)
-$form.Controls.Add($cbDate)
-$y += 34
+$cbDate.Location = New-Object System.Drawing.Point(178,$script:y)
+$cbDate.Size = New-Object System.Drawing.Size(220,28)
+$cbDate.BackColor = $colorInput
+$cbDate.ForeColor = $colorText
+$cbDate.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$inputCard.Controls.Add($cbDate)
 
-# populate next 20 Wednesdays (baseline)
+# Populate next 20 Wednesdays (baseline behavior).
 $today = Get-Date
 $daysUntilWed = (3 - [int]$today.DayOfWeek + 7) % 7
 $nextWed = $today.AddDays($daysUntilWed)
 for ($i=0;$i -lt 20;$i++) { [void]$cbDate.Items.Add($nextWed.AddDays(7*$i).ToString("yyyy-MM-dd")) }
 
-# Timeslot selector dormant; default is 11:00 PM (baseline)
+# Timeslot selector dormant; default is 11:00 PM (baseline behavior).
 $DefaultAnchorTime = "11:00 PM"
 
-# Button (baseline)
-$btn = New-Object System.Windows.Forms.Button
-$btn.Text = "Generate & Post 4 Actions (Pilot/Deploy/Force/Conf)"
-$btn.Location = New-Object System.Drawing.Point(160,$y)
-$btn.Size = New-Object System.Drawing.Size(320,32)
-$form.Controls.Add($btn)
-$y += 42
+$logLabel = New-Object System.Windows.Forms.Label
+$logLabel.Text = "Activity log"
+$logLabel.Location = New-Object System.Drawing.Point(28, 326)
+$logLabel.Size = New-Object System.Drawing.Size(300, 24)
+$logLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$logLabel.ForeColor = $colorText
+$form.Controls.Add($logLabel)
 
-# Log (baseline)
 $LogBox = New-Object System.Windows.Forms.TextBox
 $LogBox.Multiline = $true
-# (left writable intentionally for copy/select context menu)
+# Left writable intentionally for copy/select context menu (baseline behavior).
 $LogBox.ScrollBars = "Vertical"
 $LogBox.ReadOnly = $false
 $LogBox.WordWrap = $false
-$LogBox.Location = New-Object System.Drawing.Point(10,$y)
-$LogBox.Size = New-Object System.Drawing.Size(600,520)
+$LogBox.Location = New-Object System.Drawing.Point(28, 352)
+$LogBox.Size = New-Object System.Drawing.Size(844, 310)
+$LogBox.Anchor = "Top,Left,Right,Bottom"
+$LogBox.BackColor = $colorLog
+$LogBox.ForeColor = $colorText
+$LogBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$LogBox.Font = New-Object System.Drawing.Font("Consolas", 9)
 $LogBox.ContextMenu = New-Object System.Windows.Forms.ContextMenu
 $LogBox.ContextMenu.MenuItems.AddRange(@(
-    (New-Object System.Windows.Forms.MenuItem "Copy",      { $LogBox.Copy() }),
+    (New-Object System.Windows.Forms.MenuItem "Copy",       { $LogBox.Copy() }),
     (New-Object System.Windows.Forms.MenuItem "Select All", { $LogBox.SelectAll() })
 ))
-$LogBox.Anchor = "Top,Left,Right,Bottom"
 $form.Controls.Add($LogBox)
+
+$footerCard = New-Object System.Windows.Forms.Panel
+$footerCard.Location = New-Object System.Drawing.Point(28, 680)
+$footerCard.Size = New-Object System.Drawing.Size(844, 72)
+$footerCard.Anchor = "Left,Right,Bottom"
+$footerCard.BackColor = $colorCard
+$form.Controls.Add($footerCard)
+
+$chkSilent = New-Object System.Windows.Forms.CheckBox
+$chkSilent.Text = "Generate silent BigFix actions"
+$chkSilent.Location = New-Object System.Drawing.Point(18, 10)
+$chkSilent.Size = New-Object System.Drawing.Size(360, 25)
+$chkSilent.ForeColor = $colorText
+$chkSilent.BackColor = $colorCard
+$footerCard.Controls.Add($chkSilent)
+
+$silentDisclaimer = New-Object System.Windows.Forms.Label
+$silentDisclaimer.Text = "Only use this for deployments that require silent installations such as required agents"
+$silentDisclaimer.Location = New-Object System.Drawing.Point(39, 37)
+$silentDisclaimer.Size = New-Object System.Drawing.Size(520, 22)
+$silentDisclaimer.ForeColor = $colorInfo
+$footerCard.Controls.Add($silentDisclaimer)
+
+$btn = New-Object System.Windows.Forms.Button
+$btn.Text = "Generate and Post 4 Actions"
+$btn.Location = New-Object System.Drawing.Point(588, 17)
+$btn.Size = New-Object System.Drawing.Size(238, 40)
+$btn.Anchor = "Top,Right"
+$btn.BackColor = $colorAccent
+$btn.ForeColor = [System.Drawing.Color]::White
+$btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$btn.FlatAppearance.BorderSize = 0
+$btn.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$btn.Cursor = [System.Windows.Forms.Cursors]::Hand
+$footerCard.Controls.Add($btn)
 
 # =========================
 # ACTION  (baseline; only targeting + Force deadline drift-safe)
@@ -405,8 +508,9 @@ $btn.Add_Click({
     $fixId  = if ($tbFixlet.Text) { $tbFixlet.Text.Trim() } else { "" }
     $dStr   = $cbDate.SelectedItem
     $tStr   = $DefaultAnchorTime
+    $silentMessaging = $chkSilent.Checked
 
-    LogLine ("Fields: server='{0}' user='{1}' fixId='{2}' date='{3}' time='{4}'" -f (Fmt $server),(Fmt $user),(Fmt $fixId),(Fmt $dStr),(Fmt $tStr))
+    LogLine ("Fields: server='{0}' user='{1}' fixId='{2}' date='{3}' time='{4}' silent='{5}'" -f (Fmt $server),(Fmt $user),(Fmt $fixId),(Fmt $dStr),(Fmt $tStr),$silentMessaging)
 
     if (-not ($server -and $user -and $pass -and $fixId -and $dStr)) {
         LogLine "❌ Please fill in Server, Username, Password, Fixlet ID, and Date."
@@ -526,7 +630,8 @@ $btn.Add_Click({
                 -PreActionText        $cfg.Msg `
                 -AskToSaveWorkText    $cfg.SaveAsk `
                 -DeadlineLocal        "" `
-                -DeadlineOffset       $deadlineOff
+                -DeadlineOffset       $deadlineOff `
+                -SilentMessaging      $silentMessaging
 
             $safeTitle = ($a -replace '[^\w\-. ]','_') -replace '\s+','_'
             $tmpAction = Join-Path $env:TEMP ("BES_Action_{0}_{1:yyyyMMdd_HHmmss}.xml" -f $safeTitle,(Get-Date))
@@ -540,7 +645,7 @@ $btn.Add_Click({
             if ($a -eq "Pilot") {
                 $dlg = [System.Windows.Forms.MessageBox]::Show(
                     $form,
-                    ("Fixlet: {0}`r`nCreate the 4 actions (Pilot/Deploy/Force/Conf) now?" -f $titleRaw),
+                    ("Fixlet: {0}`r`nCreate the 4 actions (Pilot/Deploy/Force/Conf) now?`r`nSilent BigFix messaging: {1}" -f $titleRaw, $(if ($silentMessaging) { "Yes" } else { "No" })),
                     "Confirm — Create Actions",
                     [System.Windows.Forms.MessageBoxButtons]::YesNo,
                     [System.Windows.Forms.MessageBoxIcon]::Question,
