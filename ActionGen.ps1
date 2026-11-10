@@ -1,5 +1,5 @@
 # =========================================================
-# BigFix Action Generator — Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
+# BigFix Action Generator - Baseline-2025-09-24-ForceCascade-RunWindow22-ConfirmDialog
 # CHANGES (only these two):
 #   1) Targeting: "(member of group <id> of sites)"
 #   2) Force deadline: use DeadlineLocalOffset computed at top-of-minute to prevent drift
@@ -188,7 +188,7 @@ function Post-XmlFile-InFile {
             $errBody = $sr.ReadToEnd(); $sr.Close()
             $errFile = Join-Path $env:TEMP ("BES_Post_Error_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
             try { [System.IO.File]::WriteAllText($errFile, $errBody, [Text.Encoding]::UTF8) } catch {}
-            LogLine ("❌ Server Error body (first 2000 chars): {0}" -f ($errBody.Substring(0,[Math]::Min(2000,$errBody.Length))))
+            LogLine ("ERROR: Server Error body (first 2000 chars): {0}" -f ($errBody.Substring(0,[Math]::Min(2000,$errBody.Length))))
             LogLine ("Saved full error to: {0}" -f $errFile)
             throw "Invoke-WebRequest POST failed :: $errBody"
         }
@@ -218,7 +218,7 @@ function Build-SourcedFixletActionXml {
         [string]$PreActionText,
         [string]$AskToSaveWorkText,     # "true"/"false"
         [string]$DeadlineLocal,         # (ignored now; keep for signature stability)
-        [string]$DeadlineOffset,        # PT… or ""
+        [string]$DeadlineOffset,        # PT... or ""
         [bool]$SilentMessaging = $false # omit all BigFix client user messaging
     )
 
@@ -513,7 +513,7 @@ $btn.Add_Click({
     LogLine ("Fields: server='{0}' user='{1}' fixId='{2}' date='{3}' time='{4}' silent='{5}'" -f (Fmt $server),(Fmt $user),(Fmt $fixId),(Fmt $dStr),(Fmt $tStr),$silentMessaging)
 
     if (-not ($server -and $user -and $pass -and $fixId -and $dStr)) {
-        LogLine "❌ Please fill in Server, Username, Password, Fixlet ID, and Date."
+        LogLine "ERROR: Please fill in Server, Username, Password, Fixlet ID, and Date."
         return
     }
 
@@ -548,7 +548,7 @@ $btn.Add_Click({
         $DeployStart = Snap-ToExactMinute($PilotStart.AddDays(1))
         $ConfStart   = Snap-ToExactMinute($PilotStart.AddDays(1))
 
-        # Run window 22:00–06:59 (baseline)
+        # Run window 22:00-06:59 (baseline)
         $TRStartStr   = "22:00:00"
         $TREndStr     = "06:59:00"
 
@@ -591,9 +591,9 @@ $btn.Add_Click({
             LogLine "---- Building: $a ----"
 
             $groupIdRaw = "$($GroupMap[$a])"
-            if (-not $groupIdRaw) { LogLine "❌ Missing group id for $a"; continue }
+            if (-not $groupIdRaw) { LogLine "ERROR: Missing group id for $a"; continue }
             $groupIdNumeric = Get-NumericGroupId $groupIdRaw
-            if (-not $groupIdNumeric) { LogLine ("❌ Could not parse numeric ID from '{0}' for {1}" -f $groupIdRaw, $a); continue }
+            if (-not $groupIdNumeric) { LogLine ("ERROR: Could not parse numeric ID from '{0}' for {1}" -f $groupIdRaw, $a); continue }
 
             $groupRel = Build-GroupMembershipRelevance -GroupIdNumeric $groupIdNumeric
             LogLine ("Targeting: {0}" -f $groupRel)
@@ -641,18 +641,18 @@ $btn.Add_Click({
                 LogLine ("curl -k -u USER:PASS -H `"Content-Type: application/xml`" -d @`"$tmpAction`" {0}" -f $postUrl)
             }
 
-            # Confirmation dialog (once, for Pilot — baseline)
+            # Confirmation dialog (once, for Pilot - baseline)
             if ($a -eq "Pilot") {
                 $dlg = [System.Windows.Forms.MessageBox]::Show(
                     $form,
                     ("Fixlet: {0}`r`nCreate the 4 actions (Pilot/Deploy/Force/Conf) now?`r`nSilent BigFix messaging: {1}" -f $titleRaw, $(if ($silentMessaging) { "Yes" } else { "No" })),
-                    "Confirm — Create Actions",
+                    "Confirm - Create Actions",
                     [System.Windows.Forms.MessageBoxButtons]::YesNo,
                     [System.Windows.Forms.MessageBoxIcon]::Question,
                     [System.Windows.Forms.MessageBoxDefaultButton]::Button2
                 )
                 if ($dlg -ne [System.Windows.Forms.DialogResult]::Yes) {
-                    LogLine "🚫 User canceled."
+                    LogLine "CANCELED: User canceled."
                     return
                 }
             }
@@ -661,18 +661,18 @@ $btn.Add_Click({
                 if ($PostUsingInvokeWebRequest -and (Test-Path $tmpAction)) {
                     Post-XmlFile-InFile -Url $postUrl -User $user -Pass $pass -XmlFilePath $tmpAction
                 } else {
-                    LogLine "⚠️ Direct POST path disabled; enable if needed."
+                    LogLine "WARNING: Direct POST path disabled; enable if needed."
                 }
-                LogLine ("✅ {0} posted successfully." -f $a)
+                LogLine ("SUCCESS: {0} posted successfully." -f $a)
             } catch {
-                LogLine ("❌ POST failed for {0}: {1}" -f $a, $_.Exception.Message)
+                LogLine ("ERROR: POST failed for {0}: {1}" -f $a, $_.Exception.Message)
             }
         }
 
         LogLine "All actions attempted. Log file: $LogFile"
     }
     catch {
-        LogLine ("❌ Fatal error: {0}" -f ($_.Exception.GetBaseException().Message))
+        LogLine ("ERROR: Fatal error: {0}" -f ($_.Exception.GetBaseException().Message))
     }
 })
 
